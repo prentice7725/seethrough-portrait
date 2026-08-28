@@ -135,6 +135,17 @@ checkpoints, so it could not be run end to end. What was actually verified:
    closed cleanly -- this exercises every UI component and event-wiring call
    in the file. What it does **not** exercise is the `run_a001` callback
    itself (needs torch + the real checkpoints).
+4. Added after a real install surfaced `ModuleNotFoundError: No module named
+   'transformers'`: installed CPU-only torch + torchvision + the rest of
+   `webui/requirements.txt` in a clean environment and actually imported
+   every class `seethrough_engine.vendor` pulls from `see-through/common`
+   (`modules.layerdiffuse.diffusers_kdiffusion_sdxl`, `.layerdiff3d`, `.vae`,
+   `modules.marigold`, `utils.cv`, `utils.torchcv`). This caught two missing
+   direct dependencies (`transformers`, `torchvision`) that `-r
+   ../requirements.txt` doesn't list (that file assumes ComfyUI already
+   provides them) and `webui/requirements.txt` hadn't added either; both are
+   now pinned there. Still not verified: loading an actual checkpoint or
+   running inference.
 
 ## M2 acceptance (to be confirmed on real hardware)
 

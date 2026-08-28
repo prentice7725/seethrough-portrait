@@ -13,7 +13,8 @@ limitations.
 ## Install
 
 ```bash
-# 1. Install a CUDA-matched torch build first:
+# 1. Install a CUDA-matched torch + torchvision build first (both from the
+#    same command, so their CUDA builds match):
 #    https://pytorch.org/get-started/locally/
 # 2. Then everything else:
 pip install -r webui/requirements.txt

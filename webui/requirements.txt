@@ -2,12 +2,19 @@
 #
 # Unlike the ComfyUI node graph, there is no host application supplying
 # torch/numpy/etc. here, so this list is meant to be self-sufficient. Install
-# a CUDA-matched torch build FIRST from https://pytorch.org/get-started/locally/
-# (this file intentionally does not pin one), then:
+# a CUDA-matched torch + torchvision build FIRST from
+# https://pytorch.org/get-started/locally/ (this file intentionally does not
+# pin one), then:
 #   pip install -r webui/requirements.txt
+#
+# Verified by actually importing every class seethrough_engine.vendor pulls
+# from see-through/common (modules.layerdiffuse.*, modules.marigold,
+# utils.cv, utils.torchcv) against this exact list -- see
+# docs/M2_IMPLEMENTATION_SPEC.md's "Verification performed" section.
 
 -r ../requirements.txt
 gradio>=4.0.0
+transformers
 safetensors
 huggingface_hub
 PyYAML
