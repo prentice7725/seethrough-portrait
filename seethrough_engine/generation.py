@@ -23,14 +23,28 @@ import cv2
 import numpy as np
 import torch
 
-from portrait_core import (
-    PortraitConfig,
-    apply_silhouette_guard,
-    evaluate_portrait_layers,
-    resolve_subject_mask,
-    select_best_layer_set,
-)
-from portrait_core.report import build_portrait_report
+try:
+    # ComfyUI loads this package's parent as a relative package, where
+    # portrait_core is a sibling -- same reason nodes.py imports it this way.
+    from ..portrait_core import (
+        PortraitConfig,
+        apply_silhouette_guard,
+        evaluate_portrait_layers,
+        resolve_subject_mask,
+        select_best_layer_set,
+    )
+    from ..portrait_core.report import build_portrait_report
+except ImportError:
+    # Standalone (webui): portrait_core is a plain top-level package on
+    # sys.path, not a relative sibling.
+    from portrait_core import (
+        PortraitConfig,
+        apply_silhouette_guard,
+        evaluate_portrait_layers,
+        resolve_subject_mask,
+        select_best_layer_set,
+    )
+    from portrait_core.report import build_portrait_report
 
 from . import vendor
 from .device import empty_cache, resolve_device, resolve_offload_device
