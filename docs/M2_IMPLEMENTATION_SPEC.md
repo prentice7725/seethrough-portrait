@@ -163,6 +163,69 @@ below is a real run added after the fact. What was actually verified:
        around in-process.
      - `webui/requirements.txt` was missing `transformers` and
        `torchvision` (see item 4) -- fixed before this run.
+6. **Making the model actually fit the 8GB card.** The run in item 5 only
+   completed because Windows' CUDA system-memory fallback was silently
+   spilling to host RAM. That fallback does not fail, it just gets slow: a
+   buffer larger than free VRAM measured 4.1 GB/s against 366 GB/s for one
+   that fits, a 90x penalty paid on every step. With the fallback turned off
+   the same run dies outright, and the numbers say it always should have:
+
+   | | GiB |
+   |---|---|
+   | RTX 5060 Laptop, total | 7.93 |
+   | CUDA context + desktop | -0.75 |
+   | what torch can actually hold | **7.19** |
+   | UNet weights (4.07B params, bf16) | **7.58** |
+
+   The weights alone are 0.39 GiB too big, before the VAE pair (0.36 GiB) or
+   a byte of activation. `resolution`, `steps` and `enable_head_detail`
+   cannot help, because the failure is in `unet.to(device)` -- it precedes
+   every one of them. Three changes, in decreasing order of how much they
+   matter:
+     - `generation.fit_unet_on` measures free VRAM and, when the weights plus
+       activation headroom will not fit, leaves them on the CPU and streams
+       them in (diffusers group offloading, leaf level, with CUDA-stream
+       prefetch) instead of moving them. Above the threshold it still moves
+       the model wholesale, so a large card behaves exactly as before, and
+       `nodes.py` is untouched -- ComfyUI has its own VRAM scheduler.
+       `device.group_offload` documents why leaf and not block level: this
+       UNet's blocks are wildly uneven (`up_blocks.0` is 3.70 GiB,
+       `down_blocks.2` 2.37 GiB, `mid_block` 1.25 GiB stays resident), and
+       block-level prefetch holds an adjacent pair at once, which measured
+       5.57 GiB and ran 2x slower than leaf. Both produce identical coverage.
+     - `model_loading` passes `torch_dtype` to every `from_pretrained`. It was
+       instantiating at the default fp32 and upcasting the bf16 checkpoint on
+       the way in, only for `.to(dtype=...)` to halve it again: peak system
+       RAM for a UNet load fell from 17.51 GiB to 0.82 GiB (the bf16 file is
+       now mmap-aliased rather than copied) and load time from 20.2s to 8.0s.
+     - `load_layerdiff_model(vae_tiling=True)` runs the SDXL VAE in 512px
+       tiles. This is a no-op at or below `resolution=512` -- including for
+       item 5's recorded run, so that baseline is unaffected -- and only
+       engages above it, where the VAE's activation peak would otherwise be
+       taken across the whole canvas.
+
+   Measured on the same card and asset (A-001, seed 42, 30 steps), all `PASS`:
+
+   | settings | wall time | peak VRAM | layers |
+   |---|---|---|---|
+   | res 512, head off | 60.7s | 2.03 GiB | 13 |
+   | res 512, head on | 109.6s | 2.03 GiB | 24 |
+   | res 1280, head off | 333.9s | 3.66 GiB | 13 |
+   | res 1280, head on | 609.9s | 3.66 GiB | 24 |
+
+   The res-512/head-off row reproduces item 5's coverage table field for
+   field, which is the evidence that streaming the weights does not change
+   results. Peak VRAM turns out to depend only on resolution -- the head
+   stage runs at the same size with fewer frames, so it costs time and no
+   memory.
+
+   One trap for anyone reproducing this outside the webui: the vendored
+   `TransparentVAEEncoder.encode` calls `latent_dist.sample()` with no
+   generator, so the `c_concat` conditioning is drawn from the **global**
+   CUDA RNG. `run_portrait_pipeline`'s `seed_everything` parameter defaults
+   to a no-op, and `webui/app.py` is what supplies the real one. Omit it and
+   the run still passes but the coverage numbers move -- which looks exactly
+   like an offloading bug and is not one.
 
 ## M2 acceptance
 

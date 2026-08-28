@@ -47,7 +47,15 @@ except ImportError:
     from portrait_core.report import build_portrait_report
 
 from . import vendor
-from .device import empty_cache, resolve_device, resolve_offload_device
+from .device import (
+    empty_cache,
+    free_vram_bytes,
+    group_offload,
+    is_group_offloaded,
+    module_bytes,
+    resolve_device,
+    resolve_offload_device,
+)
 from .layers import (
     ALL_TAGS,
     VALID_BODY_PARTS_V2,
@@ -68,12 +76,52 @@ __all__ = [
     "crop_head",
     "layer_similarity",
     "make_preview",
+    "fit_unet_on",
     "run_diffusion_stage",
     "run_portrait_pipeline",
     "PortraitPipelineResult",
 ]
 
 _NOOP_LOG: Callable[[str], None] = lambda msg: None
+
+# Room to leave free for activations after the weights are placed. The diffusion
+# loop runs one frame per body-part tag as a batch, so this is generous on
+# purpose -- guessing low here trades a working (if slower) run for an OOM.
+ACTIVATION_HEADROOM_BYTES = 1_500_000_000
+
+
+def fit_unet_on(unet, device, offload_device, *,
+                headroom_bytes: int = ACTIVATION_HEADROOM_BYTES,
+                log: Callable[[str], None] = _NOOP_LOG) -> bool:
+    """Put the UNet where the diffusion loop can reach it, and say whether it
+    had to be streamed rather than moved.
+
+    Moving it wholesale is much faster, so that stays the default. But this
+    UNet is 4.07B parameters -- 7.58 GiB even in bf16 -- which is more than an
+    8GB card can hold at all, and `.to(device)` on a card that cannot take it
+    does not degrade, it raises OutOfMemoryError partway through the move
+    (before any of the run's actual settings -- resolution, steps, head detail
+    -- get a chance to matter). So when the weights plus activation headroom
+    will not fit, stream them a block at a time instead.
+
+    Callers must not `.to(offload_device)` a UNet this returns True for: the
+    weights already live there, and the group offload hooks own placement from
+    that point on.
+    """
+    if is_group_offloaded(unet):
+        # A pipeline kept warm across runs is already set up.
+        return True
+
+    free = free_vram_bytes(device)
+    needed = module_bytes(unet)
+    if free is None or needed + headroom_bytes <= free:
+        unet.to(device)
+        return False
+
+    log(f"UNet weights are {needed / 2**30:.2f} GiB and only {free / 2**30:.2f} GiB is free "
+        f"on {device} -- streaming them one block at a time instead")
+    group_offload(unet, device, offload_device)
+    return True
 
 
 def run_diffusion_stage(pipeline, device, rng, tag_version, num_inference_steps, fullpage,
@@ -224,10 +272,16 @@ def run_portrait_pipeline(
 
     pipeline.text_encoder.to(offload_device)
     pipeline.text_encoder_2.to(offload_device)
+    # Before measuring what is free for the UNet, hand the encoders' VRAM back
+    # to the driver -- until then the caching allocator still counts it as used.
+    empty_cache(device)
 
-    pipeline.unet.to(device)
+    # The VAE pair is small (under 0.4 GiB together) and is needed at both ends
+    # of every pipeline call, so it goes over outright; the UNet is the one that
+    # may not fit.
     pipeline.vae.to(device)
     pipeline.trans_vae.to(device)
+    unet_streamed = fit_unet_on(pipeline.unet, device, offload_device, log=log)
     empty_cache(device)
 
     def _diffuse(run_seed: int) -> dict[str, np.ndarray]:
@@ -305,7 +359,8 @@ def run_portrait_pipeline(
                 ):
                     break
 
-    pipeline.unet.to(offload_device)
+    if not unet_streamed:
+        pipeline.unet.to(offload_device)
     pipeline.vae.to(offload_device)
     pipeline.trans_vae.to(offload_device)
     empty_cache(device)

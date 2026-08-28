@@ -50,22 +50,41 @@ def assert_text_encoder_loaded(text_encoder, name: str, pretrained: str) -> None
 
 
 def load_layerdiff_model(pretrained: str, vae_ckpt: str = "", unet_ckpt: str = "",
-                          dtype: torch.dtype = torch.bfloat16):
+                          dtype: torch.dtype = torch.bfloat16, vae_tiling: bool = True):
     """Load the LayerDiff SDXL pipeline from a resolved local path. `pretrained`
-    should already be the output of `resolve_model_path`."""
+    should already be the output of `resolve_model_path`.
+
+    Every `from_pretrained` below passes `torch_dtype` explicitly. Without it
+    diffusers builds the model at the default dtype (fp32) and upcasts the
+    checkpoint on the way in, so loading this UNet -- 4.07B parameters, already
+    stored as bf16 -- materialized ~16.3 GB of fp32 in system RAM only to be
+    cast straight back down. (`torch_dtype` is deprecated in favour of `dtype`
+    as of diffusers 1.0.0, but it is the spelling every version this node has
+    to run under accepts -- ComfyUI ships its own diffusers, see issue #6.)
+    Loading at the target dtype makes the blanket `.to(dtype=...)` calls this
+    used to end with redundant, so only the custom-`vae_ckpt` path still
+    normalizes.
+
+    `vae_tiling` runs the SDXL VAE's encode/decode in overlapping 512px tiles
+    rather than across the whole canvas, which is where its activation peak
+    otherwise lands (the VAE is called once to encode `fullpage` and once per
+    layer to decode, both at full resolution). It is not bit-identical to the
+    untiled path -- tiles are blended over a 25% overlap -- so it is the one
+    flag to turn off if a run has to match an untiled baseline exactly.
+    """
     vendor.ensure_seethrough_importable()
 
     print(f"[SeeThrough] Loading LayerDiff model from: {pretrained}", flush=True)
-    trans_vae = vendor.TransparentVAE.from_pretrained(pretrained, subfolder="trans_vae")
+    trans_vae = vendor.TransparentVAE.from_pretrained(pretrained, subfolder="trans_vae", torch_dtype=dtype)
 
     if unet_ckpt:
         print(f"[SeeThrough] Loading custom UNet from: {unet_ckpt}", flush=True)
-        unet = vendor.UNetFrameConditionModel.from_pretrained(unet_ckpt)
+        unet = vendor.UNetFrameConditionModel.from_pretrained(unet_ckpt, torch_dtype=dtype)
     else:
-        unet = vendor.UNetFrameConditionModel.from_pretrained(pretrained, subfolder="unet")
+        unet = vendor.UNetFrameConditionModel.from_pretrained(pretrained, subfolder="unet", torch_dtype=dtype)
 
     pipeline = vendor.KDiffusionStableDiffusionXLPipeline.from_pretrained(
-        pretrained, trans_vae=trans_vae, unet=unet, scheduler=None)
+        pretrained, trans_vae=trans_vae, unet=unet, scheduler=None, torch_dtype=dtype)
 
     assert_text_encoder_loaded(pipeline.text_encoder, "text_encoder", pretrained)
     assert_text_encoder_loaded(pipeline.text_encoder_2, "text_encoder_2", pretrained)
@@ -83,27 +102,29 @@ def load_layerdiff_model(pretrained: str, vae_ckpt: str = "", unet_ckpt: str = "
             pipeline.vae.load_state_dict(vae_sd)
         if td_sd:
             pipeline.trans_vae.decoder.load_state_dict(td_sd)
+        # `load_state_dict` already copies into the existing bf16 parameters,
+        # but normalize in case a ckpt brings buffers those copies miss.
+        pipeline.vae.to(dtype=dtype)
+        pipeline.trans_vae.to(dtype=dtype)
 
-    pipeline.vae.to(dtype=dtype)
-    pipeline.trans_vae.to(dtype=dtype)
-    pipeline.unet.to(dtype=dtype)
-    pipeline.text_encoder.to(dtype=dtype)
-    pipeline.text_encoder_2.to(dtype=dtype)
+    if vae_tiling:
+        pipeline.vae.enable_tiling()
 
     print("[SeeThrough] LayerDiff model loaded to CPU (will move to GPU on demand)", flush=True)
     return pipeline
 
 
 def load_depth_model(pretrained: str, dtype: torch.dtype = torch.bfloat16):
-    """Load the Marigold depth pipeline from a resolved local path."""
+    """Load the Marigold depth pipeline from a resolved local path. `torch_dtype`
+    is passed for the same reason as in `load_layerdiff_model`: without it the
+    bf16 checkpoint is upcast to fp32 on load only to be cast straight back."""
     vendor.ensure_seethrough_importable()
 
     print(f"[SeeThrough] Loading Marigold depth model from: {pretrained}", flush=True)
-    unet = vendor.UNetFrameConditionModel.from_pretrained(pretrained, subfolder="unet")
-    pipeline = vendor.MarigoldDepthPipeline.from_pretrained(pretrained, unet=unet)
+    unet = vendor.UNetFrameConditionModel.from_pretrained(pretrained, subfolder="unet", torch_dtype=dtype)
+    pipeline = vendor.MarigoldDepthPipeline.from_pretrained(pretrained, unet=unet, torch_dtype=dtype)
 
     assert_text_encoder_loaded(pipeline.text_encoder, "text_encoder", pretrained)
-    pipeline.to(dtype=dtype)
 
     print("[SeeThrough] Depth model loaded to CPU (will move to GPU on demand)", flush=True)
     return pipeline
