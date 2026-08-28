@@ -57,3 +57,9 @@ M1 and M2 are implemented. See `M1_IMPLEMENTATION_SPEC.md` and
 procedure, and `M2_IMPLEMENTATION_SPEC.md` for the standalone single-image
 webui, including what it could not verify without GPU access.
 
+M4 is being taken before M3: a manual Spine rig test on A-001's exported
+layers was informative enough to justify going straight at the 2.5D
+feasibility question. See `PORTRAIT_AUTO_RIG_FEASIBILITY_v0.1.md`, which
+answers M4 with an automatic rig plus a browser preview rather than a bone
+hierarchy, and stays inside Phase 2's "feasibility only" limit.
+

@@ -15,6 +15,7 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
+from . import rig as rig_export
 from . import spine as spine_export
 from .generation import PortraitPipelineResult
 
@@ -24,7 +25,9 @@ SPINE_SUBDIR = "spine"
 def save_portrait_run(output_dir: str, base_name: str, result: PortraitPipelineResult,
                        source_filename: str = "", export_spine: bool = False,
                        spine_version: str = "4.2.28",
-                       depth_dict: dict[str, np.ndarray] | None = None) -> dict[str, Any]:
+                       depth_dict: dict[str, np.ndarray] | None = None,
+                       export_rig: bool = False,
+                       rig_gradient_tags: tuple[str, ...] = ()) -> dict[str, Any]:
     """Persist one Portrait Mode run. Returns a manifest dict (also written to
     `{base_name}_manifest.json`) with every artifact's filename, relative to
     `output_dir`.
@@ -36,6 +39,12 @@ def save_portrait_run(output_dir: str, base_name: str, result: PortraitPipelineR
     is semantic -- see `seethrough_engine.spine.SEMANTIC_Z_ORDER`; pass one
     (from `seethrough_engine.depth.estimate_layer_depths`) to sort by estimated
     depth the way the ComfyUI graph does. The manifest records which was used.
+
+    With `export_rig`, also writes `{base_name}_rig_manifest.json` plus part
+    PNGs under `rig/` -- the pseudo-2.5D rig of
+    `docs/PORTRAIT_AUTO_RIG_FEASIBILITY_v0.1.md`, which the browser preview
+    consumes. It costs no model and no GPU pass, only numpy and cv2 over
+    layers this function already has in hand.
     """
     os.makedirs(output_dir, exist_ok=True)
 
@@ -102,6 +111,23 @@ def save_portrait_run(output_dir: str, base_name: str, result: PortraitPipelineR
             "order": "depth" if depth_dict else "semantic",
         }
 
+    rig_manifest: dict[str, Any] = {}
+    if export_rig:
+        rig_dict, rig_images = rig_export.build_rig(
+            result.layer_dict, body_remainder=result.guard.body_remainder,
+            depth_dict=depth_dict, frame_size=result.fullpage.shape[:2],
+            gradient_tags=rig_gradient_tags, run_id=os.path.basename(output_dir),
+            tag_version=str(report.get("source", {}).get("tag_version", "")),
+        )
+        rig_path = rig_export.write_rig_project(output_dir, base_name, rig_dict, rig_images)
+        rig_manifest = {
+            "manifest": os.path.basename(rig_path),
+            "images": f"{rig_export.RIG_SUBDIR}/images",
+            "parts": [part["name"] for part in rig_dict["parts"]],
+            "anchors": sorted(rig_dict["anchors"]),
+            "depth": rig_dict["source"]["depth"],
+        }
+
     manifest = {
         "base": base_name,
         "source_filename": source_filename,
@@ -117,6 +143,8 @@ def save_portrait_run(output_dir: str, base_name: str, result: PortraitPipelineR
     }
     if spine_manifest:
         manifest["spine"] = spine_manifest
+    if rig_manifest:
+        manifest["rig"] = rig_manifest
     manifest_filename = f"{base_name}_manifest.json"
     with open(os.path.join(output_dir, manifest_filename), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)

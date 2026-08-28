@@ -34,6 +34,10 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 OUTPUT_ROOT = Path(__file__).resolve().parent / "outputs"
+# Opened straight from disk rather than served: the preview reads a run folder
+# through a directory picker, so it needs no server and works on an unzipped
+# run anywhere. See docs/PORTRAIT_AUTO_RIG_FEASIBILITY_v0.1.md.
+PREVIEW_PAGE = Path(__file__).resolve().parent / "rig_preview" / "index.html"
 
 VERDICT_COLORS = {
     "PASS": "#16a34a",
@@ -137,6 +141,8 @@ def run_a001(
     subject_mask,
     export_spine,
     spine_depth_order,
+    export_rig,
+    rig_hair_gradient,
     progress=gr.Progress(track_tqdm=True),
 ):
     if image is None:
@@ -204,11 +210,18 @@ def run_a001(
         run_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
         out_dir = OUTPUT_ROOT / run_id
         manifest = save_portrait_run(str(out_dir), "a001", result, source_filename="upload.png",
-                                     export_spine=bool(export_spine), depth_dict=depth_dict)
+                                     export_spine=bool(export_spine), depth_dict=depth_dict,
+                                     export_rig=bool(export_rig),
+                                     rig_gradient_tags=("back hair",) if rig_hair_gradient else ())
         if manifest.get("spine"):
             spine_info = manifest["spine"]
             _log(f"Spine project ({spine_info['order']} order): "
                  f"{len(spine_info['slots'])} slots -> {spine_info['json']}")
+        if manifest.get("rig"):
+            rig_info = manifest["rig"]
+            _log(f"Rig manifest ({rig_info['depth']} depth): {len(rig_info['parts'])} parts, "
+                 f"anchors {', '.join(rig_info['anchors'])} -> {rig_info['manifest']}")
+            _log(f"Preview it: open {PREVIEW_PAGE} and pick {out_dir}")
 
         layer_gallery = [
             (str(out_dir / filename), tag) for tag, filename in sorted(manifest["layers"].items())
@@ -259,6 +272,11 @@ def build_app() -> gr.Blocks:
             "Single-image Portrait Mode: decompose an upper-body portrait into "
             "layers, run the Silhouette Guard, and see the PASS / SOFT_PASS / "
             "REWORK / FAIL verdict -- no ComfyUI required."
+        )
+        gr.Markdown(
+            f"**2.5D rig preview:** open `{PREVIEW_PAGE}` in a browser and pick a "
+            "run folder from `webui/outputs/` to animate it -- head turn, tilt, "
+            "breathing, and blink, with no Spine and no Live2D."
         )
 
         with gr.Row():
@@ -311,6 +329,26 @@ def build_app() -> gr.Blocks:
                         "Export Spine is on."
                     ),
                 )
+                rig_in = gr.Checkbox(
+                    label="Export 2.5D rig manifest",
+                    value=True,
+                    info=(
+                        "Writes rig_manifest.json plus cropped part PNGs for the "
+                        "browser preview: remainder split into head/neck/body, "
+                        "eyes split left/right, anchors, and head-follow weights. "
+                        "No model and no GPU pass -- see "
+                        "docs/PORTRAIT_AUTO_RIG_FEASIBILITY_v0.1.md."
+                    ),
+                )
+                rig_hair_in = gr.Checkbox(
+                    label="Rig: soften back hair",
+                    value=False,
+                    info=(
+                        "Gives 'back hair' a top-to-bottom falloff instead of "
+                        "letting it follow the head rigidly. Turn on if hair "
+                        "reaching past the shoulders tears in the preview."
+                    ),
+                )
                 run_btn = gr.Button("Run A-001", variant="primary")
 
             with gr.Column(scale=1):
@@ -336,7 +374,7 @@ def build_app() -> gr.Blocks:
             inputs=[
                 image_in, model_in, seed_in, resolution_in, steps_in,
                 head_detail_in, guard_in, autofill_in, subject_mask_in,
-                spine_in, spine_depth_in,
+                spine_in, spine_depth_in, rig_in, rig_hair_in,
             ],
             outputs=[
                 verdict_out, coverage_out, reasons_out,

@@ -1,0 +1,632 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Portrait Rig Preview</title>
+<!--
+  Stage E of docs/PORTRAIT_AUTO_RIG_FEASIBILITY_v0.1.md.
+
+  Loads a run's rig_manifest.json plus its part PNGs and animates them: head
+  pseudo-turn, head tilt, breathing, blink. Deliberately a single self-contained
+  file with no build step and no server requirement -- pick the run directory
+  and it runs from file://, so an unzipped run works on a machine that has
+  never seen this repo.
+
+  Vertex positions are recomputed on the CPU each frame and re-uploaded. At a
+  few thousand vertices that costs nothing, and it keeps the deformation
+  readable as plain arithmetic instead of shader source -- this is a
+  feasibility rig, and being able to step through the math matters more than
+  the frame budget.
+-->
+<style>
+  :root {
+    --bg: #14161a; --panel: #1c1f26; --line: #2c313b;
+    --fg: #e8eaee; --muted: #99a1ae; --accent: #6ea8fe;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 13px/1.5 ui-sans-serif, system-ui, "Segoe UI", sans-serif;
+    display: grid; grid-template-columns: 1fr 320px; height: 100vh;
+  }
+  #stage { position: relative; display: grid; place-items: center; overflow: hidden; }
+  canvas { max-width: 100%; max-height: 100vh; display: block; }
+  #drop {
+    position: absolute; inset: 24px; border: 2px dashed var(--line); border-radius: 12px;
+    display: grid; place-content: center; text-align: center; gap: 14px; padding: 32px;
+    background: rgba(20,22,26,.92);
+  }
+  #drop.hidden { display: none; }
+  #drop h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  #drop p { color: var(--muted); margin: 0; max-width: 44ch; }
+  #panel { background: var(--panel); border-left: 1px solid var(--line); overflow-y: auto; padding: 16px; }
+  h2 { font-size: 11px; text-transform: uppercase; letter-spacing: .08em;
+       color: var(--muted); margin: 20px 0 8px; font-weight: 600; }
+  h2:first-child { margin-top: 0; }
+  label { display: block; margin: 8px 0; }
+  .row { display: flex; align-items: center; gap: 8px; }
+  .row input[type=range] { flex: 1; min-width: 0; }
+  .val { font-variant-numeric: tabular-nums; color: var(--muted); min-width: 44px; text-align: right; }
+  button {
+    background: #262b34; color: var(--fg); border: 1px solid var(--line);
+    border-radius: 6px; padding: 6px 10px; cursor: pointer; font: inherit;
+  }
+  button:hover { border-color: var(--accent); }
+  select { background: #262b34; color: var(--fg); border: 1px solid var(--line);
+           border-radius: 6px; padding: 4px 6px; font: inherit; width: 100%; }
+  .parts label { display: flex; gap: 8px; align-items: center; font-variant-numeric: tabular-nums; }
+  .parts .z { color: var(--muted); width: 22px; text-align: right; }
+  .hint { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+  .meta { color: var(--muted); font-size: 12px; }
+  .warn { color: #ffb454; }
+  #err { color: #ff8080; white-space: pre-wrap; }
+</style>
+</head>
+<body>
+
+<div id="stage">
+  <canvas id="gl"></canvas>
+  <div id="drop">
+    <h1>Portrait Rig Preview</h1>
+    <p>Pick a run directory containing <code>*_rig_manifest.json</code> and
+       <code>rig/images/</code>, or drop the folder here.</p>
+    <div class="row" style="justify-content:center">
+      <button id="pick">Choose run folder</button>
+    </div>
+    <p id="err"></p>
+  </div>
+</div>
+
+<div id="panel">
+  <h2>Run</h2>
+  <div class="meta" id="runmeta">no run loaded</div>
+
+  <h2>Idle</h2>
+  <label class="row"><input type="checkbox" id="autoIdle" checked> Auto idle motion</label>
+  <label class="row"><input type="checkbox" id="doBlink" checked> Blink</label>
+  <label class="row"><input type="checkbox" id="doBreathe" checked> Breathing</label>
+  <div class="row">
+    <button id="winkL">Wink L</button>
+    <button id="winkR">Wink R</button>
+    <button id="blinkNow">Blink</button>
+  </div>
+  <p class="hint">Wink buttons exercise the left/right eye split (H4).</p>
+
+  <h2>Head</h2>
+  <label>Turn X <span class="val" id="turnXv">0.00</span>
+    <input type="range" id="turnX" min="-1.5" max="1.5" step="0.01" value="0"></label>
+  <label>Turn Y <span class="val" id="turnYv">0.00</span>
+    <input type="range" id="turnY" min="-1.5" max="1.5" step="0.01" value="0"></label>
+  <label>Tilt Z <span class="val" id="tiltv">0.0&deg;</span>
+    <input type="range" id="tilt" min="-15" max="15" step="0.1" value="0"></label>
+  <p class="hint">Push past the manifest's &plusmn;2&deg; to find where
+     disocclusion shows (H1). Turn off auto idle first.</p>
+
+  <h2>Experiments</h2>
+  <label class="row"><input type="checkbox" id="ghost"> head_remainder &rarr; body group</label>
+  <p class="hint">Reproduces the Spine ghost silhouette (H2).</p>
+  <label>Neck weight
+    <select id="neckMode">
+      <option value="gradient">gradient (manifest)</option>
+      <option value="rigid">rigid 1.0</option>
+      <option value="detached">detached 0.0</option>
+    </select></label>
+  <p class="hint">Compare against the two degenerate cases (H3).</p>
+  <label class="row"><input type="checkbox" id="wire"> Show mesh</label>
+
+  <h2>Parts</h2>
+  <div class="parts" id="parts"></div>
+</div>
+
+<script>
+"use strict";
+
+// Parallax strength as a fraction of the canvas, so the same manifest reads
+// the same at any render resolution. Near layers travel further than far ones,
+// which is the entire illusion; these are starting values to be tuned against
+// A-001, not measurements.
+const TURN_BASE = 0.015;   // every head part moves at least this much
+const TURN_SPAN = 0.045;   // ... plus this much more the nearer it is
+const TURN_Y_SCALE = 0.7;  // vertical parallax reads stronger, so damp it
+
+const EYE_TAGS = new Set([
+  "eyewhite", "eyewhitel", "eyewhiter",
+  "irides", "iridesl", "iridesr",
+  "eyelash", "eyelashl", "eyelashr",
+  "eyes", "eyel", "eyer",
+]);
+
+const VERT_SRC = `
+attribute vec2 a_pos;
+attribute vec2 a_uv;
+uniform vec2 u_canvas;
+varying vec2 v_uv;
+void main() {
+  vec2 clip = vec2(a_pos.x / u_canvas.x * 2.0 - 1.0,
+                   1.0 - a_pos.y / u_canvas.y * 2.0);
+  gl_Position = vec4(clip, 0.0, 1.0);
+  v_uv = a_uv;
+}`;
+
+const FRAG_SRC = `
+precision mediump float;
+uniform sampler2D u_tex;
+uniform float u_wire;
+varying vec2 v_uv;
+void main() {
+  if (u_wire > 0.5) { gl_FragColor = vec4(0.43, 0.66, 1.0, 0.5); return; }
+  gl_FragColor = texture2D(u_tex, v_uv);
+}`;
+
+const state = {
+  manifest: null,
+  parts: [],
+  gl: null, prog: null, loc: null,
+  canvasW: 0, canvasH: 0,
+  turnX: 0, turnY: 0, tiltDeg: 0,
+  blink: { l: 0, r: 0 },
+  blinkTimer: 0, blinkPhase: null,
+  t0: performance.now(),
+};
+
+/* ---------- loading ---------- */
+
+const dropEl = document.getElementById("drop");
+const errEl = document.getElementById("err");
+
+document.getElementById("pick").addEventListener("click", () => {
+  const input = document.createElement("input");
+  input.type = "file";
+  input.webkitdirectory = true;
+  input.addEventListener("change", () => loadFromFiles([...input.files]));
+  input.click();
+});
+
+document.addEventListener("dragover", (e) => e.preventDefault());
+document.addEventListener("drop", async (e) => {
+  e.preventDefault();
+  const files = [];
+  const walk = async (entry, path) => {
+    if (entry.isFile) {
+      const file = await new Promise((res) => entry.file(res));
+      file._path = path + entry.name;
+      files.push(file);
+    } else if (entry.isDirectory) {
+      const reader = entry.createReader();
+      let batch;
+      do {
+        batch = await new Promise((res) => reader.readEntries(res));
+        for (const child of batch) await walk(child, path + entry.name + "/");
+      } while (batch.length);
+    }
+  };
+  for (const item of e.dataTransfer.items) {
+    const entry = item.webkitGetAsEntry && item.webkitGetAsEntry();
+    if (entry) await walk(entry, "");
+  }
+  loadFromFiles(files);
+});
+
+function pathOf(file) {
+  return (file._path || file.webkitRelativePath || file.name).replace(/\\/g, "/");
+}
+
+async function loadFromFiles(files) {
+  errEl.textContent = "";
+  const manifestFile = files.find((f) => /_rig_manifest\.json$/.test(pathOf(f)));
+  if (!manifestFile) {
+    errEl.textContent = "No *_rig_manifest.json in that folder. Run A-001 with " +
+                        "\"Export 2.5D rig manifest\" enabled.";
+    return;
+  }
+  let manifest;
+  try {
+    manifest = JSON.parse(await manifestFile.text());
+  } catch (e) {
+    errEl.textContent = "Could not parse the manifest: " + e.message;
+    return;
+  }
+  // Match each part's declared image path against the picked files by suffix:
+  // the picker roots paths at whatever folder was chosen, which may be the run
+  // directory or its parent.
+  const byPath = new Map(files.map((f) => [pathOf(f), f]));
+  const find = (rel) => {
+    for (const [path, file] of byPath) if (path.endsWith("/" + rel) || path === rel) return file;
+    return null;
+  };
+  const missing = [];
+  const images = new Map();
+  for (const part of manifest.parts) {
+    const file = find(part.image);
+    if (!file) { missing.push(part.image); continue; }
+    images.set(part.name, await createImageBitmap(file));
+  }
+  if (missing.length) {
+    errEl.textContent = "Missing part images:\n" + missing.join("\n");
+    return;
+  }
+  build(manifest, images);
+  dropEl.classList.add("hidden");
+}
+
+// Serving the run over HTTP instead? ?manifest=<url> skips the picker.
+const fromQuery = new URLSearchParams(location.search).get("manifest");
+if (fromQuery) {
+  (async () => {
+    try {
+      const manifest = await (await fetch(fromQuery)).json();
+      const base = fromQuery.slice(0, fromQuery.lastIndexOf("/") + 1);
+      const images = new Map();
+      for (const part of manifest.parts) {
+        const blob = await (await fetch(base + part.image)).blob();
+        images.set(part.name, await createImageBitmap(blob));
+      }
+      build(manifest, images);
+      dropEl.classList.add("hidden");
+    } catch (e) {
+      errEl.textContent = "Could not load ?manifest=: " + e.message;
+    }
+  })();
+}
+
+/* ---------- geometry ---------- */
+
+function smoothstep(edge0, edge1, x) {
+  if (edge1 === edge0) return x < edge0 ? 0 : 1;
+  const t = Math.min(1, Math.max(0, (x - edge0) / (edge1 - edge0)));
+  return t * t * (3 - 2 * t);
+}
+
+/** Head-follow weight for a vertex, from the manifest's weight spec. The
+ *  gradient is what a bone rig cannot express: the top of the neck follows the
+ *  head while its bottom stays with the body. */
+function weightAt(spec, y) {
+  if (spec.mode === "gradient_y") {
+    return spec.bottom + (spec.top - spec.bottom) * (1 - smoothstep(spec.y_top, spec.y_bottom, y));
+  }
+  return spec.value;
+}
+
+function buildMesh(part) {
+  const [x1, y1, x2, y2] = part.xyxy;
+  const cell = Math.max(4, part.mesh.cell);
+  const cols = Math.max(1, Math.round((x2 - x1) / cell));
+  const rows = Math.max(1, Math.round((y2 - y1) / cell));
+  const rest = [], uv = [], weight = [];
+  for (let r = 0; r <= rows; r++) {
+    for (let c = 0; c <= cols; c++) {
+      const u = c / cols, v = r / rows;
+      const x = x1 + (x2 - x1) * u, y = y1 + (y2 - y1) * v;
+      rest.push(x, y);
+      uv.push(u, v);
+      weight.push(weightAt(part.weight, y));
+    }
+  }
+  const idx = [], wire = [];
+  const at = (r, c) => r * (cols + 1) + c;
+  for (let r = 0; r < rows; r++) {
+    for (let c = 0; c < cols; c++) {
+      const a = at(r, c), b = at(r, c + 1), d = at(r + 1, c), e = at(r + 1, c + 1);
+      idx.push(a, b, d, b, e, d);
+      wire.push(a, b, a, d);
+      if (c === cols - 1) wire.push(b, e);
+      if (r === rows - 1) wire.push(d, e);
+    }
+  }
+  return {
+    rest: new Float32Array(rest), uv: new Float32Array(uv),
+    weight: new Float32Array(weight), live: new Float32Array(rest),
+    index: new Uint16Array(idx), wireIndex: new Uint16Array(wire),
+    count: idx.length, wireCount: wire.length,
+  };
+}
+
+/* ---------- GL ---------- */
+
+function compile(gl, type, src) {
+  const sh = gl.createShader(type);
+  gl.shaderSource(sh, src);
+  gl.compileShader(sh);
+  if (!gl.getShaderParameter(sh, gl.COMPILE_STATUS)) throw new Error(gl.getShaderInfoLog(sh));
+  return sh;
+}
+
+function initGL(canvas) {
+  const gl = canvas.getContext("webgl", { premultipliedAlpha: false, antialias: true });
+  if (!gl) throw new Error("WebGL is not available in this browser.");
+  const prog = gl.createProgram();
+  gl.attachShader(prog, compile(gl, gl.VERTEX_SHADER, VERT_SRC));
+  gl.attachShader(prog, compile(gl, gl.FRAGMENT_SHADER, FRAG_SRC));
+  gl.linkProgram(prog);
+  if (!gl.getProgramParameter(prog, gl.LINK_STATUS)) throw new Error(gl.getProgramInfoLog(prog));
+  gl.useProgram(prog);
+  gl.enable(gl.BLEND);
+  gl.blendFuncSeparate(gl.SRC_ALPHA, gl.ONE_MINUS_SRC_ALPHA, gl.ONE, gl.ONE_MINUS_SRC_ALPHA);
+  gl.disable(gl.DEPTH_TEST);  // draw order is the manifest's z, back to front
+  return {
+    gl, prog,
+    loc: {
+      pos: gl.getAttribLocation(prog, "a_pos"),
+      uv: gl.getAttribLocation(prog, "a_uv"),
+      canvas: gl.getUniformLocation(prog, "u_canvas"),
+      tex: gl.getUniformLocation(prog, "u_tex"),
+      wire: gl.getUniformLocation(prog, "u_wire"),
+    },
+  };
+}
+
+function makeTexture(gl, bitmap) {
+  const tex = gl.createTexture();
+  gl.bindTexture(gl.TEXTURE_2D, tex);
+  // Part crops are arbitrary sizes, so no mipmaps and clamp at the edges.
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+  gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
+  gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+  return tex;
+}
+
+/* ---------- build ---------- */
+
+function build(manifest, images) {
+  const canvas = document.getElementById("gl");
+  state.manifest = manifest;
+  state.canvasW = manifest.canvas.width;
+  state.canvasH = manifest.canvas.height;
+  canvas.width = state.canvasW;
+  canvas.height = state.canvasH;
+
+  const { gl, prog, loc } = initGL(canvas);
+  state.gl = gl; state.prog = prog; state.loc = loc;
+  gl.uniform2f(loc.canvas, state.canvasW, state.canvasH);
+
+  const anchors = manifest.anchors || {};
+  state.parts = manifest.parts.slice().sort((a, b) => a.z - b.z).map((part) => {
+    const mesh = buildMesh(part);
+    const isEye = EYE_TAGS.has(part.tag);
+    // Only eye parts get a side: plenty of other tags end in 'l' or 'r'
+    // ("back hair", "topwear") and must not claim an eye anchor.
+    const side = !isEye ? null : part.tag.endsWith("l") ? "l" : part.tag.endsWith("r") ? "r" : null;
+    const eyeAnchor = side === "l" ? anchors.eye_left : side === "r" ? anchors.eye_right : null;
+    return {
+      spec: part, mesh, visible: true,
+      tex: makeTexture(gl, images.get(part.name)),
+      buf: { pos: gl.createBuffer(), uv: gl.createBuffer(),
+             idx: gl.createBuffer(), wire: gl.createBuffer() },
+      isEye,
+      eyeSide: side,
+      eyeCenterY: eyeAnchor ? eyeAnchor[1] : (part.xyxy[1] + part.xyxy[3]) / 2,
+    };
+  });
+
+  for (const p of state.parts) {
+    gl.bindBuffer(gl.ARRAY_BUFFER, p.buf.uv);
+    gl.bufferData(gl.ARRAY_BUFFER, p.mesh.uv, gl.STATIC_DRAW);
+    gl.bindBuffer(gl.ARRAY_BUFFER, p.buf.pos);
+    gl.bufferData(gl.ARRAY_BUFFER, p.mesh.live, gl.DYNAMIC_DRAW);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, p.buf.idx);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, p.mesh.index, gl.STATIC_DRAW);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, p.buf.wire);
+    gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, p.mesh.wireIndex, gl.STATIC_DRAW);
+  }
+
+  renderPanel();
+  requestAnimationFrame(frame);
+}
+
+function renderPanel() {
+  const m = state.manifest;
+  const anchors = Object.keys(m.anchors || {});
+  const verts = state.parts.reduce((n, p) => n + p.mesh.rest.length / 2, 0);
+  document.getElementById("runmeta").innerHTML =
+    `<div>run <b>${m.source.run_id || "(unnamed)"}</b> &middot; ${m.source.tag_version || "?"}</div>` +
+    `<div>depth source: <b>${m.source.depth}</b></div>` +
+    `<div>${m.parts.length} parts &middot; ${verts} vertices</div>` +
+    `<div>anchors: ${anchors.join(", ") || "<span class='warn'>none</span>"}</div>` +
+    (anchors.includes("neck_pivot") ? "" :
+      "<div class='warn'>no neck_pivot: tilt disabled</div>");
+
+  const host = document.getElementById("parts");
+  host.innerHTML = "";
+  for (const p of state.parts) {
+    const row = document.createElement("label");
+    const cb = document.createElement("input");
+    cb.type = "checkbox"; cb.checked = true;
+    cb.addEventListener("change", () => { p.visible = cb.checked; });
+    const z = document.createElement("span");
+    z.className = "z"; z.textContent = p.spec.z;
+    const name = document.createElement("span");
+    name.textContent = `${p.spec.tag} (${p.spec.group})`;
+    row.append(cb, z, name);
+    host.appendChild(row);
+  }
+}
+
+/* ---------- animation ---------- */
+
+function scheduleBlink(now) {
+  const cfg = state.manifest.motion.blink;
+  const [lo, hi] = cfg.interval_s;
+  state.blinkTimer = now + (lo + Math.random() * (hi - lo)) * 1000;
+}
+
+function startBlink(now, sides) {
+  const cfg = state.manifest.motion.blink;
+  state.blinkPhase = {
+    start: now, sides,
+    close: cfg.close_s * 1000, hold: cfg.hold_s * 1000, open: cfg.open_s * 1000,
+  };
+}
+
+function blinkAmount(now) {
+  const ph = state.blinkPhase;
+  if (!ph) return { l: 0, r: 0 };
+  const dt = now - ph.start;
+  let a;
+  if (dt < ph.close) a = dt / ph.close;
+  else if (dt < ph.close + ph.hold) a = 1;
+  else if (dt < ph.close + ph.hold + ph.open) a = 1 - (dt - ph.close - ph.hold) / ph.open;
+  else { state.blinkPhase = null; return { l: 0, r: 0 }; }
+  return { l: ph.sides.includes("l") ? a : 0, r: ph.sides.includes("r") ? a : 0 };
+}
+
+/** Weight overrides for the H2/H3 experiments. `motion.overrides` is read once
+ *  per frame -- doing a DOM lookup per vertex costs more than the deformation. */
+function effectiveWeight(part, i, overrides) {
+  if (overrides.ghost && part.spec.tag === "head_remainder") return 0.16;
+  if (part.spec.group === "neck") {
+    if (overrides.neck === "rigid") return 1.0;
+    if (overrides.neck === "detached") return 0.0;
+  }
+  return part.mesh.weight[i];
+}
+
+function deform(part, now, motion) {
+  const { rest, live } = part.mesh;
+  const anchors = state.manifest.anchors || {};
+  const pivot = anchors.neck_pivot;
+  const bodyPivotY = anchors.body_pivot ? anchors.body_pivot[1] : state.canvasH;
+  const span = Math.max(state.canvasW, state.canvasH);
+  const parallax = span * (TURN_BASE + TURN_SPAN * (1 - part.spec.depth));
+  const tilt = pivot ? motion.tiltRad : 0;
+  const blink = part.eyeSide === "l" ? motion.blink.l
+              : part.eyeSide === "r" ? motion.blink.r
+              : Math.max(motion.blink.l, motion.blink.r);
+
+  for (let i = 0, v = 0; v < rest.length; i++, v += 2) {
+    let x = rest[v], y = rest[v + 1];
+    const w = effectiveWeight(part, i, motion.overrides);
+
+    // Eyes close toward their own centre line before anything moves them, so
+    // the lid stays put while the head turns.
+    if (part.isEye && blink > 0) {
+      y = part.eyeCenterY + (y - part.eyeCenterY) * (1 - blink);
+    }
+
+    // Depth-differential parallax: near parts travel further than far ones.
+    x += motion.turnX * parallax * w;
+    y += motion.turnY * parallax * TURN_Y_SCALE * w;
+
+    // Tilt about the neck pivot, scaled by the same weight, which is what
+    // keeps the bottom of the neck attached to the torso.
+    if (tilt !== 0 && w !== 0) {
+      const a = tilt * w, cos = Math.cos(a), sin = Math.sin(a);
+      const dx = x - pivot[0], dy = y - pivot[1];
+      x = pivot[0] + dx * cos - dy * sin;
+      y = pivot[1] + dx * sin + dy * cos;
+    }
+
+    if (motion.breath !== 0) {
+      if (part.spec.group === "body") {
+        y = bodyPivotY + (y - bodyPivotY) * (1 + motion.breath * 0.004);
+      } else {
+        y -= motion.breath * state.manifest.motion.breathing.amplitude_px;
+      }
+    }
+
+    live[v] = x; live[v + 1] = y;
+  }
+}
+
+function frame(now) {
+  const gl = state.gl, loc = state.loc;
+  const t = (now - state.t0) / 1000;
+
+  if (document.getElementById("autoIdle").checked) {
+    // Two incommensurable periods so the loop never visibly repeats.
+    setSlider("turnX", Math.sin(t * 0.37) * 0.55 + Math.sin(t * 0.13) * 0.2);
+    setSlider("turnY", Math.sin(t * 0.29 + 1.1) * 0.35);
+    setSlider("tilt", Math.sin(t * 0.23 + 0.6) * state.manifest.motion.head_tilt.max_deg);
+  }
+
+  if (document.getElementById("doBlink").checked) {
+    if (!state.blinkTimer) scheduleBlink(now);
+    if (!state.blinkPhase && now >= state.blinkTimer) {
+      startBlink(now, ["l", "r"]);
+      scheduleBlink(now);
+      // Occasionally blink twice in quick succession.
+      if (Math.random() < 0.2) state.blinkTimer = now + 260;
+    }
+  }
+
+  const motion = {
+    turnX: state.turnX, turnY: state.turnY,
+    tiltRad: state.tiltDeg * Math.PI / 180,
+    blink: blinkAmount(now),
+    breath: document.getElementById("doBreathe").checked
+      ? Math.sin(t * 2 * Math.PI / state.manifest.motion.breathing.period_s) : 0,
+    overrides: {
+      ghost: document.getElementById("ghost").checked,
+      neck: document.getElementById("neckMode").value,
+    },
+  };
+
+  gl.viewport(0, 0, state.canvasW, state.canvasH);
+  gl.clearColor(0, 0, 0, 0);
+  gl.clear(gl.COLOR_BUFFER_BIT);
+
+  const wire = document.getElementById("wire").checked;
+  for (const p of state.parts) {
+    if (!p.visible) continue;
+    deform(p, now, motion);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, p.buf.pos);
+    gl.bufferSubData(gl.ARRAY_BUFFER, 0, p.mesh.live);
+    gl.enableVertexAttribArray(loc.pos);
+    gl.vertexAttribPointer(loc.pos, 2, gl.FLOAT, false, 0, 0);
+
+    gl.bindBuffer(gl.ARRAY_BUFFER, p.buf.uv);
+    gl.enableVertexAttribArray(loc.uv);
+    gl.vertexAttribPointer(loc.uv, 2, gl.FLOAT, false, 0, 0);
+
+    gl.activeTexture(gl.TEXTURE0);
+    gl.bindTexture(gl.TEXTURE_2D, p.tex);
+    gl.uniform1i(loc.tex, 0);
+
+    gl.uniform1f(loc.wire, 0);
+    gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, p.buf.idx);
+    gl.drawElements(gl.TRIANGLES, p.mesh.count, gl.UNSIGNED_SHORT, 0);
+
+    if (wire) {
+      gl.uniform1f(loc.wire, 1);
+      gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, p.buf.wire);
+      gl.drawElements(gl.LINES, p.mesh.wireCount, gl.UNSIGNED_SHORT, 0);
+    }
+  }
+  requestAnimationFrame(frame);
+}
+
+/* ---------- controls ---------- */
+
+function setSlider(id, value) {
+  const el = document.getElementById(id);
+  el.value = value;
+  syncSlider(id);
+}
+
+function syncSlider(id) {
+  const value = parseFloat(document.getElementById(id).value);
+  if (id === "turnX") { state.turnX = value; document.getElementById("turnXv").textContent = value.toFixed(2); }
+  if (id === "turnY") { state.turnY = value; document.getElementById("turnYv").textContent = value.toFixed(2); }
+  if (id === "tilt") { state.tiltDeg = value; document.getElementById("tiltv").textContent = value.toFixed(1) + "°"; }
+}
+
+for (const id of ["turnX", "turnY", "tilt"]) {
+  document.getElementById(id).addEventListener("input", () => {
+    document.getElementById("autoIdle").checked = false;
+    syncSlider(id);
+  });
+}
+
+document.getElementById("blinkNow").addEventListener("click",
+  () => startBlink(performance.now(), ["l", "r"]));
+document.getElementById("winkL").addEventListener("click",
+  () => startBlink(performance.now(), ["l"]));
+document.getElementById("winkR").addEventListener("click",
+  () => startBlink(performance.now(), ["r"]));
+</script>
+</body>
+</html>
