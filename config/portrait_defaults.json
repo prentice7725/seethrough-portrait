@@ -1,0 +1,33 @@
+{
+  "schema_version": 1,
+  "alpha": {
+    "presence_threshold": 0.04,
+    "binary_threshold": 0.062745,
+    "informative_transparency_min": 0.005,
+    "subject_area_min": 0.02,
+    "subject_area_max": 0.98,
+    "layer_presence_ratio_min": 0.001
+  },
+  "guard": {
+    "enabled": true,
+    "clip_layers_to_subject": true,
+    "metric_binary_threshold": 0.05,
+    "reconstruction_epsilon": 0.000001
+  },
+  "scoring": {
+    "similarity_weight": 0.5,
+    "silhouette_weight": 0.35,
+    "shoulder_arm_weight": 0.15,
+    "spill_penalty_weight": 0.2,
+    "critical_group_penalty": 0.15,
+    "low_similarity_threshold": 0.85,
+    "max_auto_fill_runs": 5
+  },
+  "verdict": {
+    "pass_pre_coverage_min": 0.94,
+    "pass_remainder_max": 0.06,
+    "soft_pass_post_coverage_min": 0.995,
+    "soft_pass_remainder_max": 0.2,
+    "post_spill_max": 0.002
+  }
+}

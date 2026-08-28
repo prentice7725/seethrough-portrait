@@ -1,0 +1,1843 @@
+import os
+import sys
+import random
+import uuid
+from datetime import datetime
+
+print("[SeeThrough] nodes.py: starting imports...", flush=True)
+
+import torch
+import numpy as np
+
+import folder_paths
+import comfy.model_management as mm
+import traceback
+import re
+
+
+def _sanitize_filename(name):
+    """Windows-safe filename sanitization; preserves Unicode and spaces.
+
+    Replaces `<>:"|?*\\/\x00` with underscore; strips trailing dots/spaces.
+    """
+    if not name:
+        return ""
+    cleaned = re.sub(r'[<>:"|?*\\/\x00]', '_', str(name))
+    return cleaned.rstrip(' .')
+
+
+def _log_vram(label):
+    """Log current GPU VRAM usage for profiling."""
+    if torch.cuda.is_available():
+        alloc = torch.cuda.memory_allocated() / (1024 ** 3)
+        reserved = torch.cuda.memory_reserved() / (1024 ** 3)
+        print(f"[SeeThrough VRAM] {label}: allocated={alloc:.2f}GB, reserved={reserved:.2f}GB", flush=True)
+
+
+def _assert_text_encoder_loaded(text_encoder, name, pretrained):
+    """Fail fast when diffusers silently substitutes an empty placeholder (e.g. nn.Identity)
+    for a missing text_encoder. Detects by checking for the presence of parameters, which
+    covers any placeholder type, not just nn.Identity. See issue #6."""
+    if text_encoder is None or next(text_encoder.parameters(), None) is None:
+        raise RuntimeError(
+            f"{name} failed to load (got empty placeholder with no parameters).\n"
+            f"Model path: {pretrained}\n"
+            f"Likely causes:\n"
+            f"  1. Model checkpoint missing text_encoder/text_encoder_2 subfolder or model_index.json entries.\n"
+            f"  2. Incompatible diffusers version silently substituted nn.Identity placeholder.\n"
+            f"Fix: re-download the model, or downgrade diffusers to a version compatible with your ComfyUI build.\n"
+            f"See: https://github.com/tackcrypto1031/tk_seethrough/issues/6"
+        )
+
+print("[SeeThrough] nodes.py: comfy imports OK", flush=True)
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+SEETHROUGH_ROOT_DIR = os.path.join(CURRENT_DIR, "see-through")
+SEETHROUGH_COMMON_DIR = os.path.join(SEETHROUGH_ROOT_DIR, "common")
+
+print(f"[SeeThrough] CURRENT_DIR = {CURRENT_DIR}", flush=True)
+print(f"[SeeThrough] SEETHROUGH_COMMON_DIR = {SEETHROUGH_COMMON_DIR}", flush=True)
+print(f"[SeeThrough] common dir exists = {os.path.isdir(SEETHROUGH_COMMON_DIR)}", flush=True)
+
+# Mock pycocotools if not installed (only used for mask RLE, not needed here)
+try:
+    import pycocotools  # noqa: F401
+    print("[SeeThrough] pycocotools found", flush=True)
+except ImportError:
+    print("[SeeThrough] pycocotools not found, installing mock...", flush=True)
+    import types as _types
+    _mock_pycocotools = _types.ModuleType("pycocotools")
+    _mock_mask = _types.ModuleType("pycocotools.mask")
+    _mock_pycocotools.mask = _mock_mask
+    sys.modules["pycocotools"] = _mock_pycocotools
+    sys.modules["pycocotools.mask"] = _mock_mask
+
+if SEETHROUGH_COMMON_DIR not in sys.path:
+    sys.path.insert(0, SEETHROUGH_COMMON_DIR)
+    print(f"[SeeThrough] Added to sys.path: {SEETHROUGH_COMMON_DIR}", flush=True)
+
+if SEETHROUGH_ROOT_DIR not in sys.path:
+    sys.path.insert(1, SEETHROUGH_ROOT_DIR)
+    print(f"[SeeThrough] Added to sys.path: {SEETHROUGH_ROOT_DIR}", flush=True)
+
+_st_conflict_backup = {}
+for _prefix in ("utils", "modules"):
+    for _key in list(sys.modules.keys()):
+        if _key == _prefix or _key.startswith(_prefix + "."):
+            _st_conflict_backup[_key] = sys.modules.pop(_key)
+if _st_conflict_backup:
+    print(f"[SeeThrough] Temporarily removed {len(_st_conflict_backup)} conflicting sys.modules entries: "
+          f"{list(_st_conflict_backup.keys())[:10]}{'...' if len(_st_conflict_backup) > 10 else ''}", flush=True)
+
+print("[SeeThrough] Importing see-through modules...", flush=True)
+import cv2
+from safetensors.torch import load_file
+
+from modules.layerdiffuse.diffusers_kdiffusion_sdxl import KDiffusionStableDiffusionXLPipeline
+from modules.layerdiffuse.layerdiff3d import UNetFrameConditionModel
+from modules.layerdiffuse.vae import TransparentVAE
+from modules.marigold import MarigoldDepthPipeline
+from utils.cv import center_square_pad_resize, img_alpha_blending, smart_resize
+from utils.torchcv import cluster_inpaint_part
+
+try:
+    from .portrait_core import (
+        PortraitConfig,
+        apply_silhouette_guard,
+        evaluate_portrait_layers,
+        resolve_subject_mask,
+        select_best_layer_set,
+    )
+    from .portrait_core.report import build_portrait_report
+except ImportError:
+    from portrait_core import (
+        PortraitConfig,
+        apply_silhouette_guard,
+        evaluate_portrait_layers,
+        resolve_subject_mask,
+        select_best_layer_set,
+    )
+    from portrait_core.report import build_portrait_report
+
+print("[SeeThrough] All see-through imports OK", flush=True)
+
+for _key, _mod in _st_conflict_backup.items():
+    if _key not in sys.modules:
+        sys.modules[_key] = _mod
+del _st_conflict_backup
+
+DEFAULT_LAYERDIFF_REPO = "layerdifforg/seethroughv0.0.2_layerdiff3d"
+DEFAULT_DEPTH_REPO = "layerdifforg/seethroughv0.0.1_marigold"
+
+VALID_BODY_PARTS_V2 = [
+    "hair", "headwear", "face", "eyes", "eyewear", "ears", "earwear",
+    "nose", "mouth", "neck", "neckwear", "topwear", "handwear",
+    "bottomwear", "legwear", "footwear", "tail", "wings", "objects",
+]
+
+VALID_BODY_PARTS_V3_BODY = [
+    "front hair", "back hair", "head", "neck", "neckwear",
+    "topwear", "handwear", "bottomwear", "legwear", "footwear",
+    "tail", "wings", "objects",
+]
+
+VALID_BODY_PARTS_V3_HEAD = [
+    "headwear", "face", "irides", "eyebrow", "eyewhite",
+    "eyelash", "eyewear", "ears", "earwear", "nose", "mouth",
+]
+
+# All unique tags across v2 + v3 (26 total), used for boolean INPUT_TYPES
+ALL_TAGS = list(dict.fromkeys(
+    VALID_BODY_PARTS_V2 + VALID_BODY_PARTS_V3_BODY + VALID_BODY_PARTS_V3_HEAD
+))
+
+SEETHROUGH_MODELS_DIR = os.path.join(folder_paths.models_dir, "SeeThrough")
+os.makedirs(SEETHROUGH_MODELS_DIR, exist_ok=True)
+
+
+class SeeThrough_LayersData:
+    """Output of GenerateLayers: raw RGBA layers + preprocessing info."""
+    def __init__(self, layer_dict, fullpage, input_img, resolution, pad_size, pad_pos,
+                 all_runs_layers=None, portrait_result=None):
+        self.layer_dict = layer_dict      # tag -> RGBA numpy (resolution x resolution)
+        self.fullpage = fullpage           # center-padded input (resolution x resolution, RGBA)
+        self.input_img = input_img         # original input (RGBA)
+        self.resolution = resolution
+        self.pad_size = pad_size
+        self.pad_pos = pad_pos
+        self.scale = pad_size[0] / resolution
+        self.all_runs_layers = all_runs_layers  # list of {"run": int, "layer_dict": {tag: RGBA}} or None
+        self.portrait_result = portrait_result
+
+
+class SeeThrough_LayersDepthData:
+    """Output of GenerateDepth: layers + per-tag depth maps."""
+    def __init__(self, layer_dict, depth_dict, fullpage, resolution, all_runs_layers=None,
+                 input_img=None, portrait_result=None):
+        self.layer_dict = layer_dict      # tag -> RGBA numpy
+        self.depth_dict = depth_dict      # tag -> float32 depth [0,1]
+        self.fullpage = fullpage
+        self.resolution = resolution
+        self.all_runs_layers = all_runs_layers  # passed through from LayersData
+        self.input_img = input_img        # original input (RGBA), for PSD base layer
+        self.portrait_result = portrait_result
+
+
+def seed_everything(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+
+
+def _scan_model_dirs():
+    found = []
+    if os.path.isdir(SEETHROUGH_MODELS_DIR):
+        for name in sorted(os.listdir(SEETHROUGH_MODELS_DIR)):
+            if os.path.isdir(os.path.join(SEETHROUGH_MODELS_DIR, name)):
+                found.append(name)
+    return found
+
+
+def _resolve_model_path(model_name):
+    model_basename = model_name.split("/")[-1]
+    local = os.path.join(SEETHROUGH_MODELS_DIR, model_basename)
+    if os.path.isdir(local):
+        return local
+    if "/" in model_name:
+        try:
+            from huggingface_hub import snapshot_download
+            print(f"[SeeThrough] Downloading {model_name} -> {local}", flush=True)
+            snapshot_download(repo_id=model_name, local_dir=local)
+            return local
+        except Exception as e:
+            print(f"[SeeThrough] snapshot_download failed ({e}); falling back to HF cache", flush=True)
+    return model_name
+
+
+def _label_lr_split(labels, stats, id1, id2):
+    label1 = (labels == id1).astype(np.uint8) * 255
+    label2 = (labels == id2).astype(np.uint8) * 255
+    stats1, stats2 = stats[id1], stats[id2]
+    x1 = stats[id1][0] + stats[id1][2] / 2
+    x2 = stats[id2][0] + stats[id2][2] / 2
+    if x2 < x1:
+        return label2, label1, stats2, stats1
+    return label1, label2, stats1, stats2
+
+
+def _process_cuts(img, depth, src_xyxy, tgt_bbox, mask=None):
+    tx1, ty1, tx2, ty2 = tgt_bbox[:4]
+    tx2 += tx1
+    ty2 += ty1
+    img = img[ty1:ty2, tx1:tx2].copy()
+    depth = depth[ty1:ty2, tx1:tx2]
+    depth_median = 1.0
+    if mask is not None:
+        mask = (mask[ty1:ty2, tx1:tx2].copy() > 15).astype(np.uint8)
+        ksize = 1
+        element = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * ksize + 1, 2 * ksize + 1), (ksize, ksize))
+        mask = cv2.dilate(mask, element)
+        img[..., -1] *= mask
+        depth = 1 - (1 - depth) * mask
+        if np.any(mask):
+            depth_median = float(np.median(depth[mask > 0]))
+    fxyxy = [tx1 + src_xyxy[0], ty1 + src_xyxy[1], tx2 + src_xyxy[0], ty2 + src_xyxy[1]]
+    return img, depth, fxyxy, depth_median
+
+
+def _part_lr_split(tag, part_info):
+    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+        part_info["mask"].astype(np.uint8) * 255, connectivity=8)
+    tag2pinfo = {}
+    if len(stats) > 2:
+        stats = np.array(stats)
+        stats_order = np.argsort(stats[..., -1])[::-1][1:]
+        arml_mask, armr_mask, statsl, statsr = _label_lr_split(labels, stats, stats_order[0], stats_order[1])
+        img, depth, xyxy, dm = _process_cuts(part_info["img"], part_info["depth"], part_info["xyxy"], statsl, mask=arml_mask)
+        tag2pinfo[f"{tag}-r"] = {"img": img, "xyxy": xyxy, "depth": depth, "depth_median": dm, "tag": f"{tag}-r"}
+        img, depth, xyxy, dm = _process_cuts(part_info["img"], part_info["depth"], part_info["xyxy"], statsr, mask=armr_mask)
+        tag2pinfo[f"{tag}-l"] = {"img": img, "xyxy": xyxy, "depth": depth, "depth_median": dm, "tag": f"{tag}-l"}
+    else:
+        tag2pinfo[tag] = part_info
+    return tag2pinfo
+
+
+def _tag_lr_split(tag, tag2pinfo):
+    if tag in tag2pinfo:
+        tag2pinfo.update(_part_lr_split(tag, tag2pinfo.pop(tag)))
+
+
+def _compute_depth_median(part_dict):
+    img = part_dict.pop("img")
+    part_dict.pop("mask", None)
+    depth = part_dict.pop("depth")
+    mask = img[..., -1] > 10
+    depth_median = float(np.median(depth[mask])) if np.any(mask) else 1.0
+    nz = cv2.findNonZero(mask.astype(np.uint8))
+    if nz is not None:
+        xywh = cv2.boundingRect(nz)
+        cx1, cy1 = int(xywh[0]), int(xywh[1])
+        cx2, cy2 = cx1 + int(xywh[2]), cy1 + int(xywh[3])
+        depth = depth[cy1:cy2, cx1:cx2]
+        img = img[cy1:cy2, cx1:cx2]
+        if "xyxy" in part_dict:
+            ox, oy = part_dict["xyxy"][0], part_dict["xyxy"][1]
+            part_dict["xyxy"] = [ox + cx1, oy + cy1, ox + cx2, oy + cy2]
+        else:
+            part_dict["xyxy"] = [cx1, cy1, cx2, cy2]
+    depth = np.clip(depth, 0, 1) * 255
+    depth = np.round(depth).astype(np.uint8)
+    part_dict["depth_median"] = depth_median
+    part_dict["img"] = img
+    part_dict["depth"] = depth
+    return part_dict
+
+
+def _crop_head(img, xywh):
+    x, y, w, h = xywh
+    ih, iw = img.shape[:2]
+    x1, y1, x2, y2 = x, y, x + w, y + h
+    if w < iw // 2:
+        px = min(iw - x - w, x, w // 5)
+        x1 = min(max(x - px, 0), iw)
+        x2 = min(max(x + w + px, 0), iw)
+    if h < ih // 2:
+        py = min(ih - y - h, y, h // 5)
+        y2 = min(max(y + h + py, 0), ih)
+        y1 = min(max(y - py, 0), ih)
+    return img[y1:y2, x1:x2], (x1, y1, x2, y2)
+
+
+def _make_preview(tag2pinfo, resolution):
+    drawables = list(tag2pinfo.values())
+    if drawables:
+        blended = img_alpha_blending(drawables, premultiplied=False, final_size=(resolution, resolution))
+    else:
+        blended = np.zeros((resolution, resolution, 4), dtype=np.uint8)
+    preview = blended[..., :3].astype(np.float32) / 255.0
+    return torch.from_numpy(preview).unsqueeze(0)
+
+
+def _prepare_portrait_subject_mask(subject_mask, resolution):
+    """Align a foreground-positive ComfyUI MASK to the model's square canvas."""
+    if subject_mask is None:
+        return None
+    mask_tensor = subject_mask[0] if subject_mask.ndim == 3 else subject_mask
+    mask_np = mask_tensor.detach().cpu().numpy().astype(np.float32)
+    mask_np = np.clip(mask_np, 0.0, 1.0)
+    mask_rgb = np.repeat((mask_np[..., None] * 255.0).astype(np.uint8), 3, axis=-1)
+    padded, _, _ = center_square_pad_resize(mask_rgb, resolution, return_pad_info=True)
+    if padded.ndim == 3:
+        padded = padded[..., 0]
+    return padded.astype(np.float32) / 255.0
+
+
+class SeeThrough_LoadLayerDiffModel:
+    @classmethod
+    def INPUT_TYPES(s):
+        local_models = _scan_model_dirs()
+        model_list = local_models + [DEFAULT_LAYERDIFF_REPO]
+        return {
+            "required": {
+                "model": (model_list, {"default": DEFAULT_LAYERDIFF_REPO,
+                                       "tooltip": "HuggingFace repo ID or local model folder in models/SeeThrough/"}),
+            },
+            "optional": {
+                "vae_ckpt": ("STRING", {"default": "",
+                                        "tooltip": "Optional path to a custom VAE checkpoint (.safetensors)"}),
+                "unet_ckpt": ("STRING", {"default": "",
+                                         "tooltip": "Optional path to a custom UNet checkpoint"}),
+            },
+        }
+
+    RETURN_TYPES = ("SEETHROUGH_LAYERDIFF_MODEL",)
+    RETURN_NAMES = ("layerdiff_model",)
+    FUNCTION = "load_model"
+    CATEGORY = "SeeThrough"
+
+    def load_model(self, model, vae_ckpt="", unet_ckpt=""):
+        dtype = torch.bfloat16
+        pretrained = _resolve_model_path(model)
+
+        print(f"[SeeThrough] Loading LayerDiff model from: {pretrained}", flush=True)
+        trans_vae = TransparentVAE.from_pretrained(pretrained, subfolder="trans_vae")
+
+        if unet_ckpt:
+            print(f"[SeeThrough] Loading custom UNet from: {unet_ckpt}", flush=True)
+            unet = UNetFrameConditionModel.from_pretrained(unet_ckpt)
+        else:
+            unet = UNetFrameConditionModel.from_pretrained(pretrained, subfolder="unet")
+
+        pipeline = KDiffusionStableDiffusionXLPipeline.from_pretrained(
+            pretrained, trans_vae=trans_vae, unet=unet, scheduler=None)
+
+        _assert_text_encoder_loaded(pipeline.text_encoder, "text_encoder", pretrained)
+        _assert_text_encoder_loaded(pipeline.text_encoder_2, "text_encoder_2", pretrained)
+
+        if vae_ckpt:
+            print(f"[SeeThrough] Loading custom VAE from: {vae_ckpt}", flush=True)
+            td_sd, vae_sd = {}, {}
+            sd = load_file(vae_ckpt)
+            for k, v in sd.items():
+                if k.startswith("trans_decoder."):
+                    td_sd[k[len("trans_decoder."):]] = v
+                elif k.startswith("vae."):
+                    vae_sd[k.replace("vae.", "")] = v
+            if vae_sd:
+                pipeline.vae.load_state_dict(vae_sd)
+            if td_sd:
+                pipeline.trans_vae.decoder.load_state_dict(td_sd)
+
+        pipeline.vae.to(dtype=dtype)
+        pipeline.trans_vae.to(dtype=dtype)
+        pipeline.unet.to(dtype=dtype)
+        pipeline.text_encoder.to(dtype=dtype)
+        pipeline.text_encoder_2.to(dtype=dtype)
+
+        _log_vram("LayerDiff model loaded (CPU)")
+        print("[SeeThrough] LayerDiff model loaded to CPU (will move to GPU on demand)", flush=True)
+        return (pipeline,)
+
+class SeeThrough_LoadDepthModel:
+    @classmethod
+    def INPUT_TYPES(s):
+        local_models = _scan_model_dirs()
+        model_list = local_models + [DEFAULT_DEPTH_REPO]
+        return {
+            "required": {
+                "model": (model_list, {"default": DEFAULT_DEPTH_REPO,
+                                       "tooltip": "HuggingFace repo ID or local model folder in models/SeeThrough/"}),
+            },
+        }
+
+    RETURN_TYPES = ("SEETHROUGH_DEPTH_MODEL",)
+    RETURN_NAMES = ("depth_model",)
+    FUNCTION = "load_model"
+    CATEGORY = "SeeThrough"
+
+    def load_model(self, model):
+        dtype = torch.bfloat16
+        pretrained = _resolve_model_path(model)
+
+        print(f"[SeeThrough] Loading Marigold depth model from: {pretrained}", flush=True)
+        unet = UNetFrameConditionModel.from_pretrained(pretrained, subfolder="unet")
+        pipeline = MarigoldDepthPipeline.from_pretrained(pretrained, unet=unet)
+
+        _assert_text_encoder_loaded(pipeline.text_encoder, "text_encoder", pretrained)
+        pipeline.to(dtype=dtype)
+
+        _log_vram("Depth model loaded (CPU)")
+        print("[SeeThrough] Depth model loaded to CPU (will move to GPU on demand)", flush=True)
+        return (pipeline,)
+
+class SeeThrough_GenerateLayers:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "layerdiff_model": ("SEETHROUGH_LAYERDIFF_MODEL",),
+                "seed": ("INT", {"default": 42, "min": 0, "max": 2**32 - 1}),
+                "resolution": ("INT", {"default": 1280, "min": 512, "max": 2048, "step": 64}),
+                "num_inference_steps": ("INT", {"default": 30, "min": 1, "max": 100}),
+            },
+        }
+
+    RETURN_TYPES = ("SEETHROUGH_LAYERS", "IMAGE")
+    RETURN_NAMES = ("layers", "preview")
+    FUNCTION = "generate"
+    CATEGORY = "SeeThrough"
+
+    def generate(self, image, layerdiff_model, seed=42, resolution=1280, num_inference_steps=30):
+        pipeline = layerdiff_model
+        device = mm.get_torch_device()
+        offload = torch.device("cpu")
+        seed_everything(seed)
+
+        # Convert ComfyUI IMAGE to numpy RGBA
+        img_np = (image[0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        if img_np.shape[-1] == 3:
+            img_np = np.concatenate([img_np, np.full((*img_np.shape[:2], 1), 255, dtype=np.uint8)], axis=-1)
+        input_img = img_np.copy()
+
+        fullpage, pad_size, pad_pos = center_square_pad_resize(input_img, resolution, return_pad_info=True)
+        scale = pad_size[0] / resolution
+
+        tag_version = pipeline.unet.get_tag_version()
+        layer_dict = {}
+
+        print(f"[SeeThrough] GenerateLayers: tag_version={tag_version}, resolution={resolution}, steps={num_inference_steps}", flush=True)
+        _log_vram("GenerateLayers start")
+
+        # Encode text prompts on GPU, then offload text encoders
+        pipeline.text_encoder.to(device)
+        pipeline.text_encoder_2.to(device)
+        _log_vram("Text encoders loaded to GPU")
+
+        if tag_version == "v2":
+            prompt_embeds, pooled_prompt_embeds = pipeline.encode_cropped_prompt_77tokens(VALID_BODY_PARTS_V2)
+        elif tag_version == "v3":
+            body_tags = VALID_BODY_PARTS_V3_BODY
+            head_tags = VALID_BODY_PARTS_V3_HEAD
+            body_embeds, body_pooled = pipeline.encode_cropped_prompt_77tokens(body_tags)
+            head_embeds, head_pooled = pipeline.encode_cropped_prompt_77tokens(head_tags)
+        else:
+            raise ValueError(f"Unknown tag version: {tag_version}")
+
+        pipeline.text_encoder.to(offload)
+        pipeline.text_encoder_2.to(offload)
+        _log_vram("Text encoders offloaded to CPU")
+
+        # Load UNet+VAE to GPU for diffusion
+        pipeline.unet.to(device)
+        pipeline.vae.to(device)
+        pipeline.trans_vae.to(device)
+        mm.soft_empty_cache()
+        _log_vram("UNet+VAE on GPU, ready for diffusion")
+
+        rng = torch.Generator(device=device).manual_seed(seed)
+
+        if tag_version == "v2":
+            out = pipeline(strength=1.0, num_inference_steps=num_inference_steps, batch_size=1,
+                           generator=rng, guidance_scale=1.0,
+                           prompt_embeds=prompt_embeds, pooled_prompt_embeds=pooled_prompt_embeds,
+                           fullpage=fullpage)
+            _log_vram("v2 diffusion complete")
+            for rst, tag in zip(out.images, VALID_BODY_PARTS_V2):
+                layer_dict[tag] = rst
+
+        elif tag_version == "v3":
+            out = pipeline(strength=1.0, num_inference_steps=num_inference_steps, batch_size=1,
+                           generator=rng, guidance_scale=1.0,
+                           prompt_embeds=body_embeds, pooled_prompt_embeds=body_pooled,
+                           fullpage=fullpage, group_index=0)
+            _log_vram("v3 body diffusion complete")
+            for rst, tag in zip(out.images, body_tags):
+                layer_dict[tag] = rst
+
+            # Head-level generation
+            head_img = out.images[2]
+            nz = cv2.findNonZero((head_img[..., -1] > 15).astype(np.uint8))
+            if nz is not None:
+                hx0, hy0, hw, hh = cv2.boundingRect(nz)
+                hx = int(hx0 * scale) - pad_pos[0]
+                hy = int(hy0 * scale) - pad_pos[1]
+                input_head, (hx1, hy1, hx2, hy2) = _crop_head(input_img, [hx, hy, int(hw * scale), int(hh * scale)])
+                hx1 = int(hx1 / scale + pad_pos[0] / scale)
+                hy1 = int(hy1 / scale + pad_pos[1] / scale)
+                ih, iw = input_head.shape[:2]
+                input_head, head_pad_size, head_pad_pos = center_square_pad_resize(input_head, resolution, return_pad_info=True)
+
+                out = pipeline(strength=1.0, num_inference_steps=num_inference_steps, batch_size=1,
+                               generator=rng, guidance_scale=1.0,
+                               prompt_embeds=head_embeds, pooled_prompt_embeds=head_pooled,
+                               fullpage=input_head, group_index=1)
+                _log_vram("v3 head diffusion complete")
+
+                canvas = np.zeros((resolution, resolution, 4), dtype=np.uint8)
+                coords = np.array([head_pad_pos[1], head_pad_pos[1] + ih, head_pad_pos[0], head_pad_pos[0] + iw])
+                py1, py2, px1, px2 = (coords / scale).astype(np.int64)
+                scale_size = (int(head_pad_size[0] / scale), int(head_pad_size[1] / scale))
+
+                for rst, tag in zip(out.images, head_tags):
+                    rst = smart_resize(rst, scale_size)[py1:py2, px1:px2]
+                    full = canvas.copy()
+                    full[hy1:hy1 + rst.shape[0], hx1:hx1 + rst.shape[1]] = rst
+                    layer_dict[tag] = full
+
+        # Offload pipeline back to CPU
+        pipeline.unet.to(offload)
+        pipeline.vae.to(offload)
+        pipeline.trans_vae.to(offload)
+        mm.soft_empty_cache()
+        _log_vram("GenerateLayers offloaded to CPU")
+        print(f"[SeeThrough] GenerateLayers complete: {len(layer_dict)} layers, pipeline offloaded to CPU", flush=True)
+
+        layers_data = SeeThrough_LayersData(layer_dict, fullpage, input_img, resolution, pad_size, pad_pos)
+
+        preview_dict = {}
+        for tag, img in layer_dict.items():
+            mask = img[..., -1] > 10
+            if np.any(mask):
+                preview_dict[tag] = {"img": img, "xyxy": [0, 0, resolution, resolution]}
+        preview = _make_preview(preview_dict, resolution)
+
+        return (layers_data, preview)
+
+
+class SeeThrough_GenerateLayers_Custom:
+    @classmethod
+    def INPUT_TYPES(cls):
+        return {
+            "required": {
+                "image": ("IMAGE",),
+                "layerdiff_model": ("SEETHROUGH_LAYERDIFF_MODEL",),
+                "seed": ("INT", {"default": 42, "min": 0, "max": 2**32 - 1}),
+                "resolution": ("INT", {"default": 1280, "min": 512, "max": 2048, "step": 64}),
+                "num_inference_steps": ("INT", {"default": 30, "min": 1, "max": 100}),
+                "enable_head_detail": ("BOOLEAN", {"default": True,
+                    "tooltip": "v3 only: enable head detail stage (face, eyes, ears, etc). Disabling skips the 2nd inference pass and saves ~50% time."}),
+                "auto_fill": ("BOOLEAN", {"default": False,
+                    "tooltip": "Auto-fill missing layers: if enabled, automatically re-runs inference (up to 5 times) until all expected layers are generated. Expected: v3+head=24, v3 body=13, v2=19."}),
+                "min_alpha_coverage": ("FLOAT", {"default": 0.01, "min": 0.001, "max": 0.1, "step": 0.005,
+                    "tooltip": "Minimum alpha coverage ratio to consider a layer valid. Layers below this threshold are treated as missing. Only used when auto_fill is enabled."}),
+                "portrait_mode": ("BOOLEAN", {"default": False,
+                    "tooltip": "Upper-body portrait profile. Preserves the subject silhouette and does not require absent legs/feet."}),
+                "silhouette_guard": ("BOOLEAN", {"default": True,
+                    "tooltip": "Portrait mode: clip layer spill and recover unexplained source pixels as BODY_REMAINDER."}),
+            },
+            "optional": {
+                "subject_mask": ("MASK", {
+                    "tooltip": "Foreground-positive subject mask (white=subject). Recommended for opaque-background portraits."
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("SEETHROUGH_LAYERS", "IMAGE")
+    RETURN_NAMES = ("layers", "preview")
+    FUNCTION = "generate"
+    CATEGORY = "SeeThrough"
+
+    def _check_missing_layers(self, layer_dict, resolution, min_alpha_coverage):
+        """Return list of tags whose alpha coverage is below threshold."""
+        total_pixels = resolution * resolution
+        missing = []
+        for tag, img in layer_dict.items():
+            alpha_ratio = np.sum(img[..., -1] > 10) / total_pixels
+            if alpha_ratio < min_alpha_coverage:
+                missing.append(tag)
+        return missing
+
+    @staticmethod
+    def _layer_similarity(layer_img, original_img):
+        """Compute similarity between a generated layer and the original image.
+        Returns a score in [0, 1] where 1 = perfect match.
+        Compares RGB values only in regions where the layer has alpha > 10."""
+        mask = layer_img[..., -1] > 10
+        if not np.any(mask):
+            return 0.0
+
+        # Ensure shapes match by using minimum dimensions
+        h = min(layer_img.shape[0], original_img.shape[0])
+        w = min(layer_img.shape[1], original_img.shape[1])
+        mask = mask[:h, :w]
+
+        layer_rgb = layer_img[:h, :w, :3][mask].astype(np.float32)
+        orig_rgb = original_img[:h, :w, :3][mask].astype(np.float32)
+
+        if layer_rgb.size == 0:
+            return 0.0
+
+        # Mean Absolute Error, normalized to [0, 1] similarity
+        mae = np.mean(np.abs(layer_rgb - orig_rgb)) / 255.0
+        return float(1.0 - mae)
+
+    def _run_diffusion(self, pipeline, device, rng, tag_version, num_inference_steps,
+                       fullpage, prompt_embeds=None, pooled_prompt_embeds=None,
+                       body_embeds=None, body_pooled=None, head_embeds=None, head_pooled=None,
+                       enable_head_detail=True, input_img=None, scale=1.0, pad_pos=None, resolution=1280):
+        """Run a single diffusion pass and return the layer_dict."""
+        run_layer_dict = {}
+
+        if tag_version == "v2":
+            out = pipeline(strength=1.0, num_inference_steps=num_inference_steps, batch_size=1,
+                           generator=rng, guidance_scale=1.0,
+                           prompt_embeds=prompt_embeds, pooled_prompt_embeds=pooled_prompt_embeds,
+                           fullpage=fullpage)
+            _log_vram("v2 diffusion complete")
+            for rst, tag in zip(out.images, VALID_BODY_PARTS_V2):
+                run_layer_dict[tag] = rst
+
+        elif tag_version == "v3":
+            out = pipeline(strength=1.0, num_inference_steps=num_inference_steps, batch_size=1,
+                           generator=rng, guidance_scale=1.0,
+                           prompt_embeds=body_embeds, pooled_prompt_embeds=body_pooled,
+                           fullpage=fullpage, group_index=0)
+            _log_vram("v3 body diffusion complete")
+            for rst, tag in zip(out.images, VALID_BODY_PARTS_V3_BODY):
+                run_layer_dict[tag] = rst
+
+            if enable_head_detail and "head" in run_layer_dict:
+                head_img = run_layer_dict["head"]
+                nz = cv2.findNonZero((head_img[..., -1] > 15).astype(np.uint8))
+                if nz is not None:
+                    hx0, hy0, hw, hh = cv2.boundingRect(nz)
+                    hx = int(hx0 * scale) - pad_pos[0]
+                    hy = int(hy0 * scale) - pad_pos[1]
+                    input_head, (hx1, hy1, hx2, hy2) = _crop_head(input_img, [hx, hy, int(hw * scale), int(hh * scale)])
+                    hx1 = int(hx1 / scale + pad_pos[0] / scale)
+                    hy1 = int(hy1 / scale + pad_pos[1] / scale)
+                    ih, iw = input_head.shape[:2]
+                    input_head, head_pad_size, head_pad_pos = center_square_pad_resize(input_head, resolution, return_pad_info=True)
+
+                    out = pipeline(strength=1.0, num_inference_steps=num_inference_steps, batch_size=1,
+                                   generator=rng, guidance_scale=1.0,
+                                   prompt_embeds=head_embeds, pooled_prompt_embeds=head_pooled,
+                                   fullpage=input_head, group_index=1)
+                    _log_vram("v3 head diffusion complete")
+
+                    canvas = np.zeros((resolution, resolution, 4), dtype=np.uint8)
+                    coords = np.array([head_pad_pos[1], head_pad_pos[1] + ih, head_pad_pos[0], head_pad_pos[0] + iw])
+                    py1, py2, px1, px2 = (coords / scale).astype(np.int64)
+                    scale_size = (int(head_pad_size[0] / scale), int(head_pad_size[1] / scale))
+
+                    for rst, tag in zip(out.images, VALID_BODY_PARTS_V3_HEAD):
+                        rst = smart_resize(rst, scale_size)[py1:py2, px1:px2]
+                        full = canvas.copy()
+                        full[hy1:hy1 + rst.shape[0], hx1:hx1 + rst.shape[1]] = rst
+                        run_layer_dict[tag] = full
+
+        return run_layer_dict
+
+    def generate(self, image, layerdiff_model, seed=42, resolution=1280, num_inference_steps=30,
+                 enable_head_detail=True, auto_fill=False, min_alpha_coverage=0.01,
+                 portrait_mode=False, silhouette_guard=True, subject_mask=None):
+        pipeline = layerdiff_model
+        device = mm.get_torch_device()
+        offload = torch.device("cpu")
+        seed_everything(seed)
+
+        # Convert ComfyUI IMAGE to numpy RGBA
+        img_np = (image[0].cpu().numpy() * 255).clip(0, 255).astype(np.uint8)
+        if img_np.shape[-1] == 3:
+            img_np = np.concatenate([img_np, np.full((*img_np.shape[:2], 1), 255, dtype=np.uint8)], axis=-1)
+        input_img = img_np.copy()
+
+        fullpage, pad_size, pad_pos = center_square_pad_resize(input_img, resolution, return_pad_info=True)
+        scale = pad_size[0] / resolution
+        portrait_config = PortraitConfig.load() if portrait_mode else None
+        provided_subject_mask = (
+            _prepare_portrait_subject_mask(subject_mask, resolution) if portrait_mode else None
+        )
+
+        tag_version = pipeline.unet.get_tag_version()
+        layer_dict = {}
+
+        # Determine expected layer count based on model version and settings
+        if tag_version == "v2":
+            expected_tags = set(VALID_BODY_PARTS_V2)
+        elif tag_version == "v3":
+            expected_tags = set(VALID_BODY_PARTS_V3_BODY)
+            if enable_head_detail:
+                expected_tags |= set(VALID_BODY_PARTS_V3_HEAD)
+        else:
+            expected_tags = set()
+        expected_count = len(expected_tags)
+
+        print(f"[SeeThrough] GenerateLayers_Custom: tag_version={tag_version}, resolution={resolution}, "
+              f"steps={num_inference_steps}, head_detail={enable_head_detail}, "
+              f"auto_fill={auto_fill}, portrait_mode={portrait_mode}, "
+              f"expected_layers={expected_count}", flush=True)
+        _log_vram("GenerateLayers_Custom start")
+
+        # Encode text prompts on GPU, then offload text encoders (done once for all runs)
+        pipeline.text_encoder.to(device)
+        pipeline.text_encoder_2.to(device)
+        _log_vram("Text encoders loaded to GPU")
+
+        prompt_embeds, pooled_prompt_embeds = None, None
+        body_embeds, body_pooled = None, None
+        head_embeds, head_pooled = None, None
+
+        if tag_version == "v2":
+            prompt_embeds, pooled_prompt_embeds = pipeline.encode_cropped_prompt_77tokens(VALID_BODY_PARTS_V2)
+        elif tag_version == "v3":
+            body_embeds, body_pooled = pipeline.encode_cropped_prompt_77tokens(VALID_BODY_PARTS_V3_BODY)
+            if enable_head_detail:
+                head_embeds, head_pooled = pipeline.encode_cropped_prompt_77tokens(VALID_BODY_PARTS_V3_HEAD)
+        else:
+            raise ValueError(f"Unknown tag version: {tag_version}")
+
+        pipeline.text_encoder.to(offload)
+        pipeline.text_encoder_2.to(offload)
+        _log_vram("Text encoders offloaded to CPU")
+
+        # Load UNet+VAE to GPU for diffusion (kept on GPU across all runs)
+        pipeline.unet.to(device)
+        pipeline.vae.to(device)
+        pipeline.trans_vae.to(device)
+        mm.soft_empty_cache()
+        _log_vram("UNet+VAE on GPU, ready for diffusion")
+
+        max_runs = 5 if auto_fill else 1
+        all_runs_layers = []  # collect all run results for grouped PSD
+
+        # --- Run 1: primary inference ---
+        rng = torch.Generator(device=device).manual_seed(seed)
+        layer_dict = self._run_diffusion(
+            pipeline, device, rng, tag_version, num_inference_steps, fullpage,
+            prompt_embeds=prompt_embeds, pooled_prompt_embeds=pooled_prompt_embeds,
+            body_embeds=body_embeds, body_pooled=body_pooled,
+            head_embeds=head_embeds, head_pooled=head_pooled,
+            enable_head_detail=enable_head_detail, input_img=input_img,
+            scale=scale, pad_pos=pad_pos, resolution=resolution)
+        _log_vram("Run 1 diffusion complete")
+
+        # Store Run 1 results for grouped PSD
+        if auto_fill:
+            all_runs_layers.append({"run": 1, "seed": seed, "layer_dict": dict(layer_dict)})
+
+        total_pixels = resolution * resolution
+        portrait_mask = None
+        selection_trace = ()
+
+        if portrait_mode:
+            # ComfyUI IMAGE is RGB, so its alpha was synthesized above and is not
+            # evidence of the subject silhouette. The dedicated subject_mask
+            # output from LoadSource carries real source alpha when available.
+            mask_source_image = fullpage.copy()
+            mask_source_image[..., 3] = 255
+            portrait_mask = resolve_subject_mask(
+                mask_source_image,
+                provided_mask=provided_subject_mask,
+                generated_layers=layer_dict,
+                config=portrait_config,
+            )
+            portrait_eval = evaluate_portrait_layers(
+                layer_dict, portrait_mask, enable_head_detail=enable_head_detail,
+                config=portrait_config,
+            )
+            initial_guard = apply_silhouette_guard(fullpage, layer_dict, portrait_mask, portrait_config)
+            print(
+                f"[SeeThrough Portrait] Run 1: coverage={initial_guard.metrics.silhouette_coverage:.4f}, "
+                f"remainder={initial_guard.metrics.recovered_ratio:.4f}, "
+                f"critical_missing={list(portrait_eval.missing_critical_groups)}",
+                flush=True,
+            )
+
+            if auto_fill:
+                pass_coverage = float(portrait_config.section("verdict")["pass_pre_coverage_min"])
+                needs_improvement = (
+                    initial_guard.metrics.silhouette_coverage < pass_coverage
+                    or bool(portrait_eval.missing_critical_groups)
+                )
+                if needs_improvement:
+                    raw_runs = [dict(layer_dict)]
+                    for run_idx in range(2, max_runs + 1):
+                        run_seed = seed + run_idx - 1
+                        print(f"[SeeThrough Portrait] Auto-fill run {run_idx}/{max_runs} (seed={run_seed})", flush=True)
+                        seed_everything(run_seed)
+                        rng = torch.Generator(device=device).manual_seed(run_seed)
+                        run_layer_dict = self._run_diffusion(
+                            pipeline, device, rng, tag_version, num_inference_steps, fullpage,
+                            prompt_embeds=prompt_embeds, pooled_prompt_embeds=pooled_prompt_embeds,
+                            body_embeds=body_embeds, body_pooled=body_pooled,
+                            head_embeds=head_embeds, head_pooled=head_pooled,
+                            enable_head_detail=enable_head_detail, input_img=input_img,
+                            scale=scale, pad_pos=pad_pos, resolution=resolution)
+                        raw_runs.append(dict(run_layer_dict))
+                        all_runs_layers.append({
+                            "run": run_idx, "seed": run_seed,
+                            "layer_dict": dict(run_layer_dict),
+                        })
+                        selected = select_best_layer_set(
+                            raw_runs, fullpage, portrait_mask, config=portrait_config,
+                            enable_head_detail=enable_head_detail,
+                        )
+                        layer_dict = selected.layers
+                        selection_trace = selected.trace
+                        current_eval = evaluate_portrait_layers(
+                            layer_dict, portrait_mask,
+                            enable_head_detail=enable_head_detail,
+                            config=portrait_config,
+                        )
+                        current_guard = apply_silhouette_guard(
+                            fullpage, layer_dict, portrait_mask, portrait_config,
+                        )
+                        print(
+                            f"[SeeThrough Portrait] After run {run_idx}: "
+                            f"coverage={current_guard.metrics.silhouette_coverage:.4f}, "
+                            f"critical_missing={list(current_eval.missing_critical_groups)}",
+                            flush=True,
+                        )
+                        if (
+                            current_guard.metrics.silhouette_coverage >= pass_coverage
+                            and not current_eval.missing_critical_groups
+                        ):
+                            break
+                else:
+                    print("[SeeThrough Portrait] Run 1 already satisfies coverage and semantic gates", flush=True)
+        else:
+            # Original full-body auto-fill behavior is preserved outside Portrait Mode.
+            similarity_scores = {}
+            missing_tags = set()
+            for tag in expected_tags:
+                if tag in layer_dict:
+                    alpha_ratio = np.sum(layer_dict[tag][..., -1] > 10) / total_pixels
+                    if alpha_ratio >= min_alpha_coverage:
+                        similarity_scores[tag] = self._layer_similarity(layer_dict[tag], fullpage)
+                    else:
+                        missing_tags.add(tag)
+                        similarity_scores[tag] = 0.0
+                else:
+                    missing_tags.add(tag)
+                    similarity_scores[tag] = 0.0
+
+            valid_count = expected_count - len(missing_tags)
+            print(f"[SeeThrough] Run 1 complete: {valid_count}/{expected_count} valid layers", flush=True)
+            for tag in sorted(similarity_scores.keys()):
+                status = "MISSING" if tag in missing_tags else f"sim={similarity_scores[tag]:.4f}"
+                print(f"  - {tag}: {status}", flush=True)
+
+            if auto_fill:
+                needs_improvement = len(missing_tags) > 0 or any(
+                    s < 0.85 for tag, s in similarity_scores.items() if tag not in missing_tags
+                )
+                if not needs_improvement:
+                    print("[SeeThrough] Run 1 all layers valid with good similarity, skipping extra runs", flush=True)
+                else:
+                    for run_idx in range(2, max_runs + 1):
+                        if not missing_tags and not any(s < 0.85 for s in similarity_scores.values()):
+                            print("[SeeThrough] All layers filled with good similarity, stopping", flush=True)
+                            break
+                        run_seed = seed + run_idx - 1
+                        print(f"[SeeThrough] Auto-fill run {run_idx}/{max_runs} (seed={run_seed})", flush=True)
+                        seed_everything(run_seed)
+                        rng = torch.Generator(device=device).manual_seed(run_seed)
+                        run_layer_dict = self._run_diffusion(
+                            pipeline, device, rng, tag_version, num_inference_steps, fullpage,
+                            prompt_embeds=prompt_embeds, pooled_prompt_embeds=pooled_prompt_embeds,
+                            body_embeds=body_embeds, body_pooled=body_pooled,
+                            head_embeds=head_embeds, head_pooled=head_pooled,
+                            enable_head_detail=enable_head_detail, input_img=input_img,
+                            scale=scale, pad_pos=pad_pos, resolution=resolution)
+                        all_runs_layers.append({"run": run_idx, "seed": run_seed, "layer_dict": dict(run_layer_dict)})
+                        for tag in expected_tags:
+                            if tag not in run_layer_dict:
+                                continue
+                            new_img = run_layer_dict[tag]
+                            new_alpha = np.sum(new_img[..., -1] > 10) / total_pixels
+                            if new_alpha < min_alpha_coverage:
+                                continue
+                            new_sim = self._layer_similarity(new_img, fullpage)
+                            old_sim = similarity_scores.get(tag, 0.0)
+                            if tag in missing_tags or new_sim > old_sim:
+                                layer_dict[tag] = new_img
+                                similarity_scores[tag] = new_sim
+                                missing_tags.discard(tag)
+
+        # Offload pipeline back to CPU (once, after all runs)
+        pipeline.unet.to(offload)
+        pipeline.vae.to(offload)
+        pipeline.trans_vae.to(offload)
+        mm.soft_empty_cache()
+        _log_vram("GenerateLayers_Custom offloaded to CPU")
+        print(f"[SeeThrough] GenerateLayers_Custom complete: {len(layer_dict)} layers, pipeline offloaded to CPU", flush=True)
+
+        portrait_result = None
+        if portrait_mode:
+            final_evaluation = evaluate_portrait_layers(
+                layer_dict, portrait_mask,
+                enable_head_detail=enable_head_detail,
+                config=portrait_config,
+            )
+            if silhouette_guard:
+                final_guard = apply_silhouette_guard(
+                    fullpage, layer_dict, portrait_mask, portrait_config,
+                )
+                layer_dict = final_guard.guarded_layers
+            else:
+                # Still calculate diagnostics/remainder, but preserve raw layers when clipping is disabled.
+                raw_config = PortraitConfig(raw={
+                    **portrait_config.raw,
+                    "guard": {
+                        **portrait_config.section("guard"),
+                        "enabled": False,
+                        "clip_layers_to_subject": False,
+                    },
+                })
+                final_guard = apply_silhouette_guard(fullpage, layer_dict, portrait_mask, raw_config)
+            report = build_portrait_report(
+                source={
+                    "filename": "",
+                    "width": int(fullpage.shape[1]),
+                    "height": int(fullpage.shape[0]),
+                },
+                run={
+                    "seed": int(seed),
+                    "resolution": int(resolution),
+                    "steps": int(num_inference_steps),
+                    "auto_fill": bool(auto_fill),
+                    "run_count": int(len(all_runs_layers) if all_runs_layers else 1),
+                    "enable_head_detail": bool(enable_head_detail),
+                    "silhouette_guard": bool(silhouette_guard),
+                },
+                mask=portrait_mask,
+                guard=final_guard,
+                evaluation=final_evaluation,
+                config=portrait_config,
+                selection_trace=selection_trace,
+            )
+            portrait_result = {
+                "mask": portrait_mask,
+                "guard": final_guard,
+                "evaluation": final_evaluation,
+                "report": report,
+            }
+            print(
+                f"[SeeThrough Portrait] verdict={report['verdict']}, "
+                f"pre_coverage={final_guard.metrics.silhouette_coverage:.4f}, "
+                f"post_coverage={final_guard.metrics.post_recovery_coverage:.4f}",
+                flush=True,
+            )
+
+        layers_data = SeeThrough_LayersData(layer_dict, fullpage, input_img, resolution, pad_size, pad_pos,
+                                               all_runs_layers=all_runs_layers if all_runs_layers else None,
+                                               portrait_result=portrait_result)
+
+        preview_dict = {}
+        for tag, img in layer_dict.items():
+            mask = img[..., -1] > 10
+            if np.any(mask):
+                preview_dict[tag] = {"img": img, "xyxy": [0, 0, resolution, resolution]}
+        if portrait_result is not None:
+            remainder = portrait_result["guard"].body_remainder
+            if np.any(remainder[..., -1] > 10):
+                preview_dict["body_remainder"] = {
+                    "img": remainder,
+                    "xyxy": [0, 0, resolution, resolution],
+                }
+        preview = _make_preview(preview_dict, resolution)
+
+        return (layers_data, preview)
+
+
+class SeeThrough_GenerateDepth:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "layers": ("SEETHROUGH_LAYERS",),
+                "depth_model": ("SEETHROUGH_DEPTH_MODEL",),
+                "seed": ("INT", {"default": 42, "min": 0, "max": 2**32 - 1}),
+            },
+        }
+
+    RETURN_TYPES = ("SEETHROUGH_LAYERS_DEPTH", "IMAGE")
+    RETURN_NAMES = ("layers_depth", "preview")
+    FUNCTION = "generate"
+    CATEGORY = "SeeThrough"
+
+    def generate(self, layers, depth_model, seed=42):
+        layer_dict = layers.layer_dict
+        fullpage = layers.fullpage
+        resolution = layers.resolution
+        marigold = depth_model
+        device = mm.get_torch_device()
+        offload = torch.device("cpu")
+
+        print("[SeeThrough] GenerateDepth: running Marigold...", flush=True)
+        _log_vram("GenerateDepth start")
+
+        empty_array = np.zeros((resolution, resolution, 4), dtype=np.uint8)
+        blended_alpha = np.zeros((resolution, resolution), dtype=np.float32)
+        compose_list = {"eyes": ["eyewhite", "irides", "eyelash", "eyebrow"],
+                        "hair": ["back hair", "front hair"]}
+
+        img_list = []
+        for tag in VALID_BODY_PARTS_V2:
+            if tag in layer_dict:
+                tag_arr = layer_dict[tag].copy()
+                tag_arr[..., -1][tag_arr[..., -1] < 15] = 0
+                img_list.append(tag_arr)
+            else:
+                img_list.append(empty_array.copy())
+
+        compose_dict = {}
+        for c, clist in compose_list.items():
+            imlist, taglist = [], []
+            for t in clist:
+                if t in layer_dict:
+                    tag_arr = layer_dict[t].copy()
+                    tag_arr[..., -1][tag_arr[..., -1] < 15] = 0
+                    imlist.append(tag_arr)
+                    taglist.append(t)
+            if imlist:
+                composed = img_alpha_blending(imlist, premultiplied=False)
+                img_list[VALID_BODY_PARTS_V2.index(c)] = composed
+                compose_dict[c] = {"taglist": taglist, "imlist": imlist}
+
+        for img in img_list:
+            blended_alpha += img[..., -1].astype(np.float32) / 255
+        blended_alpha = np.clip(blended_alpha, 0, 1) * 255
+        blended_alpha = blended_alpha.astype(np.uint8)
+
+        fullpage_for_depth = fullpage.copy()
+        fullpage_for_depth[..., -1] = blended_alpha
+        img_list.append(fullpage_for_depth)
+
+        # Move Marigold to GPU for inference
+        marigold.to(device=device)
+        mm.soft_empty_cache()
+        _log_vram("Marigold on GPU")
+        print("[SeeThrough] Marigold pipeline moved to GPU", flush=True)
+
+        seed_everything(seed)
+        pipe_out = marigold(color_map=None, show_progress_bar=False, img_list=img_list)
+        _log_vram("Marigold inference complete")
+        depth_pred = pipe_out.depth_tensor.to(device="cpu", dtype=torch.float32).numpy()
+
+        # Offload Marigold back to CPU
+        marigold.to(device=offload)
+        mm.soft_empty_cache()
+        _log_vram("GenerateDepth offloaded to CPU")
+
+        depth_dict = {}
+        for ii, tag in enumerate(VALID_BODY_PARTS_V2):
+            depth = depth_pred[ii]
+            if tag in compose_dict:
+                mask_accum = blended_alpha > 256  # all-False
+                for t, im in zip(compose_dict[tag]["taglist"][::-1], compose_dict[tag]["imlist"][::-1]):
+                    mask_local = im[..., -1] > 15
+                    mask_invis = np.bitwise_and(mask_accum, mask_local)
+                    depth_local = np.full((resolution, resolution), fill_value=1.0, dtype=np.float32)
+                    depth_local[mask_local] = depth[mask_local]
+                    if np.any(mask_invis):
+                        vis = np.bitwise_and(mask_local, np.bitwise_not(mask_invis))
+                        if np.any(vis):
+                            depth_local[mask_invis] = np.median(depth[vis])
+                    mask_accum = np.bitwise_or(mask_accum, mask_local)
+                    depth_dict[t] = depth_local
+            else:
+                depth_dict[tag] = np.clip(depth, 0, 1).astype(np.float32)
+
+        print(f"[SeeThrough] GenerateDepth complete: {len(depth_dict)} depth maps, Marigold offloaded to CPU", flush=True)
+
+        result = SeeThrough_LayersDepthData(layer_dict, depth_dict, fullpage, resolution,
+                                                all_runs_layers=getattr(layers, 'all_runs_layers', None),
+                                                input_img=getattr(layers, 'input_img', None),
+                                                portrait_result=getattr(layers, 'portrait_result', None))
+
+        # Preview: blend with depth info
+        preview_dict = {}
+        for tag in layer_dict:
+            img = layer_dict[tag]
+            if tag in depth_dict and np.any(img[..., -1] > 10):
+                preview_dict[tag] = {"img": img, "depth": depth_dict[tag], "xyxy": [0, 0, resolution, resolution]}
+        preview = _make_preview(preview_dict, resolution)
+
+        return (result, preview)
+
+class SeeThrough_PostProcess:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "layers_depth": ("SEETHROUGH_LAYERS_DEPTH",),
+                "tblr_split": ("BOOLEAN", {"default": True,
+                                           "tooltip": "Split symmetric parts (eyes, ears, handwear) into left/right"}),
+                "use_lama": ("BOOLEAN", {"default": True,
+                                         "tooltip": "Use LaMa inpainting for hair splitting (better quality). Falls back to OpenCV if disabled."}),
+            },
+        }
+
+    RETURN_TYPES = ("SEETHROUGH_PARTS", "IMAGE")
+    RETURN_NAMES = ("parts", "preview")
+    FUNCTION = "process"
+    CATEGORY = "SeeThrough"
+
+    def process(self, layers_depth, tblr_split=True, use_lama=True):
+        layer_dict = layers_depth.layer_dict
+        depth_dict = layers_depth.depth_dict
+        fullpage = layers_depth.fullpage
+        resolution = layers_depth.resolution
+
+        print("[SeeThrough] PostProcess: splitting & clustering...", flush=True)
+
+        # Build tag2pinfo
+        tag2pinfo = {}
+        for tag in layer_dict:
+            img = layer_dict[tag]
+            if tag not in depth_dict:
+                continue
+            depth = depth_dict[tag]
+            mask = img[..., -1] > 10
+            if not np.any(mask):
+                continue
+            tag2pinfo[tag] = {"img": img, "depth": depth, "xyxy": [0, 0, resolution, resolution],
+                              "mask": mask, "tag": tag}
+
+        # Eye splitting (v2 composite 'eyes')
+        if "eyes" in tag2pinfo:
+            part_info = tag2pinfo.pop("eyes")
+            num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
+                part_info["mask"].astype(np.uint8) * 255, connectivity=8)
+            if len(stats) > 2:
+                stats_arr = np.array(stats)
+                if len(stats_arr[..., -1]) >= 5:
+                    stats_order = np.argsort(stats_arr[..., -1])[::-1][1:]
+                    eyel_mask, eyer_mask, statsl, statsr = _label_lr_split(labels, stats_arr, stats_order[0], stats_order[1])
+                    img, depth, xyxy, _ = _process_cuts(part_info["img"], part_info["depth"], part_info["xyxy"], statsl)
+                    tag2pinfo["eyer"] = {"img": img, "xyxy": xyxy, "depth": depth}
+                    img, depth, xyxy, _ = _process_cuts(part_info["img"], part_info["depth"], part_info["xyxy"], statsr)
+                    tag2pinfo["eyel"] = {"img": img, "xyxy": xyxy, "depth": depth}
+                    if len(stats_order) >= 4:
+                        browl_mask, browr_mask, statsl, statsr = _label_lr_split(labels, stats_arr, stats_order[2], stats_order[3])
+                        img, depth, xyxy, _ = _process_cuts(part_info["img"], part_info["depth"], part_info["xyxy"], statsl)
+                        tag2pinfo["browr"] = {"img": img, "xyxy": xyxy, "depth": depth}
+                        img, depth, xyxy, _ = _process_cuts(part_info["img"], part_info["depth"], part_info["xyxy"], statsr)
+                        tag2pinfo["browl"] = {"img": img, "xyxy": xyxy, "depth": depth}
+                else:
+                    tag2pinfo["eyes"] = part_info
+            else:
+                tag2pinfo["eyes"] = part_info
+
+        # Left-right splitting
+        if tblr_split:
+            _tag_lr_split("handwear", tag2pinfo)
+            for eye_tag in ["eyewhite", "irides", "eyelash", "eyebrow"]:
+                _tag_lr_split(eye_tag, tag2pinfo)
+            _tag_lr_split("ears", tag2pinfo)
+
+            if "hair" in tag2pinfo:
+                part_info = tag2pinfo.pop("hair")
+                try:
+                    inpaint_mode = "lama" if use_lama else "cv2"
+                    parts = cluster_inpaint_part(inpaint=inpaint_mode, **part_info)
+                    parts.sort(key=lambda x: x["depth_median"])
+                    tag2pinfo["hairf"] = parts[0]
+                    tag2pinfo["hairb"] = parts[1]
+                except Exception as e:
+                    traceback.print_exc()
+                    print(f"[SeeThrough] Hair clustering failed: {e}, keeping as-is", flush=True)
+                    tag2pinfo["hair"] = part_info
+
+        # Nose/mouth color restoration
+        for restore_tag in ("nose", "mouth"):
+            if restore_tag in tag2pinfo:
+                pinfo = tag2pinfo[restore_tag]
+                src_h, src_w = pinfo["img"].shape[:2]
+                fp_h, fp_w = fullpage.shape[:2]
+                if src_h == fp_h and src_w == fp_w:
+                    pinfo["img"][..., :3] = fullpage[..., :3]
+                else:
+                    x1, y1 = pinfo["xyxy"][0], pinfo["xyxy"][1]
+                    crop = fullpage[y1:min(y1 + src_h, fp_h), x1:min(x1 + src_w, fp_w), :3]
+                    pinfo["img"][:crop.shape[0], :crop.shape[1], :3] = crop
+
+        # Crop + depth_median
+        for tag in list(tag2pinfo.keys()):
+            pinfo = tag2pinfo[tag]
+            if "img" in pinfo and "depth" in pinfo:
+                _compute_depth_median(pinfo)
+            pinfo["tag"] = tag
+
+        # Depth ordering adjustments
+        if "face" in tag2pinfo:
+            face_dm = tag2pinfo["face"]["depth_median"]
+            for t in ["nose", "mouth", "eyes", "eyel", "eyer"]:
+                if t in tag2pinfo and tag2pinfo[t]["depth_median"] > face_dm:
+                    tag2pinfo[t]["depth_median"] = face_dm - 0.001
+            for t in ["earr", "earl", "ears"]:
+                if t in tag2pinfo:
+                    tag2pinfo[t]["depth_median"] = face_dm + 0.001
+
+        frame_size = fullpage.shape[:2]
+        all_runs_layers = getattr(layers_depth, 'all_runs_layers', None)
+        portrait_result = getattr(layers_depth, 'portrait_result', None)
+        if portrait_result is not None:
+            remainder = portrait_result["guard"].body_remainder
+            remainder_mask = remainder[..., -1] > 10
+            nz = cv2.findNonZero(remainder_mask.astype(np.uint8))
+            if nz is not None:
+                bx, by, bw, bh = cv2.boundingRect(nz)
+                remainder_pinfo = {
+                    "img": remainder[by:by + bh, bx:bx + bw],
+                    "xyxy": [bx, by, bx + bw, by + bh],
+                    "depth_median": 1.001,
+                    "tag": "body_remainder",
+                    "is_recovery": True,
+                }
+                # Insertion order is also used by the preview compositor. Keep
+                # the residual behind every semantic layer; its alpha formula
+                # assumes that ordering.
+                tag2pinfo = {"body_remainder": remainder_pinfo, **tag2pinfo}
+        parts_data = {
+            "tag2pinfo": tag2pinfo,
+            "frame_size": frame_size,
+            "all_runs_layers": all_runs_layers,
+            "fullpage": fullpage,  # center-padded original (resolution x resolution, RGBA), for PSD base layer
+            "portrait_result": portrait_result,
+        }
+
+        print(f"[SeeThrough] PostProcess complete: {len(tag2pinfo)} layers", flush=True)
+        for tag, pinfo in sorted(tag2pinfo.items(), key=lambda x: x[1].get("depth_median", 1)):
+            dm = pinfo.get("depth_median", "?")
+            print(f"  - {tag}: depth_median={dm:.4f}" if isinstance(dm, float) else f"  - {tag}", flush=True)
+
+        preview = _make_preview(tag2pinfo, resolution)
+        return (parts_data, preview)
+
+
+class SeeThrough_SavePSD:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "parts": ("SEETHROUGH_PARTS",),
+                "filename_prefix": ("STRING", {"default": "seethrough"}),
+            },
+            "optional": {
+                "original_image": ("IMAGE",),
+                "source_filename": ("STRING", {"default": ""}),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("info_file",)
+    FUNCTION = "save"
+    CATEGORY = "SeeThrough"
+    OUTPUT_NODE = True
+
+    def save(self, parts, filename_prefix="seethrough", original_image=None, source_filename=""):
+        from PIL import Image
+        import json
+
+        tag2pinfo = parts["tag2pinfo"]
+        frame_size = parts["frame_size"]
+        canvas_h, canvas_w = frame_size
+
+        output_dir = folder_paths.get_output_directory()
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        uid = str(uuid.uuid4())[:8]
+
+        src = _sanitize_filename(source_filename)
+        if src and filename_prefix:
+            base = f"{filename_prefix}_{src}_{uid}"
+        elif src:
+            base = f"{src}_{uid}"
+        else:
+            base = f"{filename_prefix}_{ts}_{uid}"
+
+        base_img_np = None
+        if original_image is not None:
+            src_tensor = original_image[0] if original_image.ndim == 4 else original_image
+            base_img_np = (src_tensor.cpu().numpy() * 255.0).clip(0, 255).astype(np.uint8)
+            if base_img_np.ndim == 3 and base_img_np.shape[2] == 3:
+                alpha = np.full(base_img_np.shape[:2] + (1,), 255, dtype=np.uint8)
+                base_img_np = np.concatenate([base_img_np, alpha], axis=2)
+            if base_img_np.shape[0] != canvas_h or base_img_np.shape[1] != canvas_w:
+                print(
+                    f"[SeeThrough] WARNING: original_image size "
+                    f"({base_img_np.shape[1]}x{base_img_np.shape[0]}) mismatches "
+                    f"frame_size ({canvas_w}x{canvas_h}). Resizing.",
+                    flush=True,
+                )
+                pil = Image.fromarray(base_img_np, mode="RGBA")
+                pil = pil.resize((canvas_w, canvas_h), Image.LANCZOS)
+                base_img_np = np.array(pil)
+        elif parts.get("fullpage") is not None:
+            base_img_np = parts["fullpage"]
+            if base_img_np.ndim == 3 and base_img_np.shape[2] == 3:
+                alpha = np.full(base_img_np.shape[:2] + (1,), 255, dtype=np.uint8)
+                base_img_np = np.concatenate([base_img_np, alpha], axis=2)
+
+        source_filename_saved = None
+        if base_img_np is not None:
+            source_filename_saved = f"{base}_original.png"
+            Image.fromarray(base_img_np).save(os.path.join(output_dir, source_filename_saved))
+
+        portrait_result = parts.get("portrait_result")
+        portrait_report_filename = None
+        portrait_diagnostics = {}
+        if portrait_result is not None:
+            guard_result = portrait_result["guard"]
+            diagnostic_arrays = {
+                "coverage_mask": guard_result.generated_union_post_guard,
+                "missing_mask": guard_result.missing_mask,
+                "spill_mask": guard_result.spill_mask,
+            }
+            for diagnostic_name, diagnostic_mask in diagnostic_arrays.items():
+                diagnostic_filename = f"{base}_{diagnostic_name}.png"
+                diagnostic_u8 = np.rint(
+                    np.clip(diagnostic_mask, 0.0, 1.0) * 255.0
+                ).astype(np.uint8)
+                Image.fromarray(diagnostic_u8, mode="L").save(
+                    os.path.join(output_dir, diagnostic_filename)
+                )
+                portrait_diagnostics[diagnostic_name] = diagnostic_filename
+            reconstruction_filename = f"{base}_reconstruction.png"
+            Image.fromarray(guard_result.reconstruction_rgba).save(
+                os.path.join(output_dir, reconstruction_filename)
+            )
+            portrait_diagnostics["reconstruction"] = reconstruction_filename
+
+        sorted_tags = sorted(tag2pinfo.keys(), key=lambda t: tag2pinfo[t].get("depth_median", 1), reverse=True)
+
+        if portrait_result is not None:
+            try:
+                actual_reconstruction = img_alpha_blending(
+                    list(tag2pinfo.values()),
+                    premultiplied=False,
+                    final_size=(canvas_h, canvas_w),
+                )
+                Image.fromarray(actual_reconstruction).save(
+                    os.path.join(output_dir, portrait_diagnostics["reconstruction"])
+                )
+            except Exception as e:
+                print(
+                    f"[SeeThrough Portrait] WARNING: parts reconstruction preview failed; "
+                    f"kept alpha-recovery preview. Error: {e}",
+                    flush=True,
+                )
+
+        layer_info_list = []
+        for tag in sorted_tags:
+            pinfo = tag2pinfo[tag]
+            img = pinfo.get("img")
+            depth = pinfo.get("depth")
+            if img is None:
+                continue
+
+            xyxy = pinfo.get("xyxy", [0, 0, img.shape[1], img.shape[0]])
+            x1, y1, x2, y2 = [int(v) for v in xyxy]
+
+            layer_filename = f"{base}_{tag}.png"
+            Image.fromarray(img).save(os.path.join(output_dir, layer_filename))
+            if tag == "body_remainder" and portrait_result is not None:
+                portrait_diagnostics["body_remainder"] = layer_filename
+
+            entry = {"name": tag, "filename": layer_filename,
+                     "left": x1, "top": y1, "right": x2, "bottom": y2,
+                     "depth_median": float(pinfo.get("depth_median", 1))}
+
+            if depth is not None:
+                depth_filename = f"{base}_{tag}_depth.png"
+                if depth.ndim == 2:
+                    Image.fromarray(depth, mode="L").save(os.path.join(output_dir, depth_filename))
+                else:
+                    Image.fromarray(depth).save(os.path.join(output_dir, depth_filename))
+                entry["depth_filename"] = depth_filename
+
+            layer_info_list.append(entry)
+
+        # Save all runs data if available (for grouped PSD)
+        all_runs_layers = parts.get("all_runs_layers")
+        all_runs_info = []
+        if all_runs_layers:
+            for run_data in all_runs_layers:
+                run_idx = run_data["run"]
+                run_seed = run_data.get("seed", "?")
+                run_layer_dict = run_data["layer_dict"]
+                run_layers = []
+                for tag, img in run_layer_dict.items():
+                    if img is None:
+                        continue
+                    mask = img[..., -1] > 10
+                    if not np.any(mask):
+                        continue
+                    # Compute bounding box from alpha
+                    nz = cv2.findNonZero(mask.astype(np.uint8))
+                    if nz is not None:
+                        bx, by, bw, bh = cv2.boundingRect(nz)
+                        cropped = img[by:by+bh, bx:bx+bw]
+                        x1, y1, x2, y2 = bx, by, bx+bw, by+bh
+                    else:
+                        cropped = img
+                        x1, y1 = 0, 0
+                        x2, y2 = img.shape[1], img.shape[0]
+
+                    run_filename = f"{base}_run{run_idx}_{tag}.png"
+                    Image.fromarray(cropped).save(os.path.join(output_dir, run_filename))
+                    run_layers.append({
+                        "name": tag, "filename": run_filename,
+                        "left": int(x1), "top": int(y1), "right": int(x2), "bottom": int(y2),
+                    })
+                all_runs_info.append({
+                    "run": run_idx, "seed": run_seed,
+                    "layer_count": len(run_layers), "layers": run_layers,
+                })
+            print(f"[SeeThrough] Saved {len(all_runs_info)} runs for grouped PSD", flush=True)
+
+        info_filename = f"{base}_layers.json"
+        info_path = os.path.join(output_dir, info_filename)
+        info_data = {
+            "prefix": filename_prefix,
+            "timestamp": f"{ts}_{uid}",
+            "layers": layer_info_list,
+            "width": int(canvas_w),
+            "height": int(canvas_h),
+            "base": base,
+            "source_name": src,
+            "source_filename": source_filename_saved,
+        }
+        if portrait_result is not None:
+            portrait_report = dict(portrait_result["report"])
+            portrait_report["source"] = {
+                **portrait_report.get("source", {}),
+                "filename": source_filename or src,
+            }
+            portrait_report["artifacts"] = dict(portrait_diagnostics)
+            portrait_report_filename = f"{base}_portrait_report.json"
+            with open(os.path.join(output_dir, portrait_report_filename), "w", encoding="utf-8") as f:
+                json.dump(portrait_report, f, indent=2, ensure_ascii=False)
+            info_data.update({
+                "portrait_mode": True,
+                "portrait_report": portrait_report_filename,
+                "verdict": portrait_report["verdict"],
+                "portrait_diagnostics": portrait_diagnostics,
+            })
+        if all_runs_info:
+            info_data["all_runs"] = all_runs_info
+        with open(info_path, "w", encoding="utf-8") as f:
+            json.dump(info_data, f, indent=2)
+
+        log_path = os.path.join(output_dir, "seethrough_psd_info.log")
+        with open(log_path, "w") as f:
+            f.write(info_filename)
+
+        print(f"[SeeThrough] {len(layer_info_list)} layers saved. Use 'Download PSD' button to generate PSD.", flush=True)
+        return (info_path,)
+
+
+# Default tag-to-Spine name mapping
+DEFAULT_SPINE_NAMES = {
+    "front hair": "front-hair", "back hair": "back-hair",
+    "hairf": "front-hair", "hairb": "back-hair", "hair": "hair",
+    "head": "head", "headwear": "headwear",
+    "face": "face", "irides": "irides", "eyebrow": "eyebrow",
+    "eyewhite": "eye-white", "eyelash": "eyelash", "eyewear": "eyewear",
+    "eyes": "eyes", "eyel": "eye-left", "eyer": "eye-right",
+    "browl": "eyebrow-left", "browr": "eyebrow-right",
+    "eyewhitel": "eye-white-left", "eyewhiter": "eye-white-right",
+    "iridesl": "irides-left", "iridesr": "irides-right",
+    "eyelashl": "eyelash-left", "eyelashr": "eyelash-right",
+    "eyebrowl": "eyebrow-left", "eyebrowr": "eyebrow-right",
+    "ears": "ears", "earl": "ear-left", "earr": "ear-right",
+    "earwear": "earwear",
+    "nose": "nose", "mouth": "mouth",
+    "neck": "neck", "neckwear": "neckwear",
+    "topwear": "topwear", "bottomwear": "bottomwear",
+    "handwear": "handwear", "handwearl": "handwear-left", "handwearr": "handwear-right",
+    "legwear": "legwear", "footwear": "footwear",
+    "tail": "tail", "wings": "wings", "objects": "objects",
+}
+
+
+class SeeThrough_LayerRename:
+    """Rename layer tags to Spine-friendly names. Uses built-in defaults
+    or a user-supplied JSON mapping (one key per line: "old_tag": "new_name")."""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "parts": ("SEETHROUGH_PARTS",),
+            },
+            "optional": {
+                "custom_mapping_json": ("STRING", {
+                    "default": "",
+                    "multiline": True,
+                    "tooltip": "JSON object to override default names, e.g. {\"hairf\": \"bangs\", \"topwear\": \"shirt\"}. Leave empty to use defaults.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("SEETHROUGH_PARTS",)
+    RETURN_NAMES = ("parts",)
+    FUNCTION = "rename"
+    CATEGORY = "SeeThrough"
+
+    def rename(self, parts, custom_mapping_json=""):
+        import json as _json
+        tag2pinfo = parts["tag2pinfo"]
+        frame_size = parts["frame_size"]
+
+        mapping = dict(DEFAULT_SPINE_NAMES)
+        if custom_mapping_json.strip():
+            try:
+                user_map = _json.loads(custom_mapping_json.strip())
+                mapping.update(user_map)
+            except Exception as e:
+                print(f"[SeeThrough] LayerRename: invalid JSON, using defaults. Error: {e}", flush=True)
+
+        new_tag2pinfo = {}
+        for tag, pinfo in tag2pinfo.items():
+            new_name = mapping.get(tag, tag)
+            pinfo_copy = dict(pinfo)
+            pinfo_copy["tag"] = new_name
+            pinfo_copy["original_tag"] = tag
+            new_tag2pinfo[new_name] = pinfo_copy
+
+        print(f"[SeeThrough] LayerRename: {len(new_tag2pinfo)} layers renamed", flush=True)
+        return ({"tag2pinfo": new_tag2pinfo, "frame_size": frame_size,
+                 "all_runs_layers": parts.get("all_runs_layers")},)
+
+
+class SeeThrough_LayerFilter:
+    """Filter layers by inclusion/exclusion lists. Useful to remove unwanted
+    parts (wings, tail, objects) before export."""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "parts": ("SEETHROUGH_PARTS",),
+                "mode": (["include", "exclude"], {"default": "exclude",
+                          "tooltip": "include = keep only listed tags; exclude = remove listed tags"}),
+                "tags": ("STRING", {
+                    "default": "\n".join([
+                        "front-hair", "back-hair", "head", "headwear",
+                        "face", "irides", "irides-left", "irides-right",
+                        "eyebrow", "eyebrow-left", "eyebrow-right",
+                        "eye-white", "eye-white-left", "eye-white-right",
+                        "eyelash", "eyelash-left", "eyelash-right",
+                        "eye-left", "eye-right", "eyewear",
+                        "ears", "ear-left", "ear-right", "earwear",
+                        "nose", "mouth",
+                        "neck", "neckwear",
+                        "topwear", "bottomwear",
+                        "handwear", "handwear-left", "handwear-right",
+                        "legwear", "footwear",
+                        "tail", "wings", "objects",
+                    ]),
+                    "multiline": True,
+                    "tooltip": "One tag per line. All available tags are pre-filled — delete the ones you want to exclude (exclude mode) or keep only the ones you need (include mode). Names shown are post-rename defaults; if not using LayerRename, use original tags (e.g. hairf, eyel).",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("SEETHROUGH_PARTS",)
+    RETURN_NAMES = ("parts",)
+    FUNCTION = "filter_layers"
+    CATEGORY = "SeeThrough"
+
+    def filter_layers(self, parts, mode="exclude", tags=""):
+        tag2pinfo = parts["tag2pinfo"]
+        frame_size = parts["frame_size"]
+
+        tag_set = {t.strip() for t in tags.strip().splitlines() if t.strip()}
+
+        if not tag_set:
+            return (parts,)
+
+        if mode == "include":
+            filtered = {k: v for k, v in tag2pinfo.items() if k in tag_set}
+        else:
+            filtered = {k: v for k, v in tag2pinfo.items() if k not in tag_set}
+
+        print(f"[SeeThrough] LayerFilter ({mode}): {len(tag2pinfo)} → {len(filtered)} layers", flush=True)
+        return ({"tag2pinfo": filtered, "frame_size": frame_size},)
+
+
+class SeeThrough_ExportSpine:
+    """Export layers as a Spine 2D skeleton project (JSON + images/).
+    Output can be opened directly in the Spine editor."""
+
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "parts": ("SEETHROUGH_PARTS",),
+                "filename_prefix": ("STRING", {"default": "seethrough_spine"}),
+                "spine_version": ("STRING", {"default": "4.2.28",
+                                              "tooltip": "Spine editor version string for the skeleton JSON."}),
+            },
+            "optional": {
+                "output_path": ("STRING", {
+                    "default": "",
+                    "tooltip": "Custom output directory path. Leave empty to use ComfyUI default output folder.",
+                }),
+            },
+        }
+
+    RETURN_TYPES = ("STRING",)
+    RETURN_NAMES = ("spine_json_path",)
+    FUNCTION = "export"
+    CATEGORY = "SeeThrough"
+    OUTPUT_NODE = True
+
+    def export(self, parts, filename_prefix="seethrough_spine", spine_version="4.2.28", output_path=""):
+        from PIL import Image
+        import json as _json
+
+        tag2pinfo = parts["tag2pinfo"]
+        frame_size = parts["frame_size"]
+        canvas_h, canvas_w = frame_size
+
+        if output_path.strip():
+            output_dir = output_path.strip()
+            os.makedirs(output_dir, exist_ok=True)
+        else:
+            output_dir = folder_paths.get_output_directory()
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        uid = str(uuid.uuid4())[:8]
+
+        project_dir = os.path.join(output_dir, f"{filename_prefix}_{ts}_{uid}")
+        images_dir = os.path.join(project_dir, "images")
+        os.makedirs(images_dir, exist_ok=True)
+
+        # Sort by depth_median descending (back-to-front for Spine slots array)
+        sorted_tags = sorted(
+            tag2pinfo.keys(),
+            key=lambda t: tag2pinfo[t].get("depth_median", 1),
+            reverse=True,
+        )
+
+        slots = []
+        attachments = {}
+
+        for tag in sorted_tags:
+            pinfo = tag2pinfo[tag]
+            img = pinfo.get("img")
+            if img is None:
+                continue
+
+            # Save cropped PNG
+            safe_name = tag.replace(" ", "-")
+            png_filename = f"{safe_name}.png"
+            Image.fromarray(img).save(os.path.join(images_dir, png_filename))
+
+            # Bounding box on original canvas (after _compute_depth_median cropping)
+            xyxy = pinfo.get("xyxy", [0, 0, img.shape[1], img.shape[0]])
+            x1, y1, x2, y2 = [int(v) for v in xyxy]
+            img_w = img.shape[1]
+            img_h = img.shape[0]
+
+            # Center of this layer on the original canvas (Y-down coords)
+            center_x_canvas = (x1 + x2) / 2.0
+            center_y_canvas = (y1 + y2) / 2.0
+
+            # Convert to Spine coords: origin = bottom-center of canvas, Y-up
+            spine_x = center_x_canvas - canvas_w / 2.0
+            spine_y = canvas_h - center_y_canvas
+
+            # Slot (draw order = array index, already sorted back-to-front)
+            slots.append({
+                "name": safe_name,
+                "bone": "root",
+                "attachment": safe_name,
+            })
+
+            # Skin attachment
+            attachments[safe_name] = {
+                safe_name: {
+                    "x": round(spine_x, 2),
+                    "y": round(spine_y, 2),
+                    "width": img_w,
+                    "height": img_h,
+                }
+            }
+
+        # Build Spine skeleton JSON
+        skeleton_data = {
+            "skeleton": {
+                "hash": "",
+                "spine": spine_version,
+                "x": round(-canvas_w / 2.0, 2),
+                "y": 0,
+                "width": canvas_w,
+                "height": canvas_h,
+                "images": "./images/",
+                "audio": "",
+            },
+            "bones": [{"name": "root"}],
+            "slots": slots,
+            "skins": [
+                {
+                    "name": "default",
+                    "attachments": attachments,
+                }
+            ],
+            "animations": {
+                "setup": {}
+            },
+        }
+
+        json_path = os.path.join(project_dir, f"{filename_prefix}.json")
+        with open(json_path, "w", encoding="utf-8") as f:
+            _json.dump(skeleton_data, f, indent=2, ensure_ascii=False)
+
+        print(f"[SeeThrough] ExportSpine: {len(slots)} slots → {json_path}", flush=True)
+        return (json_path,)
+
+
+class SeeThrough_LoadSource:
+    """Loads an image like ComfyUI's LoadImage but also outputs the source filename.
+
+    Used to feed `SeeThrough_SavePSD.source_filename` so the final PSD keeps the
+    user's original filename instead of a timestamp.
+    """
+
+    @classmethod
+    def INPUT_TYPES(cls):
+        input_dir = folder_paths.get_input_directory()
+        try:
+            files = [
+                f for f in os.listdir(input_dir)
+                if os.path.isfile(os.path.join(input_dir, f))
+            ]
+        except FileNotFoundError:
+            files = []
+        return {
+            "required": {
+                "image": (sorted(files), {"image_upload": True}),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "MASK", "STRING", "MASK")
+    RETURN_NAMES = ("image", "mask", "source_filename", "subject_mask")
+    FUNCTION = "load"
+    CATEGORY = "SeeThrough"
+
+    def load(self, image):
+        from PIL import Image, ImageOps
+        image_path = folder_paths.get_annotated_filepath(image)
+        img = Image.open(image_path)
+        img = ImageOps.exif_transpose(img)
+        rgb = img.convert("RGB")
+        arr = np.array(rgb).astype(np.float32) / 255.0
+        tensor = torch.from_numpy(arr)[None,]  # [1, H, W, 3]
+
+        if "A" in img.getbands():
+            mask_arr = np.array(img.getchannel("A")).astype(np.float32) / 255.0
+            mask = 1.0 - torch.from_numpy(mask_arr)
+            subject_mask = torch.from_numpy(mask_arr)
+        else:
+            mask = torch.zeros((tensor.shape[1], tensor.shape[2]), dtype=torch.float32)
+            # No alpha means there is no trustworthy subject silhouette.
+            subject_mask = torch.zeros((tensor.shape[1], tensor.shape[2]), dtype=torch.float32)
+
+        basename = os.path.splitext(os.path.basename(image))[0]
+        source_filename = _sanitize_filename(basename)
+
+        if tensor.shape[0] > 1:
+            print(f"[SeeThrough] LoadSource: batch>1 not supported, using [0]", flush=True)
+            tensor = tensor[:1]
+
+        return (
+            tensor,
+            mask.unsqueeze(0) if mask.ndim == 2 else mask,
+            source_filename,
+            subject_mask.unsqueeze(0) if subject_mask.ndim == 2 else subject_mask,
+        )
+
+
+NODE_CLASS_MAPPINGS = {
+    "SeeThrough_LoadSource": SeeThrough_LoadSource,
+    "SeeThrough_LoadLayerDiffModel": SeeThrough_LoadLayerDiffModel,
+    "SeeThrough_LoadDepthModel": SeeThrough_LoadDepthModel,
+    "SeeThrough_GenerateLayers": SeeThrough_GenerateLayers,
+    "SeeThrough_GenerateLayers_Custom": SeeThrough_GenerateLayers_Custom,
+    "SeeThrough_GenerateDepth": SeeThrough_GenerateDepth,
+    "SeeThrough_PostProcess": SeeThrough_PostProcess,
+    "SeeThrough_SavePSD": SeeThrough_SavePSD,
+    "SeeThrough_LayerRename": SeeThrough_LayerRename,
+    "SeeThrough_LayerFilter": SeeThrough_LayerFilter,
+    "SeeThrough_ExportSpine": SeeThrough_ExportSpine,
+}
+
+NODE_DISPLAY_NAME_MAPPINGS = {
+    "SeeThrough_LoadSource": "SeeThrough Load Source",
+    "SeeThrough_LoadLayerDiffModel": "SeeThrough Load LayerDiff Model",
+    "SeeThrough_LoadDepthModel": "SeeThrough Load Depth Model",
+    "SeeThrough_GenerateLayers": "SeeThrough Generate Layers",
+    "SeeThrough_GenerateLayers_Custom": "SeeThrough Generate Layers (Custom)",
+    "SeeThrough_GenerateDepth": "SeeThrough Generate Depth",
+    "SeeThrough_PostProcess": "SeeThrough Post Process",
+    "SeeThrough_SavePSD": "SeeThrough Save PSD",
+    "SeeThrough_LayerRename": "SeeThrough Layer Rename",
+    "SeeThrough_LayerFilter": "SeeThrough Layer Filter",
+    "SeeThrough_ExportSpine": "SeeThrough Export Spine",
+}
