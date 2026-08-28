@@ -21,7 +21,7 @@ pip install -r webui/requirements.txt
 
 Models download automatically from HuggingFace on first use, into
 `models/SeeThrough/` at the repo root (or drop a pre-downloaded checkpoint
-folder there yourself -- see the main [README](../README.md#models)).
+folder there yourself -- see the main [README](../README_EN.md#models)).
 
 ## Run
 
