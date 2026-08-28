@@ -128,10 +128,18 @@ def run_a001(
     from seethrough_engine.generation import run_portrait_pipeline
 
     log_lines: list[str] = []
+    # run_portrait_pipeline only calls log() at a handful of checkpoints
+    # (per diffusion stage, per auto-fill run) -- not per denoising step --
+    # so nudge the bar forward on each one instead of leaving it pinned at
+    # whatever the last progress(...) call set. This is a coarse heartbeat,
+    # not a real fraction-complete estimate.
+    progress_state = {"value": 0.15}
 
     def _log(msg: str) -> None:
         log_lines.append(msg)
         print(f"[webui] {msg}", flush=True)
+        progress_state["value"] = min(progress_state["value"] + 0.03, 0.85)
+        progress(progress_state["value"], desc=msg)
 
     try:
         progress(0.05, desc="Loading model...")
