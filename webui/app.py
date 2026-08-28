@@ -47,6 +47,10 @@ VERDICT_COLORS = {
 # Cleared whenever a different model is selected, since we only keep one
 # checkpoint's worth of VRAM/RAM resident at a time.
 _pipeline_cache: dict[str, object] = {}
+# Marigold, loaded only if someone asks for depth-ordered Spine output. Kept
+# separately from `_pipeline_cache` because it is not what the model dropdown
+# selects, and because both rest on the CPU between runs anyway.
+_depth_cache: dict[str, object] = {}
 
 
 def _get_pipeline(model_name: str):
@@ -58,6 +62,19 @@ def _get_pipeline(model_name: str):
         _pipeline_cache.clear()
         _pipeline_cache[model_name] = model_loading.load_layerdiff_model(pretrained)
     return _pipeline_cache[model_name]
+
+
+def _get_depth_pipeline():
+    """Marigold, downloading it on first use the same way the layer model is."""
+    from seethrough_engine import model_loading
+    from seethrough_engine import paths as st_paths
+
+    repo = st_paths.DEFAULT_DEPTH_REPO
+    if repo not in _depth_cache:
+        models_dir = model_loading.default_models_dir()
+        _depth_cache[repo] = model_loading.load_depth_model(
+            model_loading.resolve_model_path(repo, models_dir))
+    return _depth_cache[repo]
 
 
 def _seed_everything(seed: int) -> None:
@@ -118,6 +135,8 @@ def run_a001(
     silhouette_guard,
     auto_fill,
     subject_mask,
+    export_spine,
+    spine_depth_order,
     progress=gr.Progress(track_tqdm=True),
 ):
     if image is None:
@@ -169,10 +188,27 @@ def run_a001(
             log=_log,
         )
 
+        depth_dict = None
+        if export_spine and spine_depth_order:
+            progress(0.88, desc="Estimating depth for Spine draw order...")
+            from seethrough_engine.depth import estimate_layer_depths
+            from seethrough_engine.device import resolve_device, resolve_offload_device
+
+            depth_dict = estimate_layer_depths(
+                _get_depth_pipeline(), result.layer_dict, result.fullpage, result.resolution,
+                device=resolve_device(), offload_device=resolve_offload_device(),
+                seed=int(seed), seed_everything=_seed_everything, log=_log,
+            )
+
         progress(0.9, desc="Saving outputs...")
         run_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
         out_dir = OUTPUT_ROOT / run_id
-        manifest = save_portrait_run(str(out_dir), "a001", result, source_filename="upload.png")
+        manifest = save_portrait_run(str(out_dir), "a001", result, source_filename="upload.png",
+                                     export_spine=bool(export_spine), depth_dict=depth_dict)
+        if manifest.get("spine"):
+            spine_info = manifest["spine"]
+            _log(f"Spine project ({spine_info['order']} order): "
+                 f"{len(spine_info['slots'])} slots -> {spine_info['json']}")
 
         layer_gallery = [
             (str(out_dir / filename), tag) for tag, filename in sorted(manifest["layers"].items())
@@ -250,6 +286,25 @@ def build_app() -> gr.Blocks:
                     head_detail_in = gr.Checkbox(label="Enable head detail", value=True)
                     guard_in = gr.Checkbox(label="Silhouette Guard", value=True)
                     autofill_in = gr.Checkbox(label="Auto-fill (up to 5 runs)", value=False)
+                spine_in = gr.Checkbox(
+                    label="Export Spine project",
+                    value=False,
+                    info=(
+                        "Adds a Spine 2D skeleton (JSON + cropped PNGs) to the zip. "
+                        "Draw order is the fixed Portrait Mode tag order unless you "
+                        "also tick depth ordering below."
+                    ),
+                )
+                spine_depth_in = gr.Checkbox(
+                    label="Spine: depth-based draw order",
+                    value=False,
+                    info=(
+                        "Runs Marigold over the layers to sort them by estimated depth, "
+                        "matching the ComfyUI Export Spine node. Downloads a 3 GB model "
+                        "on first use and adds a pass to every run. Ignored unless "
+                        "Export Spine is on."
+                    ),
+                )
                 run_btn = gr.Button("Run A-001", variant="primary")
 
             with gr.Column(scale=1):
@@ -275,6 +330,7 @@ def build_app() -> gr.Blocks:
             inputs=[
                 image_in, model_in, seed_in, resolution_in, steps_in,
                 head_detail_in, guard_in, autofill_in, subject_mask_in,
+                spine_in, spine_depth_in,
             ],
             outputs=[
                 verdict_out, coverage_out, reasons_out,

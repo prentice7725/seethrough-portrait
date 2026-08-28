@@ -122,9 +122,13 @@ except ImportError:
 try:
     from .seethrough_engine import model_loading as st_model_loading
     from .seethrough_engine import generation as st_generation
+    from .seethrough_engine import spine as st_spine
+    from .seethrough_engine import depth as st_depth
 except ImportError:
     from seethrough_engine import model_loading as st_model_loading
     from seethrough_engine import generation as st_generation
+    from seethrough_engine import spine as st_spine
+    from seethrough_engine import depth as st_depth
 
 print("[SeeThrough] All see-through imports OK", flush=True)
 
@@ -912,89 +916,23 @@ class SeeThrough_GenerateDepth:
     CATEGORY = "SeeThrough"
 
     def generate(self, layers, depth_model, seed=42):
+        # The batching, v2-slot folding and depth redistribution are shared
+        # with the standalone webui (seethrough_engine.depth), which uses them
+        # to order a Spine export the same way this graph does.
         layer_dict = layers.layer_dict
         fullpage = layers.fullpage
         resolution = layers.resolution
-        marigold = depth_model
-        device = mm.get_torch_device()
-        offload = torch.device("cpu")
 
         print("[SeeThrough] GenerateDepth: running Marigold...", flush=True)
         _log_vram("GenerateDepth start")
 
-        empty_array = np.zeros((resolution, resolution, 4), dtype=np.uint8)
-        blended_alpha = np.zeros((resolution, resolution), dtype=np.float32)
-        compose_list = {"eyes": ["eyewhite", "irides", "eyelash", "eyebrow"],
-                        "hair": ["back hair", "front hair"]}
-
-        img_list = []
-        for tag in VALID_BODY_PARTS_V2:
-            if tag in layer_dict:
-                tag_arr = layer_dict[tag].copy()
-                tag_arr[..., -1][tag_arr[..., -1] < 15] = 0
-                img_list.append(tag_arr)
-            else:
-                img_list.append(empty_array.copy())
-
-        compose_dict = {}
-        for c, clist in compose_list.items():
-            imlist, taglist = [], []
-            for t in clist:
-                if t in layer_dict:
-                    tag_arr = layer_dict[t].copy()
-                    tag_arr[..., -1][tag_arr[..., -1] < 15] = 0
-                    imlist.append(tag_arr)
-                    taglist.append(t)
-            if imlist:
-                composed = img_alpha_blending(imlist, premultiplied=False)
-                img_list[VALID_BODY_PARTS_V2.index(c)] = composed
-                compose_dict[c] = {"taglist": taglist, "imlist": imlist}
-
-        for img in img_list:
-            blended_alpha += img[..., -1].astype(np.float32) / 255
-        blended_alpha = np.clip(blended_alpha, 0, 1) * 255
-        blended_alpha = blended_alpha.astype(np.uint8)
-
-        fullpage_for_depth = fullpage.copy()
-        fullpage_for_depth[..., -1] = blended_alpha
-        img_list.append(fullpage_for_depth)
-
-        # Move Marigold to GPU for inference
-        marigold.to(device=device)
-        mm.soft_empty_cache()
-        _log_vram("Marigold on GPU")
-        print("[SeeThrough] Marigold pipeline moved to GPU", flush=True)
-
-        seed_everything(seed)
-        pipe_out = marigold(color_map=None, show_progress_bar=False, img_list=img_list)
-        _log_vram("Marigold inference complete")
-        depth_pred = pipe_out.depth_tensor.to(device="cpu", dtype=torch.float32).numpy()
-
-        # Offload Marigold back to CPU
-        marigold.to(device=offload)
-        mm.soft_empty_cache()
+        depth_dict = st_depth.estimate_layer_depths(
+            depth_model, layer_dict, fullpage, resolution,
+            device=mm.get_torch_device(), offload_device=torch.device("cpu"),
+            seed=seed, seed_everything=seed_everything,
+            log=lambda msg: print(f"[SeeThrough] {msg}", flush=True),
+        )
         _log_vram("GenerateDepth offloaded to CPU")
-
-        depth_dict = {}
-        for ii, tag in enumerate(VALID_BODY_PARTS_V2):
-            depth = depth_pred[ii]
-            if tag in compose_dict:
-                mask_accum = blended_alpha > 256  # all-False
-                for t, im in zip(compose_dict[tag]["taglist"][::-1], compose_dict[tag]["imlist"][::-1]):
-                    mask_local = im[..., -1] > 15
-                    mask_invis = np.bitwise_and(mask_accum, mask_local)
-                    depth_local = np.full((resolution, resolution), fill_value=1.0, dtype=np.float32)
-                    depth_local[mask_local] = depth[mask_local]
-                    if np.any(mask_invis):
-                        vis = np.bitwise_and(mask_local, np.bitwise_not(mask_invis))
-                        if np.any(vis):
-                            depth_local[mask_invis] = np.median(depth[vis])
-                    mask_accum = np.bitwise_or(mask_accum, mask_local)
-                    depth_dict[t] = depth_local
-            else:
-                depth_dict[tag] = np.clip(depth, 0, 1).astype(np.float32)
-
-        print(f"[SeeThrough] GenerateDepth complete: {len(depth_dict)} depth maps, Marigold offloaded to CPU", flush=True)
 
         result = SeeThrough_LayersDepthData(layer_dict, depth_dict, fullpage, resolution,
                                                 all_runs_layers=getattr(layers, 'all_runs_layers', None),
@@ -1383,28 +1321,9 @@ class SeeThrough_SavePSD:
         return (info_path,)
 
 
-# Default tag-to-Spine name mapping
-DEFAULT_SPINE_NAMES = {
-    "front hair": "front-hair", "back hair": "back-hair",
-    "hairf": "front-hair", "hairb": "back-hair", "hair": "hair",
-    "head": "head", "headwear": "headwear",
-    "face": "face", "irides": "irides", "eyebrow": "eyebrow",
-    "eyewhite": "eye-white", "eyelash": "eyelash", "eyewear": "eyewear",
-    "eyes": "eyes", "eyel": "eye-left", "eyer": "eye-right",
-    "browl": "eyebrow-left", "browr": "eyebrow-right",
-    "eyewhitel": "eye-white-left", "eyewhiter": "eye-white-right",
-    "iridesl": "irides-left", "iridesr": "irides-right",
-    "eyelashl": "eyelash-left", "eyelashr": "eyelash-right",
-    "eyebrowl": "eyebrow-left", "eyebrowr": "eyebrow-right",
-    "ears": "ears", "earl": "ear-left", "earr": "ear-right",
-    "earwear": "earwear",
-    "nose": "nose", "mouth": "mouth",
-    "neck": "neck", "neckwear": "neckwear",
-    "topwear": "topwear", "bottomwear": "bottomwear",
-    "handwear": "handwear", "handwearl": "handwear-left", "handwearr": "handwear-right",
-    "legwear": "legwear", "footwear": "footwear",
-    "tail": "tail", "wings": "wings", "objects": "objects",
-}
+# Shared with the standalone webui (seethrough_engine.spine), which applies
+# the same mapping when it exports a Spine project.
+DEFAULT_SPINE_NAMES = st_spine.DEFAULT_SPINE_NAMES
 
 
 class SeeThrough_LayerRename:
@@ -1541,12 +1460,13 @@ class SeeThrough_ExportSpine:
     OUTPUT_NODE = True
 
     def export(self, parts, filename_prefix="seethrough_spine", spine_version="4.2.28", output_path=""):
-        from PIL import Image
-        import json as _json
-
+        # Skeleton JSON, coordinate conversion and draw order are shared with
+        # the standalone webui (seethrough_engine.spine). Layers here have been
+        # through Marigold, so `draw_order` sorts them by `depth_median`
+        # exactly as this node always did; the webui, which has no depth pass,
+        # gets the semantic fallback instead.
         tag2pinfo = parts["tag2pinfo"]
         frame_size = parts["frame_size"]
-        canvas_h, canvas_w = frame_size
 
         if output_path.strip():
             output_dir = output_path.strip()
@@ -1557,91 +1477,10 @@ class SeeThrough_ExportSpine:
         uid = str(uuid.uuid4())[:8]
 
         project_dir = os.path.join(output_dir, f"{filename_prefix}_{ts}_{uid}")
-        images_dir = os.path.join(project_dir, "images")
-        os.makedirs(images_dir, exist_ok=True)
+        json_path = st_spine.write_spine_project(
+            project_dir, filename_prefix, tag2pinfo, frame_size, spine_version=spine_version)
 
-        # Sort by depth_median descending (back-to-front for Spine slots array)
-        sorted_tags = sorted(
-            tag2pinfo.keys(),
-            key=lambda t: tag2pinfo[t].get("depth_median", 1),
-            reverse=True,
-        )
-
-        slots = []
-        attachments = {}
-
-        for tag in sorted_tags:
-            pinfo = tag2pinfo[tag]
-            img = pinfo.get("img")
-            if img is None:
-                continue
-
-            # Save cropped PNG
-            safe_name = tag.replace(" ", "-")
-            png_filename = f"{safe_name}.png"
-            Image.fromarray(img).save(os.path.join(images_dir, png_filename))
-
-            # Bounding box on original canvas (after _compute_depth_median cropping)
-            xyxy = pinfo.get("xyxy", [0, 0, img.shape[1], img.shape[0]])
-            x1, y1, x2, y2 = [int(v) for v in xyxy]
-            img_w = img.shape[1]
-            img_h = img.shape[0]
-
-            # Center of this layer on the original canvas (Y-down coords)
-            center_x_canvas = (x1 + x2) / 2.0
-            center_y_canvas = (y1 + y2) / 2.0
-
-            # Convert to Spine coords: origin = bottom-center of canvas, Y-up
-            spine_x = center_x_canvas - canvas_w / 2.0
-            spine_y = canvas_h - center_y_canvas
-
-            # Slot (draw order = array index, already sorted back-to-front)
-            slots.append({
-                "name": safe_name,
-                "bone": "root",
-                "attachment": safe_name,
-            })
-
-            # Skin attachment
-            attachments[safe_name] = {
-                safe_name: {
-                    "x": round(spine_x, 2),
-                    "y": round(spine_y, 2),
-                    "width": img_w,
-                    "height": img_h,
-                }
-            }
-
-        # Build Spine skeleton JSON
-        skeleton_data = {
-            "skeleton": {
-                "hash": "",
-                "spine": spine_version,
-                "x": round(-canvas_w / 2.0, 2),
-                "y": 0,
-                "width": canvas_w,
-                "height": canvas_h,
-                "images": "./images/",
-                "audio": "",
-            },
-            "bones": [{"name": "root"}],
-            "slots": slots,
-            "skins": [
-                {
-                    "name": "default",
-                    "attachments": attachments,
-                }
-            ],
-            "animations": {
-                "setup": {}
-            },
-        }
-
-        json_path = os.path.join(project_dir, f"{filename_prefix}.json")
-        with open(json_path, "w", encoding="utf-8") as f:
-            _json.dump(skeleton_data, f, indent=2, ensure_ascii=False)
-
-        print(f"[SeeThrough] ExportSpine: {len(slots)} slots → {json_path}", flush=True)
+        print(f"[SeeThrough] ExportSpine: {len(tag2pinfo)} slots → {json_path}", flush=True)
         return (json_path,)
 
 

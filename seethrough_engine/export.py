@@ -15,14 +15,28 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
+from . import spine as spine_export
 from .generation import PortraitPipelineResult
+
+SPINE_SUBDIR = "spine"
 
 
 def save_portrait_run(output_dir: str, base_name: str, result: PortraitPipelineResult,
-                       source_filename: str = "") -> dict[str, Any]:
+                       source_filename: str = "", export_spine: bool = False,
+                       spine_version: str = "4.2.28",
+                       depth_dict: dict[str, np.ndarray] | None = None) -> dict[str, Any]:
     """Persist one Portrait Mode run. Returns a manifest dict (also written to
     `{base_name}_manifest.json`) with every artifact's filename, relative to
-    `output_dir`."""
+    `output_dir`.
+
+    With `export_spine`, also writes a Spine 2D project under `spine/` -- the
+    skeleton JSON next to the cropped per-layer PNGs it references, which is
+    the layout the Spine editor opens directly. It goes inside `output_dir` so
+    that zipping the run carries it along. Without `depth_dict` the draw order
+    is semantic -- see `seethrough_engine.spine.SEMANTIC_Z_ORDER`; pass one
+    (from `seethrough_engine.depth.estimate_layer_depths`) to sort by estimated
+    depth the way the ComfyUI graph does. The manifest records which was used.
+    """
     os.makedirs(output_dir, exist_ok=True)
 
     original_filename = f"{base_name}_original.png"
@@ -68,6 +82,26 @@ def save_portrait_run(output_dir: str, base_name: str, result: PortraitPipelineR
     with open(os.path.join(output_dir, report_filename), "w", encoding="utf-8") as f:
         json.dump(report, f, indent=2, ensure_ascii=False)
 
+    spine_manifest: dict[str, Any] = {}
+    if export_spine:
+        parts = spine_export.rename_parts(
+            spine_export.layers_to_parts(
+                result.layer_dict, body_remainder=result.guard.body_remainder,
+                depth_dict=depth_dict,
+            )
+        )
+        project_dir = os.path.join(output_dir, SPINE_SUBDIR)
+        json_path = spine_export.write_spine_project(
+            project_dir, base_name, parts, result.fullpage.shape[:2],
+            spine_version=spine_version,
+        )
+        spine_manifest = {
+            "json": f"{SPINE_SUBDIR}/{os.path.basename(json_path)}",
+            "images": f"{SPINE_SUBDIR}/images",
+            "slots": list(spine_export.draw_order(parts)),
+            "order": "depth" if depth_dict else "semantic",
+        }
+
     manifest = {
         "base": base_name,
         "source_filename": source_filename,
@@ -81,6 +115,8 @@ def save_portrait_run(output_dir: str, base_name: str, result: PortraitPipelineR
         "recovery_verdict": report["recovery_verdict"],
         "reasons": report["reasons"],
     }
+    if spine_manifest:
+        manifest["spine"] = spine_manifest
     manifest_filename = f"{base_name}_manifest.json"
     with open(os.path.join(output_dir, manifest_filename), "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)

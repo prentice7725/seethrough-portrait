@@ -48,12 +48,19 @@ in case you want to inspect them without re-downloading the zip.
 
 ## Known limitations (M2 scope)
 
-- **No PostProcess stage.** Layers are exported at the model's padded square
-  working resolution (`fullpage`), not un-padded back to the original image's
-  aspect ratio/size, and there is no hair L/R splitting, depth estimation, or
-  Spine export here -- that whole stage (`SeeThrough Post Process` and
-  downstream nodes) stays ComfyUI-only for now. This tool is for running and
-  inspecting A-001, not for producing a final rigging-ready PSD.
+- **Partial PostProcess stage.** Layers are exported at the model's padded
+  square working resolution (`fullpage`), not un-padded back to the original
+  image's aspect ratio/size, and there is no hair L/R splitting -- that part of
+  `SeeThrough Post Process` stays ComfyUI-only for now.
+- **Spine export is supported**, with a caveat about draw order. Without
+  "depth-based draw order" the slots follow `SEMANTIC_Z_ORDER`, a fixed
+  back-to-front order over Portrait Mode's tag vocabulary, so the result can
+  differ from the ComfyUI Export Spine node, which sorts by estimated depth.
+  Turning depth ordering on runs Marigold and matches it -- at the cost of a
+  3 GB download on first use and roughly 15s per run. One layer, `head`, never
+  gets a depth estimate (the depth batch is indexed by the v2 tag list, which
+  has no `head`); it is slotted in from its semantic neighbours rather than
+  dropped, which is what the ComfyUI path does with it.
 - **No PSD export.** The ComfyUI extension builds a PSD client-side in the
   browser via `ag-psd`; this webui exports plain PNGs + JSON instead.
 - **One model resident at a time.** Switching the model dropdown unloads the

@@ -286,13 +286,40 @@ python webui/app.py
 # open http://127.0.0.1:7860
 ```
 
-It does not (yet) do depth estimation, hair L/R splitting, PSD, or Spine
-export -- those stay ComfyUI-only for now. Full install/usage instructions,
+It can export a **Spine project** -- tick the box and the run's zip gains a
+skeleton JSON plus the cropped layer PNGs it references. Draw order follows
+Portrait Mode's fixed tag order by default; turning on depth ordering runs
+Marigold and sorts the way the ComfyUI graph does (downloading a 3 GB model on
+first use).
+
+It does not (yet) do hair L/R splitting or PSD -- those stay ComfyUI-only for
+now. Full install/usage instructions,
 known limitations, and the implementation contract are in
 [`webui/README.md`](webui/README.md) and
 [`docs/M2_IMPLEMENTATION_SPEC.md`](docs/M2_IMPLEMENTATION_SPEC.md).
 
 ## What's New in This Fork
+
+### v1.4.0.dev3 — Spine export from the standalone webui
+
+The webui can now produce a Spine 2D project -- skeleton JSON plus the cropped
+layer PNGs it references -- delivered as `spine/` inside the run's zip.
+
+- **New `seethrough_engine/spine.py`**: the coordinate conversion and skeleton
+  JSON are one implementation now. The `SeeThrough_ExportSpine` node delegates
+  to it, which deleted 110 lines, and the tag-to-Spine name mapping is no
+  longer duplicated.
+- **New `seethrough_engine/depth.py`**: the batched Marigold call and the
+  v2-slot folding are shared with `SeeThrough_GenerateDepth`.
+- **Two draw orders**: the default is `SEMANTIC_Z_ORDER`, a fixed back-to-front
+  order over Portrait Mode's tag vocabulary, needing no extra model and no
+  extra time. Ticking "depth-based draw order" runs Marigold and matches the
+  ComfyUI graph (3 GB download on first use, ~15s per run).
+
+One layer is beyond depth estimation either way: the depth batch is indexed by
+the v2 tag list, which has no `head`. ComfyUI drops such a layer outright; this
+interpolates it from its semantic neighbours instead, since losing the head is
+the worse outcome for a rig.
 
 ### v1.4.0.dev2 — actually running on an 8GB GPU
 

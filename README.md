@@ -305,13 +305,38 @@ python webui/app.py
 # http://127.0.0.1:7860 열기
 ```
 
-아직 depth 추정, 머리카락 좌/우 분리, PSD, Spine 내보내기는 하지 않습니다 --
-그 부분은 당분간 ComfyUI 전용으로 남아 있습니다. 전체 설치/사용 방법과 알려진
+**Spine 내보내기**를 지원합니다 -- 체크하면 결과 zip에 Spine 프로젝트(스켈레톤
+JSON + 잘라낸 레이어 PNG)가 함께 담깁니다. 그리기 순서는 기본적으로 Portrait
+Mode의 고정 태그 순서를 쓰고, depth 순서를 켜면 Marigold를 돌려 ComfyUI와 같은
+방식으로 정렬합니다(첫 사용 시 3 GB 모델을 받습니다).
+
+아직 머리카락 좌/우 분리와 PSD는 하지 않습니다 -- 그 부분은 당분간 ComfyUI
+전용으로 남아 있습니다. 전체 설치/사용 방법과 알려진
 한계, 구현 계약은
 [`webui/README.md`](webui/README.md)와
 [`docs/M2_IMPLEMENTATION_SPEC.md`](docs/M2_IMPLEMENTATION_SPEC.md)에 있습니다.
 
 ## 이 Fork의 변경 이력
+
+### v1.4.0.dev3 — 독립 실행 웹UI Spine 내보내기
+
+웹UI에서 Spine 2D 프로젝트(스켈레톤 JSON + 잘라낸 레이어 PNG)를 바로 뽑을 수
+있습니다. 결과 zip 안에 `spine/`으로 들어갑니다.
+
+- **`seethrough_engine/spine.py` 신설** — 좌표 변환과 스켈레톤 JSON 생성이
+  이제 한 구현입니다. `SeeThrough_ExportSpine` 노드가 여기로 위임하면서
+  110줄이 사라졌고, 태그→Spine 이름 매핑도 한 벌만 남았습니다.
+- **`seethrough_engine/depth.py` 신설** — Marigold 배치 호출과 v2 슬롯
+  접기/펴기를 `SeeThrough_GenerateDepth`와 공유합니다.
+- **그리기 순서 두 가지** — 기본은 `SEMANTIC_Z_ORDER`(Portrait Mode 태그
+  어휘에 대한 고정 뒤→앞 순서)라 추가 모델도 추가 시간도 들지 않습니다.
+  "depth-based draw order"를 켜면 Marigold로 정렬해 ComfyUI와 같아집니다
+  (첫 사용 시 3 GB 다운로드, 실행당 약 15초).
+
+깊이 추정이 다루지 못하는 레이어가 하나 있습니다: depth 배치는 v2 태그 목록으로
+색인되는데 거기 `head`가 없습니다. ComfyUI는 이런 레이어를 통째로 버리지만,
+여기서는 시맨틱 이웃 사이로 보간해 넣습니다 -- 리깅용으로는 머리를 잃는 쪽이
+더 나쁘기 때문입니다.
 
 ### v1.4.0.dev2 — 8GB GPU에서 실제로 돌아가게
 
