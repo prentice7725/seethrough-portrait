@@ -12,6 +12,11 @@ from . import vendor
 DEFAULT_LAYERDIFF_REPO = "layerdifforg/seethroughv0.0.2_layerdiff3d"
 DEFAULT_DEPTH_REPO = "layerdifforg/seethroughv0.0.1_marigold"
 
+# A LayerDiff checkpoint carries a `trans_vae` subfolder; the Marigold depth
+# checkpoint, which lives in the same models directory, does not. That is the
+# cheapest on-disk way to tell the two apart without importing diffusers.
+LAYERDIFF_MARKER_SUBFOLDER = "trans_vae"
+
 
 def default_models_dir() -> str:
     """Model cache directory used when the caller (e.g. the standalone webui)
@@ -19,13 +24,27 @@ def default_models_dir() -> str:
     return os.path.join(str(vendor.REPO_ROOT_DIR), "models", "SeeThrough")
 
 
-def scan_model_dirs(models_dir: str) -> list[str]:
+def scan_model_dirs(models_dir: str, require_subfolder: str | None = None) -> list[str]:
+    """Names of the checkpoint folders under `models_dir`.
+
+    `require_subfolder` keeps only those that contain it, so a caller that can
+    load exactly one kind of checkpoint doesn't offer the other one. Both the
+    LayerDiff model and the Marigold depth model land in this same directory,
+    and offering Marigold where a LayerDiff pipeline is expected only produces
+    a confusing "no file named config.json" deep inside diffusers.
+    """
     if not os.path.isdir(models_dir):
         return []
-    return sorted(
+    names = sorted(
         name for name in os.listdir(models_dir)
         if os.path.isdir(os.path.join(models_dir, name))
     )
+    if require_subfolder:
+        names = [
+            name for name in names
+            if os.path.isdir(os.path.join(models_dir, name, require_subfolder))
+        ]
+    return names
 
 
 def resolve_model_path(model_name: str, models_dir: str) -> str:

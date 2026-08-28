@@ -3,7 +3,11 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from seethrough_engine.paths import resolve_model_path, scan_model_dirs
+from seethrough_engine.paths import (
+    LAYERDIFF_MARKER_SUBFOLDER,
+    resolve_model_path,
+    scan_model_dirs,
+)
 
 
 class ResolveModelPathTests(unittest.TestCase):
@@ -72,6 +76,19 @@ class ScanModelDirsTests(unittest.TestCase):
             with open(os.path.join(models_dir, "not_a_dir.txt"), "w") as f:
                 f.write("x")
             self.assertEqual(scan_model_dirs(models_dir), ["a_model", "b_model"])
+
+    def test_require_subfolder_excludes_checkpoints_without_it(self):
+        """The Marigold depth checkpoint sits in the same models directory as
+        the LayerDiff one but has no `trans_vae`, and must not be offered
+        anywhere a LayerDiff pipeline is what gets loaded."""
+        with tempfile.TemporaryDirectory() as models_dir:
+            os.makedirs(os.path.join(models_dir, "layerdiff", LAYERDIFF_MARKER_SUBFOLDER))
+            os.makedirs(os.path.join(models_dir, "marigold", "unet"))
+            self.assertEqual(
+                scan_model_dirs(models_dir, require_subfolder=LAYERDIFF_MARKER_SUBFOLDER),
+                ["layerdiff"],
+            )
+            self.assertEqual(scan_model_dirs(models_dir), ["layerdiff", "marigold"])
 
 
 if __name__ == "__main__":

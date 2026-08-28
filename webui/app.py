@@ -245,9 +245,13 @@ def build_app() -> gr.Blocks:
     # loading the inference stack (see seethrough_engine.paths).
     from seethrough_engine import paths as st_paths
 
-    model_choices = st_paths.scan_model_dirs(st_paths.default_models_dir()) + [
-        st_paths.DEFAULT_LAYERDIFF_REPO
-    ]
+    # Only LayerDiff checkpoints: the Marigold depth model shares this models
+    # directory but is fetched on demand by `_get_depth_pipeline`, never picked
+    # here -- and picking it used to be the default, since it sorts first.
+    model_choices = st_paths.scan_model_dirs(
+        st_paths.default_models_dir(),
+        require_subfolder=st_paths.LAYERDIFF_MARKER_SUBFOLDER,
+    ) + [st_paths.DEFAULT_LAYERDIFF_REPO]
 
     with gr.Blocks(title="SeeThrough Portrait -- A-001") as demo:
         gr.Markdown(
@@ -272,7 +276,9 @@ def build_app() -> gr.Blocks:
                 model_in = gr.Dropdown(
                     label="Model",
                     choices=model_choices,
-                    value=model_choices[0] if model_choices else st_paths.DEFAULT_LAYERDIFF_REPO,
+                    # First local checkpoint if there is one (no network on
+                    # launch), else the repo id, which downloads on first run.
+                    value=model_choices[0],
                 )
                 with gr.Row():
                     seed_in = gr.Number(label="Seed", value=42, precision=0)
