@@ -23,6 +23,7 @@ from PIL import Image
 __all__ = [
     "DEFAULT_SPINE_NAMES",
     "SEMANTIC_Z_ORDER",
+    "crop_to_alpha",
     "semantic_rank",
     "draw_order",
     "fill_missing_depths",
@@ -120,7 +121,7 @@ def draw_order(tag2pinfo: dict[str, dict]) -> list[str]:
     )
 
 
-def _crop_to_alpha(img: np.ndarray, alpha_threshold: int) -> tuple[np.ndarray, list[int]] | None:
+def crop_to_alpha(img: np.ndarray, alpha_threshold: int) -> tuple[np.ndarray, list[int]] | None:
     """Tightest crop around the visible pixels, plus its box on the uncropped
     canvas. None when nothing is visible."""
     mask = img[..., -1] > alpha_threshold
@@ -218,7 +219,7 @@ def layers_to_parts(layer_dict: dict[str, np.ndarray], *, alpha_threshold: int =
     parts: dict[str, dict] = {}
 
     if body_remainder is not None:
-        cropped = _crop_to_alpha(np.asarray(body_remainder), alpha_threshold)
+        cropped = crop_to_alpha(np.asarray(body_remainder), alpha_threshold)
         if cropped is not None:
             img, xyxy = cropped
             parts["body_remainder"] = {"img": img, "xyxy": xyxy, "tag": "body_remainder",
@@ -230,7 +231,7 @@ def layers_to_parts(layer_dict: dict[str, np.ndarray], *, alpha_threshold: int =
         arr = np.asarray(img)
         if arr.ndim != 3 or arr.shape[-1] != 4:
             continue
-        cropped = _crop_to_alpha(arr, alpha_threshold)
+        cropped = crop_to_alpha(arr, alpha_threshold)
         if cropped is None:
             continue
         crop_img, xyxy = cropped

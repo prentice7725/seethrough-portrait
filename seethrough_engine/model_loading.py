@@ -10,6 +10,8 @@ has to happen once.
 
 from __future__ import annotations
 
+import os
+
 import torch
 from safetensors.torch import load_file
 
@@ -17,6 +19,7 @@ from . import vendor
 from .paths import (
     DEFAULT_DEPTH_REPO,
     DEFAULT_LAYERDIFF_REPO,
+    LAYERDIFF_MARKER_SUBFOLDER,
     default_models_dir,
     resolve_model_path,
     scan_model_dirs,
@@ -25,6 +28,7 @@ from .paths import (
 __all__ = [
     "DEFAULT_LAYERDIFF_REPO",
     "DEFAULT_DEPTH_REPO",
+    "LAYERDIFF_MARKER_SUBFOLDER",
     "default_models_dir",
     "scan_model_dirs",
     "resolve_model_path",
@@ -75,6 +79,17 @@ def load_layerdiff_model(pretrained: str, vae_ckpt: str = "", unet_ckpt: str = "
     vendor.ensure_seethrough_importable()
 
     print(f"[SeeThrough] Loading LayerDiff model from: {pretrained}", flush=True)
+    if os.path.isdir(pretrained) and not os.path.isdir(
+            os.path.join(pretrained, LAYERDIFF_MARKER_SUBFOLDER)):
+        raise RuntimeError(
+            f"{pretrained} is not a LayerDiff checkpoint: no "
+            f"'{LAYERDIFF_MARKER_SUBFOLDER}' subfolder.\n"
+            f"The Marigold depth model ({DEFAULT_DEPTH_REPO}) lives in the same "
+            f"models directory but cannot be used here -- pick the LayerDiff "
+            f"model ({DEFAULT_LAYERDIFF_REPO}) instead.\n"
+            f"If this should be a LayerDiff checkpoint, the download is likely "
+            f"incomplete; delete the folder and let it re-download."
+        )
     trans_vae = vendor.TransparentVAE.from_pretrained(pretrained, subfolder="trans_vae", torch_dtype=dtype)
 
     if unet_ckpt:
