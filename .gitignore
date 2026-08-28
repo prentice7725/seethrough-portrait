@@ -42,3 +42,12 @@ docs/*
 !docs/PORTRAIT_MODE_FORK_PLAN_v0.1.md
 !docs/M1_IMPLEMENTATION_SPEC.md
 !docs/TEST_PROTOCOL_A001.md
+!docs/M2_IMPLEMENTATION_SPEC.md
+
+# Standalone webui (M2) run outputs and downloaded model checkpoints
+webui/outputs/
+/models/
+
+# Python virtualenvs
+.venv/
+venv/

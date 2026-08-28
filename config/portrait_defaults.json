@@ -26,7 +26,7 @@
   "verdict": {
     "pass_pre_coverage_min": 0.94,
     "pass_remainder_max": 0.06,
-    "soft_pass_post_coverage_min": 0.995,
+    "soft_pass_post_coverage_min": 0.999,
     "soft_pass_remainder_max": 0.2,
     "post_spill_max": 0.002
   }

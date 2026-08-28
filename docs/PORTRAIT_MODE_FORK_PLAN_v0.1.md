@@ -52,7 +52,8 @@ and `missing_mask`.
 
 ## Current focus
 
-M1 is the only active implementation milestone. See
-`M1_IMPLEMENTATION_SPEC.md` and `TEST_PROTOCOL_A001.md` for its executable
-contract and validation procedure.
+M1 and M2 are implemented. See `M1_IMPLEMENTATION_SPEC.md` and
+`TEST_PROTOCOL_A001.md` for M1's executable contract and validation
+procedure, and `M2_IMPLEMENTATION_SPEC.md` for the standalone single-image
+webui, including what it could not verify without GPU access.
 
