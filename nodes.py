@@ -119,6 +119,13 @@ except ImportError:
     )
     from portrait_core.report import build_portrait_report
 
+try:
+    from .seethrough_engine import model_loading as st_model_loading
+    from .seethrough_engine import generation as st_generation
+except ImportError:
+    from seethrough_engine import model_loading as st_model_loading
+    from seethrough_engine import generation as st_generation
+
 print("[SeeThrough] All see-through imports OK", flush=True)
 
 for _key, _mod in _st_conflict_backup.items():
@@ -191,28 +198,14 @@ def seed_everything(seed):
 
 
 def _scan_model_dirs():
-    found = []
-    if os.path.isdir(SEETHROUGH_MODELS_DIR):
-        for name in sorted(os.listdir(SEETHROUGH_MODELS_DIR)):
-            if os.path.isdir(os.path.join(SEETHROUGH_MODELS_DIR, name)):
-                found.append(name)
-    return found
+    # Shared with the standalone webui (seethrough_engine.paths).
+    return st_model_loading.scan_model_dirs(SEETHROUGH_MODELS_DIR)
 
 
 def _resolve_model_path(model_name):
-    model_basename = model_name.split("/")[-1]
-    local = os.path.join(SEETHROUGH_MODELS_DIR, model_basename)
-    if os.path.isdir(local):
-        return local
-    if "/" in model_name:
-        try:
-            from huggingface_hub import snapshot_download
-            print(f"[SeeThrough] Downloading {model_name} -> {local}", flush=True)
-            snapshot_download(repo_id=model_name, local_dir=local)
-            return local
-        except Exception as e:
-            print(f"[SeeThrough] snapshot_download failed ({e}); falling back to HF cache", flush=True)
-    return model_name
+    # Shared with the standalone webui (seethrough_engine.model_loading); only
+    # the model cache directory differs (ComfyUI's models/SeeThrough here).
+    return st_model_loading.resolve_model_path(model_name, SEETHROUGH_MODELS_DIR)
 
 
 def _label_lr_split(labels, stats, id1, id2):
@@ -320,17 +313,15 @@ def _make_preview(tag2pinfo, resolution):
 
 
 def _prepare_portrait_subject_mask(subject_mask, resolution):
-    """Align a foreground-positive ComfyUI MASK to the model's square canvas."""
+    """Align a foreground-positive ComfyUI MASK to the model's square canvas.
+    The padding transform itself is shared with the standalone webui
+    (seethrough_engine.layers.align_subject_mask_to_canvas); only the
+    ComfyUI-tensor-to-numpy step below is specific to this node graph."""
     if subject_mask is None:
         return None
     mask_tensor = subject_mask[0] if subject_mask.ndim == 3 else subject_mask
     mask_np = mask_tensor.detach().cpu().numpy().astype(np.float32)
-    mask_np = np.clip(mask_np, 0.0, 1.0)
-    mask_rgb = np.repeat((mask_np[..., None] * 255.0).astype(np.uint8), 3, axis=-1)
-    padded, _, _ = center_square_pad_resize(mask_rgb, resolution, return_pad_info=True)
-    if padded.ndim == 3:
-        padded = padded[..., 0]
-    return padded.astype(np.float32) / 255.0
+    return st_generation.align_subject_mask_to_canvas(mask_np, resolution)
 
 
 class SeeThrough_LoadLayerDiffModel:
@@ -357,46 +348,12 @@ class SeeThrough_LoadLayerDiffModel:
     CATEGORY = "SeeThrough"
 
     def load_model(self, model, vae_ckpt="", unet_ckpt=""):
-        dtype = torch.bfloat16
+        # Shared with the standalone webui (seethrough_engine.model_loading).
         pretrained = _resolve_model_path(model)
-
-        print(f"[SeeThrough] Loading LayerDiff model from: {pretrained}", flush=True)
-        trans_vae = TransparentVAE.from_pretrained(pretrained, subfolder="trans_vae")
-
-        if unet_ckpt:
-            print(f"[SeeThrough] Loading custom UNet from: {unet_ckpt}", flush=True)
-            unet = UNetFrameConditionModel.from_pretrained(unet_ckpt)
-        else:
-            unet = UNetFrameConditionModel.from_pretrained(pretrained, subfolder="unet")
-
-        pipeline = KDiffusionStableDiffusionXLPipeline.from_pretrained(
-            pretrained, trans_vae=trans_vae, unet=unet, scheduler=None)
-
-        _assert_text_encoder_loaded(pipeline.text_encoder, "text_encoder", pretrained)
-        _assert_text_encoder_loaded(pipeline.text_encoder_2, "text_encoder_2", pretrained)
-
-        if vae_ckpt:
-            print(f"[SeeThrough] Loading custom VAE from: {vae_ckpt}", flush=True)
-            td_sd, vae_sd = {}, {}
-            sd = load_file(vae_ckpt)
-            for k, v in sd.items():
-                if k.startswith("trans_decoder."):
-                    td_sd[k[len("trans_decoder."):]] = v
-                elif k.startswith("vae."):
-                    vae_sd[k.replace("vae.", "")] = v
-            if vae_sd:
-                pipeline.vae.load_state_dict(vae_sd)
-            if td_sd:
-                pipeline.trans_vae.decoder.load_state_dict(td_sd)
-
-        pipeline.vae.to(dtype=dtype)
-        pipeline.trans_vae.to(dtype=dtype)
-        pipeline.unet.to(dtype=dtype)
-        pipeline.text_encoder.to(dtype=dtype)
-        pipeline.text_encoder_2.to(dtype=dtype)
-
+        pipeline = st_model_loading.load_layerdiff_model(
+            pretrained, vae_ckpt=vae_ckpt, unet_ckpt=unet_ckpt, dtype=torch.bfloat16,
+        )
         _log_vram("LayerDiff model loaded (CPU)")
-        print("[SeeThrough] LayerDiff model loaded to CPU (will move to GPU on demand)", flush=True)
         return (pipeline,)
 
 class SeeThrough_LoadDepthModel:
@@ -417,18 +374,10 @@ class SeeThrough_LoadDepthModel:
     CATEGORY = "SeeThrough"
 
     def load_model(self, model):
-        dtype = torch.bfloat16
+        # Shared with the standalone webui (seethrough_engine.model_loading).
         pretrained = _resolve_model_path(model)
-
-        print(f"[SeeThrough] Loading Marigold depth model from: {pretrained}", flush=True)
-        unet = UNetFrameConditionModel.from_pretrained(pretrained, subfolder="unet")
-        pipeline = MarigoldDepthPipeline.from_pretrained(pretrained, unet=unet)
-
-        _assert_text_encoder_loaded(pipeline.text_encoder, "text_encoder", pretrained)
-        pipeline.to(dtype=dtype)
-
+        pipeline = st_model_loading.load_depth_model(pretrained, dtype=torch.bfloat16)
         _log_vram("Depth model loaded (CPU)")
-        print("[SeeThrough] Depth model loaded to CPU (will move to GPU on demand)", flush=True)
         return (pipeline,)
 
 class SeeThrough_GenerateLayers:
@@ -613,82 +562,25 @@ class SeeThrough_GenerateLayers_Custom:
     def _layer_similarity(layer_img, original_img):
         """Compute similarity between a generated layer and the original image.
         Returns a score in [0, 1] where 1 = perfect match.
-        Compares RGB values only in regions where the layer has alpha > 10."""
-        mask = layer_img[..., -1] > 10
-        if not np.any(mask):
-            return 0.0
-
-        # Ensure shapes match by using minimum dimensions
-        h = min(layer_img.shape[0], original_img.shape[0])
-        w = min(layer_img.shape[1], original_img.shape[1])
-        mask = mask[:h, :w]
-
-        layer_rgb = layer_img[:h, :w, :3][mask].astype(np.float32)
-        orig_rgb = original_img[:h, :w, :3][mask].astype(np.float32)
-
-        if layer_rgb.size == 0:
-            return 0.0
-
-        # Mean Absolute Error, normalized to [0, 1] similarity
-        mae = np.mean(np.abs(layer_rgb - orig_rgb)) / 255.0
-        return float(1.0 - mae)
+        Compares RGB values only in regions where the layer has alpha > 10.
+        Shared with the standalone webui (seethrough_engine.generation)."""
+        return st_generation.layer_similarity(layer_img, original_img)
 
     def _run_diffusion(self, pipeline, device, rng, tag_version, num_inference_steps,
                        fullpage, prompt_embeds=None, pooled_prompt_embeds=None,
                        body_embeds=None, body_pooled=None, head_embeds=None, head_pooled=None,
                        enable_head_detail=True, input_img=None, scale=1.0, pad_pos=None, resolution=1280):
-        """Run a single diffusion pass and return the layer_dict."""
-        run_layer_dict = {}
-
-        if tag_version == "v2":
-            out = pipeline(strength=1.0, num_inference_steps=num_inference_steps, batch_size=1,
-                           generator=rng, guidance_scale=1.0,
-                           prompt_embeds=prompt_embeds, pooled_prompt_embeds=pooled_prompt_embeds,
-                           fullpage=fullpage)
-            _log_vram("v2 diffusion complete")
-            for rst, tag in zip(out.images, VALID_BODY_PARTS_V2):
-                run_layer_dict[tag] = rst
-
-        elif tag_version == "v3":
-            out = pipeline(strength=1.0, num_inference_steps=num_inference_steps, batch_size=1,
-                           generator=rng, guidance_scale=1.0,
-                           prompt_embeds=body_embeds, pooled_prompt_embeds=body_pooled,
-                           fullpage=fullpage, group_index=0)
-            _log_vram("v3 body diffusion complete")
-            for rst, tag in zip(out.images, VALID_BODY_PARTS_V3_BODY):
-                run_layer_dict[tag] = rst
-
-            if enable_head_detail and "head" in run_layer_dict:
-                head_img = run_layer_dict["head"]
-                nz = cv2.findNonZero((head_img[..., -1] > 15).astype(np.uint8))
-                if nz is not None:
-                    hx0, hy0, hw, hh = cv2.boundingRect(nz)
-                    hx = int(hx0 * scale) - pad_pos[0]
-                    hy = int(hy0 * scale) - pad_pos[1]
-                    input_head, (hx1, hy1, hx2, hy2) = _crop_head(input_img, [hx, hy, int(hw * scale), int(hh * scale)])
-                    hx1 = int(hx1 / scale + pad_pos[0] / scale)
-                    hy1 = int(hy1 / scale + pad_pos[1] / scale)
-                    ih, iw = input_head.shape[:2]
-                    input_head, head_pad_size, head_pad_pos = center_square_pad_resize(input_head, resolution, return_pad_info=True)
-
-                    out = pipeline(strength=1.0, num_inference_steps=num_inference_steps, batch_size=1,
-                                   generator=rng, guidance_scale=1.0,
-                                   prompt_embeds=head_embeds, pooled_prompt_embeds=head_pooled,
-                                   fullpage=input_head, group_index=1)
-                    _log_vram("v3 head diffusion complete")
-
-                    canvas = np.zeros((resolution, resolution, 4), dtype=np.uint8)
-                    coords = np.array([head_pad_pos[1], head_pad_pos[1] + ih, head_pad_pos[0], head_pad_pos[0] + iw])
-                    py1, py2, px1, px2 = (coords / scale).astype(np.int64)
-                    scale_size = (int(head_pad_size[0] / scale), int(head_pad_size[1] / scale))
-
-                    for rst, tag in zip(out.images, VALID_BODY_PARTS_V3_HEAD):
-                        rst = smart_resize(rst, scale_size)[py1:py2, px1:px2]
-                        full = canvas.copy()
-                        full[hy1:hy1 + rst.shape[0], hx1:hx1 + rst.shape[1]] = rst
-                        run_layer_dict[tag] = full
-
-        return run_layer_dict
+        """Run a single diffusion pass and return the layer_dict. Shared with
+        the standalone webui (seethrough_engine.generation)."""
+        return st_generation.run_diffusion_stage(
+            pipeline, device, rng, tag_version, num_inference_steps, fullpage,
+            prompt_embeds=prompt_embeds, pooled_prompt_embeds=pooled_prompt_embeds,
+            body_embeds=body_embeds, body_pooled=body_pooled,
+            head_embeds=head_embeds, head_pooled=head_pooled,
+            enable_head_detail=enable_head_detail, input_img=input_img,
+            scale=scale, pad_pos=pad_pos, resolution=resolution,
+            log=lambda msg: _log_vram(msg),
+        )
 
     def generate(self, image, layerdiff_model, seed=42, resolution=1280, num_inference_steps=30,
                  enable_head_detail=True, auto_fill=False, min_alpha_coverage=0.01,

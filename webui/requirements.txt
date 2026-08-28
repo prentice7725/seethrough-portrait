@@ -1,0 +1,14 @@
+# Standalone single-image Portrait Mode webui (M2).
+#
+# Unlike the ComfyUI node graph, there is no host application supplying
+# torch/numpy/etc. here, so this list is meant to be self-sufficient. Install
+# a CUDA-matched torch build FIRST from https://pytorch.org/get-started/locally/
+# (this file intentionally does not pin one), then:
+#   pip install -r webui/requirements.txt
+
+-r ../requirements.txt
+gradio>=4.0.0
+safetensors
+huggingface_hub
+PyYAML
+einops

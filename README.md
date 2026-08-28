@@ -2,48 +2,127 @@
 
 ![Preview](https://raw.githubusercontent.com/tackcrypto1031/tk_seethrough/main/workflows/sample.png)
 
-A fork of [ComfyUI-See-through](https://github.com/jtydhr88/ComfyUI-See-through) by [@jtydhr88](https://github.com/jtydhr88), adding a custom node with the option to skip the head detail inference stage for faster processing.
+A fork of [ComfyUI-See-through](https://github.com/jtydhr88/ComfyUI-See-through)
+by [@jtydhr88](https://github.com/jtydhr88) that decomposes an anime-style
+illustration into transparent semantic layers (hair, face, topwear, etc.),
+plus a **Portrait Mode** built on top for upper-body character art: a
+Silhouette Guard that recovers pixels the model omits (missing sleeves,
+shoulders, arms) so the final composite never loses more of the subject than
+the model itself generated.
 
-[中文說明](README_ZH.md)
+Two ways to run it:
 
-## What's New in This Fork
+| | ComfyUI node graph | Standalone webui |
+| --- | --- | --- |
+| Requires ComfyUI | yes | no |
+| Best for | full pipeline: depth, hair L/R split, PSD/Spine export | quickly running Portrait Mode on one image and reading the verdict |
+| Get started | [Installation](#installation-comfyui) below | [`webui/README.md`](webui/README.md) |
 
-### v1.3.0.dev1 — Portrait Mode M1
+Both paths run the same underlying model-loading and layer-generation code
+(`seethrough_engine/`), so a result from one is directly comparable to the
+other given the same seed and settings.
 
-- Upper-body Portrait Mode with crop-aware semantic groups
-- Silhouette Guard that clips layer spill to a trusted subject mask
-- `body_remainder` recovery layer for unexplained original pixels
-- Silhouette-aware multi-run selection and JSON diagnostics
-- Separate recovery and semantic verdicts
+## Portrait Mode
 
-### v1.2.8 — Issue #5
+Portrait Mode is an upper-body recovery profile for front-facing character
+portraits. It does not retrain the model or guarantee a semantic arm layer;
+instead it compares the subject's real silhouette against the union of
+generated layers and recovers whatever pixels are missing into a
+`body_remainder` safety layer, so the composited result never loses more of
+the subject than the model actually omitted.
 
-- New node **SeeThrough Load Source**: same dropdown as ComfyUI's LoadImage, plus outputs `source_filename` for preserving the original filename in PSD output.
-- **SeeThrough Save PSD** now accepts optional `original_image` + `source_filename` inputs, automatically includes the original input image as a visible base layer in the generated PSD, and uses the source filename in output filenames when available.
-- PSD layer structure is now grouped: `Original` (visible, bottom), `Parts` (hidden), `Runs` (hidden, grouped-PSD mode only) — opens the PSD on the original so you can toggle groups to edit specific parts.
+- **Silhouette Guard** clips any layer spill to the trusted subject mask and
+  recovers unexplained original pixels as `body_remainder`.
+- **Crop-aware critical groups** mean absent legs or handwear alone don't
+  fail an otherwise-complete upper-body decomposition.
+- **Silhouette-aware auto-fill** re-runs inference (up to 5 times) and keeps
+  whichever run's layers give the best coverage/similarity, not just the
+  first result.
+- **Two verdicts, reported separately** — a `recovery_verdict` (did the
+  Silhouette Guard reconstruct the full silhouette?) and an overall
+  `verdict` that also folds in semantic completeness (PASS / SOFT_PASS /
+  SOFT_PASS_LOW_CONFIDENCE / REWORK / FAIL). A 100%-reconstructed
+  silhouette is not by itself evidence that FACE/HAIR/BODY were separated
+  correctly.
 
-### v1.2.4 — Bug Fixes
+Every run produces `body_remainder`, coverage/missing/spill mask PNGs, a
+reconstruction preview, and a `*_portrait_report.json` with the full
+diagnostics. See [`docs/M1_IMPLEMENTATION_SPEC.md`](docs/M1_IMPLEMENTATION_SPEC.md)
+for the exact contract and verdict rules, and
+[`docs/TEST_PROTOCOL_A001.md`](docs/TEST_PROTOCOL_A001.md) for the validation
+procedure (A-001) both entry points are checked against.
 
-- **Fix: Depth model fails to download — HuggingFace repo ID updated** — The default Marigold depth model repo `24yearsold/seethroughv0.0.1_marigold` was moved to `layerdifforg/seethroughv0.0.1_marigold`. Updated the default repo ID so depth model auto-download works again. ([#3](https://github.com/tackcrypto1031/tk_seethrough/issues/3))
+**In ComfyUI:** use **SeeThrough Load Source** for transparent PNG input and
+connect its `subject_mask` output into **Generate Layers (Custom)**, then
+enable `portrait_mode` (and keep `silhouette_guard` on). For an opaque
+background, provide a separate foreground mask. See
+[SeeThrough Generate Layers (Custom)](#seethrough-generate-layers-custom)
+below for the full parameter table.
 
-### v1.2.3 — Bug Fixes
+**In the standalone webui:** just upload a transparent-background PNG --
+Portrait Mode is always on, and the real alpha channel is read directly as
+the trusted subject mask. See [`webui/README.md`](webui/README.md).
 
-- **Fix: PSD download fails with "Failed to load ag-psd bundle from any path"** — ComfyUI's new frontend loads extensions via ES module `import()`, causing `document.currentScript` to be `null`. Replaced with `import.meta.url` for reliable bundle path resolution regardless of install folder name. ([#1](https://github.com/tackcrypto1031/tk_seethrough/issues/1))
-- **Fix: Nodes fail to load in fresh environments** — The upstream Marigold module imports `matplotlib` at module level for an optional visualization function, causing `ModuleNotFoundError` on environments without `matplotlib`. Changed to lazy import so nodes load without requiring `matplotlib`.
+## Installation (ComfyUI)
 
-### v1.2 — Spine Export, Auto-Fill & All Runs PSD
+Clone this repository into your ComfyUI `custom_nodes` directory:
 
-- **Spine Export Nodes** — New `Layer Rename`, `Layer Filter`, and `Export Spine` nodes for Spine 2D animation preparation.
-- **Auto-Fill Missing Layers** — Enable `auto_fill` on GenerateLayers (Custom) to automatically re-run inference up to 5 times, filling missing layers and upgrading low-quality layers by comparing against the original image.
-- **All Runs PSD** — When `auto_fill` is enabled, a new "Download All Runs PSD" button appears on Save PSD. It creates a single PSD with group folders for each run, so you can manually compare and pick layers.
-- **PSD Download Buttons** — Save PSD now has 3 buttons:
-  - **Download PSD** (green) — best layers after auto-fill selection
-  - **Download Depth PSD** (purple) — depth maps
-  - **Download All Runs PSD** (orange) — all runs grouped by folder (requires `auto_fill`)
+```bash
+cd ComfyUI/custom_nodes
+git clone https://github.com/tackcrypto1031/tk_seethrough.git
+```
+
+Install dependencies:
+
+```bash
+cd tk_seethrough
+pip install -r requirements.txt
+```
+
+Restart ComfyUI. The nodes will appear under the `SeeThrough` category.
+
+### Models
+
+Models are downloaded automatically from HuggingFace on first use:
+
+| Model | HuggingFace Repo | Purpose |
+|-------|-------------------|---------|
+| LayerDiff 3D | `layerdifforg/seethroughv0.0.2_layerdiff3d` | SDXL-based transparent layer generation |
+| Marigold Depth | `layerdifforg/seethroughv0.0.1_marigold` | Fine-tuned monocular depth for anime |
+
+You can also download models manually and place them in `ComfyUI/models/SeeThrough/`.
+
+## Usage (ComfyUI)
+
+1. Add **SeeThrough Load LayerDiff Model** and **SeeThrough Load Depth Model**
+2. Add **SeeThrough Generate Layers (Custom)** — connect both models and a **Load Image** node
+3. Uncheck `enable_head_detail` if you want faster processing without head detail layers
+4. Connect to **SeeThrough Generate Depth** → **SeeThrough Post Process** → **SeeThrough Save PSD**
+5. Run the workflow and click **Download PSD** to export
+
+**For upper-body portraits:** use **SeeThrough Load Source**, connect
+`subject_mask`, enable `portrait_mode`, and keep `silhouette_guard` enabled.
+
+**For Spine export:** Replace step 4's **Save PSD** with **Layer Rename** → **Layer Filter** → **Export Spine**. Open the output JSON in Spine editor.
+
+## All Nodes
+
+| Node | Description |
+|------|-------------|
+| **SeeThrough Load LayerDiff Model** | Load the LayerDiff SDXL pipeline |
+| **SeeThrough Load Depth Model** | Load the Marigold depth estimation pipeline |
+| **SeeThrough Generate Layers** | Original layer generation (all stages, all layers) |
+| **SeeThrough Generate Layers (Custom)** | Layer generation with `enable_head_detail` toggle, `auto_fill`, and Portrait Mode |
+| **SeeThrough Generate Depth** | Depth map estimation per layer |
+| **SeeThrough Post Process** | Left/right splitting, hair clustering, color restoration |
+| **SeeThrough Save PSD** | Export layers as PNGs + metadata; download Best PSD, Depth PSD, or All Runs PSD via browser |
+| **SeeThrough Layer Rename** | Rename layer tags to Spine-friendly names (customizable) |
+| **SeeThrough Layer Filter** | Include/exclude specific layers before export |
+| **SeeThrough Export Spine** | Export layers as a Spine 2D skeleton project (JSON + images) |
 
 ### SeeThrough Generate Layers (Custom)
 
-A new node `SeeThrough_GenerateLayers_Custom` that adds one parameter compared to the original `SeeThrough Generate Layers`:
+A new node `SeeThrough_GenerateLayers_Custom` that adds parameters compared to the original `SeeThrough Generate Layers`:
 
 | Parameter | Default | Description |
 |-----------|---------|-------------|
@@ -53,30 +132,6 @@ A new node `SeeThrough_GenerateLayers_Custom` that adds one parameter compared t
 | `portrait_mode` | false | Use upper-body critical groups and silhouette-aware run selection instead of requiring full-body parts |
 | `silhouette_guard` | true | In Portrait Mode, clip spill and recover unexplained source pixels as `body_remainder` |
 | `subject_mask` | optional | Foreground-positive mask (`white = subject`). Strongly recommended for opaque-background portraits |
-
-#### Portrait Mode (M1)
-
-Portrait Mode is an upper-body recovery profile. It does not retrain the model or
-guarantee a semantic arm layer. Instead, it compares the subject silhouette with
-the union of generated layers and stores unexplained original pixels in a
-`body_remainder` safety layer.
-
-Use **SeeThrough Load Source** for transparent PNG input and connect its new
-`subject_mask` output to **Generate Layers (Custom)**. For an opaque source,
-provide a separate foreground mask. Without an independent mask, the node falls
-back to the generated layer union and marks the result low-confidence; that mode
-cannot prove that missing arms were recovered.
-
-Portrait output includes:
-
-- `body_remainder` in the Parts/PSD layer set
-- coverage, missing, and spill mask PNGs
-- reconstruction preview
-- `*_portrait_report.json` with PASS / SOFT PASS / REWORK / FAIL diagnostics
-
-Recovery success and semantic decomposition success are reported separately.
-The safety layer can preserve a missing sleeve or shoulder without turning it
-into an independently riggable arm.
 
 #### How It Works
 
@@ -104,34 +159,14 @@ Enable `auto_fill` to automatically re-run inference until all expected layers a
 
 This means even if Run 1 generates a face layer, if Run 2 produces a face that better matches the original image, Run 2's version will be used automatically.
 
+In Portrait Mode, auto-fill instead re-runs until silhouette coverage and
+critical semantic groups both pass, keeping whichever run's layer *set*
+scores best overall (similarity + silhouette coverage + shoulder/arm
+region, minus spill), not just per-layer similarity.
+
 Models are loaded to GPU only once across all runs — the overhead is only the additional diffusion time, not model loading.
 
 > **Note:** For v2 models, this toggle has no effect since v2 uses a single-stage inference.
-
-### v1.1 — Synced with Upstream
-
-This fork has been synced with [upstream v0.2.2](https://github.com/jtydhr88/ComfyUI-See-through), incorporating the following improvements:
-
-- **VRAM Offloading** — Models now stay on CPU and are moved to GPU only during inference, then offloaded back. This significantly reduces VRAM usage, making it possible to run on GPUs with 8GB or less.
-- **Text Encoder Offloading** — Text encoders are loaded to GPU for prompt encoding, then offloaded before loading UNet+VAE, so they never compete for VRAM at the same time.
-- **Marigold Compatibility Fix** — Fixed `resize` call for torchvision >= 0.23 which introduced stricter `InterpolationMode` checks.
-- **Web Fixes** — Subpath deployment support; ag-psd bundle 404 fix on case-sensitive filesystems.
-- **Custom Node Optimization** — When `enable_head_detail = false`, head text encoding is also skipped (not just diffusion), further reducing GPU memory usage.
-
-## All Nodes
-
-| Node | Description |
-|------|-------------|
-| **SeeThrough Load LayerDiff Model** | Load the LayerDiff SDXL pipeline |
-| **SeeThrough Load Depth Model** | Load the Marigold depth estimation pipeline |
-| **SeeThrough Generate Layers** | Original layer generation (all stages, all layers) |
-| **SeeThrough Generate Layers (Custom)** | Layer generation with `enable_head_detail` toggle |
-| **SeeThrough Generate Depth** | Depth map estimation per layer |
-| **SeeThrough Post Process** | Left/right splitting, hair clustering, color restoration |
-| **SeeThrough Save PSD** | Export layers as PNGs + metadata; download Best PSD, Depth PSD, or All Runs PSD via browser |
-| **SeeThrough Layer Rename** | Rename layer tags to Spine-friendly names (customizable) |
-| **SeeThrough Layer Filter** | Include/exclude specific layers before export |
-| **SeeThrough Export Spine** | Export layers as a Spine 2D skeleton project (JSON + images) |
 
 ### Spine Export Workflow
 
@@ -235,47 +270,95 @@ If not using LayerRename, use original tags: `hairf`, `hairb`, `eyel`, `eyer`, `
 
 </details>
 
-## Installation
+## Standalone webui
 
-Clone this repository into your ComfyUI `custom_nodes` directory:
-
-```bash
-cd ComfyUI/custom_nodes
-git clone https://github.com/tackcrypto1031/tk_seethrough.git
-```
-
-Install dependencies:
+`webui/app.py` runs Portrait Mode on a single image with no ComfyUI process
+involved -- upload, run, read the verdict, download the layers and report as
+a zip. It shares its model-loading and layer-generation code
+(`seethrough_engine/`) with the ComfyUI nodes above, so it is not a
+second, drifting implementation.
 
 ```bash
-cd tk_seethrough
-pip install -r requirements.txt
+pip install -r webui/requirements.txt
+python webui/app.py
+# open http://127.0.0.1:7860
 ```
 
-Restart ComfyUI. The nodes will appear under the `SeeThrough` category.
+It does not (yet) do depth estimation, hair L/R splitting, PSD, or Spine
+export -- those stay ComfyUI-only for now. Full install/usage instructions,
+known limitations, and the implementation contract are in
+[`webui/README.md`](webui/README.md) and
+[`docs/M2_IMPLEMENTATION_SPEC.md`](docs/M2_IMPLEMENTATION_SPEC.md).
 
-### Models
+## What's New in This Fork
 
-Models are downloaded automatically from HuggingFace on first use:
+### v1.4.0.dev1 — Portrait Mode M2: standalone webui
 
-| Model | HuggingFace Repo | Purpose |
-|-------|-------------------|---------|
-| LayerDiff 3D | `layerdifforg/seethroughv0.0.2_layerdiff3d` | SDXL-based transparent layer generation |
-| Marigold Depth | `layerdifforg/seethroughv0.0.1_marigold` | Fine-tuned monocular depth for anime |
+- New `webui/app.py`: a single-image Portrait Mode webui that runs without
+  ComfyUI (see [Standalone webui](#standalone-webui) above).
+- New `seethrough_engine/` package: the ComfyUI-independent model-loading and
+  layer-generation core, shared by `nodes.py` and the webui so there is one
+  implementation of the GPU-facing pipeline, not two. `nodes.py`'s node
+  behavior is unchanged; see `docs/M2_IMPLEMENTATION_SPEC.md` for what moved
+  where and why.
+- Fixed a spec/config mismatch from M1: the post-recovery coverage floor
+  that gates a hard `FAIL` verdict was `0.995` in
+  `config/portrait_defaults.json` but documented (and intended) as `0.999`
+  in `M1_IMPLEMENTATION_SPEC.md` / `TEST_PROTOCOL_A001.md`. Runs between
+  99.5% and 99.9% post-recovery coverage now correctly fail instead of
+  passing.
 
-You can also download models manually and place them in `ComfyUI/models/SeeThrough/`.
+### v1.3.0.dev1 — Portrait Mode M1
 
-## Usage
+- Upper-body Portrait Mode with crop-aware semantic groups
+- Silhouette Guard that clips layer spill to a trusted subject mask
+- `body_remainder` recovery layer for unexplained original pixels
+- Silhouette-aware multi-run selection and JSON diagnostics
+- Separate recovery and semantic verdicts
 
-1. Add **SeeThrough Load LayerDiff Model** and **SeeThrough Load Depth Model**
-2. Add **SeeThrough Generate Layers (Custom)** — connect both models and a **Load Image** node
-3. Uncheck `enable_head_detail` if you want faster processing without head detail layers
-4. Connect to **SeeThrough Generate Depth** → **SeeThrough Post Process** → **SeeThrough Save PSD**
-5. Run the workflow and click **Download PSD** to export
+### v1.2.8 — Issue #5
 
-**For upper-body portraits:** use **SeeThrough Load Source**, connect
-`subject_mask`, enable `portrait_mode`, and keep `silhouette_guard` enabled.
+- New node **SeeThrough Load Source**: same dropdown as ComfyUI's LoadImage, plus outputs `source_filename` for preserving the original filename in PSD output.
+- **SeeThrough Save PSD** now accepts optional `original_image` + `source_filename` inputs, automatically includes the original input image as a visible base layer in the generated PSD, and uses the source filename in output filenames when available.
+- PSD layer structure is now grouped: `Original` (visible, bottom), `Parts` (hidden), `Runs` (hidden, grouped-PSD mode only) — opens the PSD on the original so you can toggle groups to edit specific parts.
 
-**For Spine export:** Replace step 4's **Save PSD** with **Layer Rename** → **Layer Filter** → **Export Spine**. Open the output JSON in Spine editor.
+### v1.2.4 — Bug Fixes
+
+- **Fix: Depth model fails to download — HuggingFace repo ID updated** — The default Marigold depth model repo `24yearsold/seethroughv0.0.1_marigold` was moved to `layerdifforg/seethroughv0.0.1_marigold`. Updated the default repo ID so depth model auto-download works again. ([#3](https://github.com/tackcrypto1031/tk_seethrough/issues/3))
+
+### v1.2.3 — Bug Fixes
+
+- **Fix: PSD download fails with "Failed to load ag-psd bundle from any path"** — ComfyUI's new frontend loads extensions via ES module `import()`, causing `document.currentScript` to be `null`. Replaced with `import.meta.url` for reliable bundle path resolution regardless of install folder name. ([#1](https://github.com/tackcrypto1031/tk_seethrough/issues/1))
+- **Fix: Nodes fail to load in fresh environments** — The upstream Marigold module imports `matplotlib` at module level for an optional visualization function, causing `ModuleNotFoundError` on environments without `matplotlib`. Changed to lazy import so nodes load without requiring `matplotlib`.
+
+### v1.2 — Spine Export, Auto-Fill & All Runs PSD
+
+- **Spine Export Nodes** — New `Layer Rename`, `Layer Filter`, and `Export Spine` nodes for Spine 2D animation preparation.
+- **Auto-Fill Missing Layers** — Enable `auto_fill` on GenerateLayers (Custom) to automatically re-run inference up to 5 times, filling missing layers and upgrading low-quality layers by comparing against the original image.
+- **All Runs PSD** — When `auto_fill` is enabled, a new "Download All Runs PSD" button appears on Save PSD. It creates a single PSD with group folders for each run, so you can manually compare and pick layers.
+- **PSD Download Buttons** — Save PSD now has 3 buttons:
+  - **Download PSD** (green) — best layers after auto-fill selection
+  - **Download Depth PSD** (purple) — depth maps
+  - **Download All Runs PSD** (orange) — all runs grouped by folder (requires `auto_fill`)
+
+### v1.1 — Synced with Upstream
+
+This fork has been synced with [upstream v0.2.2](https://github.com/jtydhr88/ComfyUI-See-through), incorporating the following improvements:
+
+- **VRAM Offloading** — Models now stay on CPU and are moved to GPU only during inference, then offloaded back. This significantly reduces VRAM usage, making it possible to run on GPUs with 8GB or less.
+- **Text Encoder Offloading** — Text encoders are loaded to GPU for prompt encoding, then offloaded before loading UNet+VAE, so they never compete for VRAM at the same time.
+- **Marigold Compatibility Fix** — Fixed `resize` call for torchvision >= 0.23 which introduced stricter `InterpolationMode` checks.
+- **Web Fixes** — Subpath deployment support; ag-psd bundle 404 fix on case-sensitive filesystems.
+- **Custom Node Optimization** — When `enable_head_detail = false`, head text encoding is also skipped (not just diffusion), further reducing GPU memory usage.
+
+## Project docs
+
+For the full Portrait Mode design/implementation record:
+
+- [`docs/PORTRAIT_MODE_FORK_PLAN_v0.1.md`](docs/PORTRAIT_MODE_FORK_PLAN_v0.1.md) — overall scope and milestones (M1–M4)
+- [`docs/M1_IMPLEMENTATION_SPEC.md`](docs/M1_IMPLEMENTATION_SPEC.md) — Portrait Mode core contract and verdict rules
+- [`docs/TEST_PROTOCOL_A001.md`](docs/TEST_PROTOCOL_A001.md) — the A-001 validation procedure both entry points are checked against
+- [`docs/M2_IMPLEMENTATION_SPEC.md`](docs/M2_IMPLEMENTATION_SPEC.md) — standalone webui contract, what's shared with `nodes.py` and why, and what's still unverified without GPU access
 
 ## Acknowledgements
 
