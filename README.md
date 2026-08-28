@@ -313,6 +313,40 @@ python webui/app.py
 
 ## 이 Fork의 변경 이력
 
+### v1.4.0.dev2 — 8GB GPU에서 실제로 돌아가게
+
+이 fork가 쓰는 UNet은 40.7억 파라미터로, bf16으로도 **7.58 GiB**입니다.
+RTX 5060 Laptop(8151 MiB)에서 CUDA 컨텍스트와 데스크톱이 0.75 GiB를 가져가면
+torch가 실제로 쓸 수 있는 건 7.19 GiB뿐이라, **가중치를 GPU에 올리는 것 자체가
+불가능**했습니다 — 연산이 시작되기도 전에 `unet.to(device)`에서 OOM이 납니다.
+그래서 `resolution`이나 `steps`를 낮춰도 소용이 없습니다. 실패 지점이 그보다
+앞에 있기 때문입니다. (Windows의 CUDA 시스템 메모리 폴백이 켜져 있으면 OOM 대신
+조용히 host RAM으로 넘칩니다. 죽지는 않지만 실측 90배 느려집니다.)
+
+- **UNet 블록 스트리밍** — 가중치가 통째로 안 들어가면 CPU에 두고 leaf 단위로
+  GPU에 흘려보냅니다(diffusers group offloading + CUDA 스트림 프리페치).
+  여유 VRAM을 재서 자동 판단하므로 큰 카드에서는 기존 동작 그대로이고,
+  ComfyUI 노드 경로는 자체 VRAM 스케줄러가 있어 손대지 않았습니다.
+- **로드할 때 dtype 지정** — `from_pretrained`가 bf16 체크포인트를 fp32로
+  올렸다가 도로 내리고 있었습니다. 모델 로드 시 시스템 RAM 피크
+  **17.51 GiB → 0.82 GiB**, UNet 로드 시간 20.2초 → 8.0초.
+- **VAE 타일링** — SDXL VAE를 512px 타일로 encode/decode 합니다.
+  `resolution`이 512 이하면 발동하지 않습니다.
+
+RTX 5060 Laptop 8GB 실측 (A-001, seed 42, 30 steps, 전부 `PASS`):
+
+| 설정 | 시간 | 피크 VRAM | 레이어 |
+|---|---|---|---|
+| res 512, head off | 60.7초 | 2.03 GiB | 13 |
+| res 512, head ON | 109.6초 | 2.03 GiB | 24 |
+| res 1280, head off | 333.9초 | 3.66 GiB | 13 |
+| res 1280, head ON | 609.9초 | 3.66 GiB | 24 |
+
+res 512/head off 행은 이전 기록의 커버리지 지표와 **완전히 일치**합니다 —
+스트리밍은 결과를 바꾸지 않습니다. 그리고 피크 VRAM은 해상도에만 좌우됩니다:
+head 스테이지는 같은 해상도에 프레임이 더 적어서, 시간만 쓰고 메모리는
+새로 쓰지 않습니다.
+
 ### v1.4.0.dev1 — Portrait Mode M2: 독립 실행 웹UI
 
 - 새로운 `webui/app.py`: ComfyUI 없이 실행되는 이미지 한 장짜리 Portrait
@@ -342,15 +376,6 @@ python webui/app.py
 - **SeeThrough Save PSD**가 이제 선택적으로 `original_image` + `source_filename` 입력을 받아, 생성된 PSD에 원본 입력 이미지를 보이는(visible) 베이스 레이어로 자동 포함시키고, 가능하면 출력 파일명에도 원본 파일명을 사용합니다.
 - PSD 레이어 구조가 그룹화되었습니다: `Original`(보임, 맨 아래), `Parts`(숨김), `Runs`(숨김, grouped-PSD 모드에서만) — 원본 위에서 PSD를 열어, 필요한 부분만 그룹을 펼쳐 편집할 수 있습니다.
 
-### v1.2.4 — 버그 수정
-
-- **수정: depth 모델 다운로드 실패 — HuggingFace 저장소 ID 변경** — 기본 Marigold depth 모델 저장소 `24yearsold/seethroughv0.0.1_marigold`가 `layerdifforg/seethroughv0.0.1_marigold`로 이전되었습니다. 기본 저장소 ID를 갱신해 depth 모델 자동 다운로드가 다시 동작합니다. ([#3](https://github.com/tackcrypto1031/tk_seethrough/issues/3))
-
-### v1.2.3 — 버그 수정
-
-- **수정: "Failed to load ag-psd bundle from any path" 오류로 PSD 다운로드 실패** — ComfyUI의 새 프론트엔드가 ES module `import()`로 확장 기능을 로드하면서 `document.currentScript`가 `null`이 되는 문제였습니다. `import.meta.url`을 사용하도록 바꿔, 설치 폴더 이름과 무관하게 bundle 경로를 안정적으로 찾도록 했습니다. ([#1](https://github.com/tackcrypto1031/tk_seethrough/issues/1))
-- **수정: 새 환경에서 노드 로드 실패** — 업스트림 Marigold 모듈이 선택적 시각화 함수를 위해 모듈 최상단에서 `matplotlib`을 임포트하면서, `matplotlib`이 없는 환경에서 `ModuleNotFoundError`가 발생했습니다. 지연 임포트(lazy import)로 바꿔, `matplotlib` 없이도 노드가 로드되도록 했습니다.
-
 ### v1.2 — Spine 내보내기, Auto-Fill & All Runs PSD
 
 - **Spine 내보내기 노드** — Spine 2D 애니메이션 준비를 위한 `Layer Rename`, `Layer Filter`, `Export Spine` 노드 추가.
@@ -361,17 +386,6 @@ python webui/app.py
   - **Download Depth PSD** (보라색) — depth map
   - **Download All Runs PSD** (주황색) — 모든 run을 그룹별로 (`auto_fill` 필요)
 
-### v1.1 — 업스트림과 동기화
-
-이 fork는 [업스트림 v0.2.2](https://github.com/jtydhr88/ComfyUI-See-through)와
-동기화되어 다음 개선 사항을 포함합니다:
-
-- **VRAM 오프로딩** — 모델이 이제 CPU에 머물다가 추론 중에만 GPU로 이동하고, 끝나면 다시 오프로드됩니다. VRAM 사용량이 크게 줄어 8GB 이하 GPU에서도 실행할 수 있습니다.
-- **텍스트 인코더 오프로딩** — 텍스트 인코더는 프롬프트 인코딩을 위해 GPU에 로드된 뒤, UNet+VAE를 로드하기 전에 오프로드되어 VRAM을 동시에 두고 경쟁하지 않습니다.
-- **Marigold 호환성 수정** — torchvision >= 0.23에서 더 엄격해진 `InterpolationMode` 검사에 맞춰 `resize` 호출을 수정했습니다.
-- **웹 관련 수정** — 서브패스 배포 지원; 대소문자를 구분하는 파일 시스템에서 발생하던 ag-psd bundle 404 오류 수정.
-- **커스텀 노드 최적화** — `enable_head_detail = false`일 때 diffusion뿐 아니라 head 텍스트 인코딩도 생략되어, GPU 메모리 사용량이 더 줄었습니다.
-
 ## 프로젝트 문서
 
 Portrait Mode의 전체 설계/구현 기록:
@@ -379,7 +393,7 @@ Portrait Mode의 전체 설계/구현 기록:
 - [`docs/PORTRAIT_MODE_FORK_PLAN_v0.1.md`](docs/PORTRAIT_MODE_FORK_PLAN_v0.1.md) — 전체 범위와 마일스톤 (M1–M4)
 - [`docs/M1_IMPLEMENTATION_SPEC.md`](docs/M1_IMPLEMENTATION_SPEC.md) — Portrait Mode 핵심 계약과 verdict 규칙
 - [`docs/TEST_PROTOCOL_A001.md`](docs/TEST_PROTOCOL_A001.md) — 두 진입점 모두가 검증받는 A-001 검증 절차
-- [`docs/M2_IMPLEMENTATION_SPEC.md`](docs/M2_IMPLEMENTATION_SPEC.md) — 독립 실행 웹UI 계약, `nodes.py`와 무엇을 왜 공유하는지, GPU 없이는 아직 검증하지 못한 부분
+- [`docs/M2_IMPLEMENTATION_SPEC.md`](docs/M2_IMPLEMENTATION_SPEC.md) — 독립 실행 웹UI 계약, `nodes.py`와 무엇을 왜 공유하는지, 8GB 카드에서의 VRAM 측정치와 재현 방법
 
 ## 감사의 말
 

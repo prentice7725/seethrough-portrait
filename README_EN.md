@@ -294,6 +294,43 @@ known limitations, and the implementation contract are in
 
 ## What's New in This Fork
 
+### v1.4.0.dev2 — actually running on an 8GB GPU
+
+The UNet this fork uses is 4.07B parameters -- **7.58 GiB even in bf16**. On
+an RTX 5060 Laptop (8151 MiB), once the CUDA context and the desktop have
+taken their 0.75 GiB, torch can hold 7.19 GiB, so **the weights could not be
+put on the card at all**: `unet.to(device)` raised OutOfMemoryError before any
+compute started. Lowering `resolution` or `steps` could not help, because the
+failure came before either of them mattered. (With Windows' CUDA system-memory
+fallback enabled it silently spills to host RAM instead of failing -- it does
+not die, it just runs ~90x slower.)
+
+- **UNet block streaming** — when the weights will not fit whole, they stay on
+  the CPU and are streamed to the GPU a leaf at a time (diffusers group
+  offloading with CUDA-stream prefetch). The decision is made by measuring
+  free VRAM, so a larger card behaves exactly as before, and the ComfyUI node
+  path is untouched -- it has ComfyUI's own VRAM scheduler.
+- **Load at the target dtype** — `from_pretrained` was instantiating at the
+  default fp32 and upcasting the bf16 checkpoint on the way in, only to cast
+  it straight back. Peak system RAM for a model load fell from
+  **17.51 GiB to 0.82 GiB**, and UNet load time from 20.2s to 8.0s.
+- **VAE tiling** — the SDXL VAE encodes/decodes in 512px tiles. Inactive at
+  `resolution` 512 or below.
+
+Measured on that card (A-001, seed 42, 30 steps, all `PASS`):
+
+| settings | wall time | peak VRAM | layers |
+|---|---|---|---|
+| res 512, head off | 60.7s | 2.03 GiB | 13 |
+| res 512, head on | 109.6s | 2.03 GiB | 24 |
+| res 1280, head off | 333.9s | 3.66 GiB | 13 |
+| res 1280, head on | 609.9s | 3.66 GiB | 24 |
+
+The res-512/head-off row reproduces the previously recorded coverage table
+field for field -- streaming the weights does not change results. Peak VRAM
+depends only on resolution: the head stage runs at the same size with fewer
+frames, so it costs time and no extra memory.
+
 ### v1.4.0.dev1 — Portrait Mode M2: standalone webui
 
 - New `webui/app.py`: a single-image Portrait Mode webui that runs without
@@ -324,15 +361,6 @@ known limitations, and the implementation contract are in
 - **SeeThrough Save PSD** now accepts optional `original_image` + `source_filename` inputs, automatically includes the original input image as a visible base layer in the generated PSD, and uses the source filename in output filenames when available.
 - PSD layer structure is now grouped: `Original` (visible, bottom), `Parts` (hidden), `Runs` (hidden, grouped-PSD mode only) — opens the PSD on the original so you can toggle groups to edit specific parts.
 
-### v1.2.4 — Bug Fixes
-
-- **Fix: Depth model fails to download — HuggingFace repo ID updated** — The default Marigold depth model repo `24yearsold/seethroughv0.0.1_marigold` was moved to `layerdifforg/seethroughv0.0.1_marigold`. Updated the default repo ID so depth model auto-download works again. ([#3](https://github.com/tackcrypto1031/tk_seethrough/issues/3))
-
-### v1.2.3 — Bug Fixes
-
-- **Fix: PSD download fails with "Failed to load ag-psd bundle from any path"** — ComfyUI's new frontend loads extensions via ES module `import()`, causing `document.currentScript` to be `null`. Replaced with `import.meta.url` for reliable bundle path resolution regardless of install folder name. ([#1](https://github.com/tackcrypto1031/tk_seethrough/issues/1))
-- **Fix: Nodes fail to load in fresh environments** — The upstream Marigold module imports `matplotlib` at module level for an optional visualization function, causing `ModuleNotFoundError` on environments without `matplotlib`. Changed to lazy import so nodes load without requiring `matplotlib`.
-
 ### v1.2 — Spine Export, Auto-Fill & All Runs PSD
 
 - **Spine Export Nodes** — New `Layer Rename`, `Layer Filter`, and `Export Spine` nodes for Spine 2D animation preparation.
@@ -343,16 +371,6 @@ known limitations, and the implementation contract are in
   - **Download Depth PSD** (purple) — depth maps
   - **Download All Runs PSD** (orange) — all runs grouped by folder (requires `auto_fill`)
 
-### v1.1 — Synced with Upstream
-
-This fork has been synced with [upstream v0.2.2](https://github.com/jtydhr88/ComfyUI-See-through), incorporating the following improvements:
-
-- **VRAM Offloading** — Models now stay on CPU and are moved to GPU only during inference, then offloaded back. This significantly reduces VRAM usage, making it possible to run on GPUs with 8GB or less.
-- **Text Encoder Offloading** — Text encoders are loaded to GPU for prompt encoding, then offloaded before loading UNet+VAE, so they never compete for VRAM at the same time.
-- **Marigold Compatibility Fix** — Fixed `resize` call for torchvision >= 0.23 which introduced stricter `InterpolationMode` checks.
-- **Web Fixes** — Subpath deployment support; ag-psd bundle 404 fix on case-sensitive filesystems.
-- **Custom Node Optimization** — When `enable_head_detail = false`, head text encoding is also skipped (not just diffusion), further reducing GPU memory usage.
-
 ## Project docs
 
 For the full Portrait Mode design/implementation record:
@@ -360,7 +378,7 @@ For the full Portrait Mode design/implementation record:
 - [`docs/PORTRAIT_MODE_FORK_PLAN_v0.1.md`](docs/PORTRAIT_MODE_FORK_PLAN_v0.1.md) — overall scope and milestones (M1–M4)
 - [`docs/M1_IMPLEMENTATION_SPEC.md`](docs/M1_IMPLEMENTATION_SPEC.md) — Portrait Mode core contract and verdict rules
 - [`docs/TEST_PROTOCOL_A001.md`](docs/TEST_PROTOCOL_A001.md) — the A-001 validation procedure both entry points are checked against
-- [`docs/M2_IMPLEMENTATION_SPEC.md`](docs/M2_IMPLEMENTATION_SPEC.md) — standalone webui contract, what's shared with `nodes.py` and why, and what's still unverified without GPU access
+- [`docs/M2_IMPLEMENTATION_SPEC.md`](docs/M2_IMPLEMENTATION_SPEC.md) — standalone webui contract, what's shared with `nodes.py` and why, and the measured VRAM numbers for an 8GB card
 
 ## Acknowledgements
 
