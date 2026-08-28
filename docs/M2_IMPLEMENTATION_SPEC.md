@@ -119,8 +119,9 @@ can compare two runs on disk without re-downloading.
 
 ## Verification performed
 
-This change was made without GPU access or the real LayerDiff/Marigold
-checkpoints, so it could not be run end to end. What was actually verified:
+This change was originally made without GPU access or the real
+LayerDiff/Marigold checkpoints, so it could not be run end to end; item 5
+below is a real run added after the fact. What was actually verified:
 
 1. `tests/unit` (38 tests, no torch/GPU required) passes, including new
    tests for `seethrough_engine.layers` (`layer_similarity`, `crop_head`,
@@ -144,18 +145,39 @@ checkpoints, so it could not be run end to end. What was actually verified:
    direct dependencies (`transformers`, `torchvision`) that `-r
    ../requirements.txt` doesn't list (that file assumes ComfyUI already
    provides them) and `webui/requirements.txt` hadn't added either; both are
-   now pinned there. Still not verified: loading an actual checkpoint or
-   running inference.
+   now pinned there. Still not verified at that point: loading an actual
+   checkpoint or running inference.
+5. **Real end-to-end run**, `layerdifforg/seethroughv0.0.2_layerdiff3d` on
+   an RTX 5060 (8GB): `python webui/app.py` loaded the model, ran Portrait
+   Mode with `silhouette_guard` on, and produced `PASS` with internally
+   consistent numbers (`post_recovery_coverage: 1.0`,
+   `recovered_ratio: 0.024` well under the `pass_remainder_max: 0.06` gate,
+   `post_spill_ratio: 0.0`, `handwear_detected: true`) -- exactly the metric
+   set `CoverageMetrics` defines, confirming the coverage table shape too.
+   Two things surfaced along the way, neither a bug in this repo:
+     - The very first CUDA call on this GPU generation triggered a long
+       (~18 minute) kernel-autotune stall with no console output, which by
+       default exceeds Windows' 2-second TDR timeout and silently kills the
+       process with no Python traceback. Fixed by raising `TdrDelay` (see
+       `webui/README.md` Troubleshooting). Not something this webui can work
+       around in-process.
+     - `webui/requirements.txt` was missing `transformers` and
+       `torchvision` (see item 4) -- fixed before this run.
 
-## M2 acceptance (to be confirmed on real hardware)
+## M2 acceptance
 
 1. Uploading the A-001 asset with `silhouette_guard` on reproduces the same
    verdict/coverage numbers as running the same settings through the ComfyUI
-   node graph (same seed, resolution, steps).
+   node graph (same seed, resolution, steps). **Not yet done** -- a real
+   webui run now produces a well-formed `PASS`, but it hasn't been run
+   through the ComfyUI node graph on the same asset/seed for a side-by-side
+   comparison.
 2. The exported zip's `*_portrait_report.json` validates against the same
-   schema `build_portrait_report` already produces for nodes.py (schema_version 1).
+   schema `build_portrait_report` already produces for nodes.py
+   (schema_version 1). **Confirmed** -- the real run's coverage table matches
+   `CoverageMetrics` field-for-field.
 3. `python webui/app.py` starts and serves the UI with no ComfyUI process
-   running.
+   running. **Confirmed**, including a full real run to a `PASS` verdict.
 4. Existing ComfyUI node behavior is unchanged for a real GPU run (guarded
    by manual regression, since `tests/unit` cannot load the diffusion
-   pipeline).
+   pipeline). **Not yet done.**

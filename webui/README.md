@@ -58,6 +58,41 @@ in case you want to inspect them without re-downloading the zip.
   browser via `ag-psd`; this webui exports plain PNGs + JSON instead.
 - **One model resident at a time.** Switching the model dropdown unloads the
   previously loaded one.
-- Not verified end-to-end on real GPU hardware as part of this change (see
-  `docs/M2_IMPLEMENTATION_SPEC.md`) -- the Gradio app itself was smoke-tested
-  (builds, serves, responds to HTTP), but no real diffusion run.
+
+## Troubleshooting
+
+### The process just dies mid-run with no Python error, after the GPU was pegged at 100% for a long time
+
+This is almost always **Windows TDR** (Timeout Detection and Recovery), not a
+bug in this code. If a single CUDA kernel runs longer than the driver's
+timeout (default 2 seconds), Windows force-resets the GPU driver, and
+whatever process was using CUDA at that moment is killed outright -- below
+Python's exception handling, so nothing gets logged.
+
+**How to confirm:** Event Viewer (`eventvwr.msc`) -> Windows Logs -> System
+-> look for an **Error** from source `nvlddmkm`, event ID **153**, timestamped
+around when it died.
+
+**Fix:** raise the timeout (admin PowerShell), then **reboot** (required):
+
+```powershell
+New-ItemProperty -Path "HKLM:\SYSTEM\CurrentControlSet\Control\GraphicsDrivers" `
+  -Name "TdrDelay" -PropertyType DWord -Value 60 -Force
+```
+
+This is especially likely to hit on a very new GPU generation (e.g. an RTX
+50-series / Blackwell card): the **first** CUDA call on a shape/architecture
+combination the driver hasn't seen before can trigger a slow cuDNN/cuBLAS
+kernel autotune search that legitimately takes several minutes -- comfortably
+past the default 2-second TDR window, even though nothing is actually hung.
+Once `TdrDelay` is raised, a first run in the tens of minutes for a brand-new
+GPU + very recent torch/CUDA build is plausible; subsequent runs in the same
+process should be much faster since the kernel search doesn't repeat for
+shapes already seen.
+
+If the console shows literally nothing after `[SeeThrough] ... model loaded
+to CPU` for a long time with GPU usage pegged near 100%, that alone isn't a
+red flag: the pipeline's own diffusion-step progress bar (`tqdm`, enabled by
+default) only starts printing once the sampling loop itself begins, so long
+setup-time silence upstream of that (text encoding, moving weights to GPU,
+first-call kernel autotuning) is expected to be quiet.
