@@ -48,6 +48,7 @@ __all__ = [
     "detect_anchors",
     "RECLAIM_PAIRS",
     "reclaim_occluded",
+    "trim_layer_edges",
     "composite_layers",
     "composite_fidelity",
     "build_rig",
@@ -146,6 +147,30 @@ RECLAIM_MIN_AREA_AT_768 = 200
 # rather than stopping at a hard edge. Sub-pixel motion across a hard, jagged
 # alpha cut is what made the seam glitter once per breath.
 RECLAIM_FEATHER_PX = 1.0
+
+# The same question at every layer's own boundary rather than between one named
+# pair. A layer's outermost pixels are darkened where its alpha ends -- on
+# A-001's `face` the two rows nearest the jaw edge composite to luma 80 and 162
+# where the original is 223 and 225, drawing a black stroke across light skin
+# two pixels above the chin line the original actually has. The same shape of
+# fault, smaller, sits where the neck's bottom meets the garment: the two
+# alphas sum to 1.64 and the overlap darkens one row by 4.
+#
+# It is only ever the boundary, so only the boundary is contested, and only
+# where something behind is there to take over. The bars are higher than
+# `reclaim_occluded`'s because a rim is thin and a thin mistake is cheap to
+# leave alone: a layer edge has to be decisively wrong, not merely worse.
+EDGE_BAND_PX = 3
+EDGE_MARGIN = 24
+EDGE_FLOOR = 30
+EDGE_MIN_AREA_AT_768 = 40
+
+# Barely feathered, unlike the pair version. There the handover is a region and
+# the feather smooths its boundary; here the handover *is* a boundary three
+# pixels deep, and a sigma of 1 leaves half the rim behind -- the jaw stroke
+# came back at -56 luma instead of -13. Measured across the two A-001 runs,
+# 0.4 beats both 0 and 1 on composite mae.
+EDGE_FEATHER_PX = 0.4
 
 MANIFEST_VERSION = "0.1"
 RIG_SUBDIR = "rig"
@@ -576,6 +601,89 @@ def reclaim_occluded(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarra
     return out, moved
 
 
+def trim_layer_edges(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarray, *,
+                     order: tuple[str, ...] = RIG_Z_ORDER,
+                     alpha_threshold: int = 10, band: int = EDGE_BAND_PX,
+                     margin: int = EDGE_MARGIN, floor: int = EDGE_FLOOR,
+                     min_area: int | None = None, feather: float | None = None,
+                     ) -> tuple[dict[str, np.ndarray], dict[str, int]]:
+    """Hand a layer's own boundary back to what is behind it, where the boundary
+    is decisively wrong and what is behind is right.
+
+    `reclaim_occluded` asks this of one named pair over their whole overlap.
+    This asks it of every layer at its own edge, which is where the
+    decomposition leaves a darkened rim: the model paints a layer's last pixels
+    toward its outline, and drawn over a lighter layer behind, that rim is a
+    stroke the picture does not have.
+
+    Same machinery as the pair version, and for the same reasons: a
+    margin-qualified core seeds each region so the threshold does not decide
+    where a region ends, and the handover is feathered and clamped by what is
+    behind so it can never open a gap. Only the front layer's alpha changes.
+    """
+    original = np.asarray(original_rgba)[..., :3].astype(np.int32)
+    canvas_h, canvas_w = original.shape[:2]
+    feather = EDGE_FEATHER_PX if feather is None else feather
+    if min_area is None:
+        scale = canvas_h * canvas_w / (768.0 * 768.0)
+        min_area = max(12, int(round(EDGE_MIN_AREA_AT_768 * scale)))
+
+    out = dict(layer_dict)
+    moved: dict[str, int] = {}
+
+    def rank(tag: str) -> int:
+        return order.index(tag) if tag in order else -1
+
+    beneath_rgb = np.zeros((canvas_h, canvas_w, 3), np.float32)
+    beneath_a = np.zeros((canvas_h, canvas_w, 1), np.float32)
+
+    for tag in sorted(out, key=rank):
+        layer = np.asarray(out[tag])
+        alpha = layer[..., 3]
+        solid = (alpha > alpha_threshold).astype(np.uint8)
+        if solid.any() and beneath_a.any():
+            # The band, and only where there is something behind to show.
+            distance = cv2.distanceTransform(solid, cv2.DIST_L2, 3)
+            edge = (solid > 0) & (distance <= band) & (beneath_a[..., 0] > 0.5)
+            if edge.any():
+                front_err = np.abs(original - layer[..., :3].astype(np.int32)).sum(axis=2)
+                behind_err = np.abs(original - beneath_rgb.astype(np.int32)).sum(axis=2)
+                # No opening here, unlike the pair version: the band is two
+                # pixels wide and a 3x3 open deletes it outright. The area bar
+                # below is what rejects noise instead.
+                core = (edge & (behind_err + margin < front_err)
+                        & (front_err > floor))
+                if core.any():
+                    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+                        core.astype(np.uint8), 8)
+                    core = np.isin(labels, [i for i in range(1, count)
+                                            if stats[i, cv2.CC_STAT_AREA] >= min_area])
+                if core.any():
+                    region = edge & (behind_err < front_err)
+                    count, labels, _, _ = cv2.connectedComponentsWithStats(
+                        region.astype(np.uint8), 8)
+                    seeded = set(np.unique(labels[core]).tolist()) - {0}
+                    take = np.isin(labels, list(seeded)) if seeded else None
+                    if take is not None and take.any():
+                        handover = take.astype(np.float32)
+                        if feather > 0:
+                            handover = cv2.GaussianBlur(handover, (0, 0), float(feather))
+                            handover = np.clip(handover, 0.0, 1.0) * np.clip(
+                                beneath_a[..., 0], 0.0, 1.0)
+                        patched = np.array(layer, copy=True)
+                        patched[..., 3] = np.rint(
+                            alpha.astype(np.float32) * (1.0 - handover)).astype(np.uint8)
+                        out[tag] = patched
+                        layer = patched
+                        moved[tag] = int(take.sum())
+
+        a = np.clip(layer[..., 3:4].astype(np.float32) / 255.0, 0.0, 1.0)
+        beneath_rgb = beneath_rgb * (1.0 - a) + layer[..., :3].astype(np.float32) * a
+        beneath_a = np.clip(beneath_a + a, 0.0, 1.0)
+
+    return out, moved
+
+
 def composite_layers(layer_dict: dict[str, np.ndarray], frame_size: tuple[int, int], *,
                      order: tuple[str, ...] = RIG_Z_ORDER,
                      alpha_threshold: int = 10) -> np.ndarray:
@@ -723,9 +831,12 @@ def build_rig(layer_dict: dict[str, np.ndarray], *,
     # hides the neck almost completely, and the remainder split below reads the
     # group unions this changes.
     reclaimed: dict[str, int] = {}
+    edge_trimmed: dict[str, int] = {}
     if original_rgba is not None:
         working, reclaimed = reclaim_occluded(working, original_rgba,
                                               alpha_threshold=alpha_threshold)
+        working, edge_trimmed = trim_layer_edges(working, original_rgba,
+                                                 alpha_threshold=alpha_threshold)
 
     # Stage B: remainder next, so the eye split and the anchors below see the
     # same layer set the manifest will describe.
@@ -804,6 +915,7 @@ def build_rig(layer_dict: dict[str, np.ndarray], *,
             "tag_version": tag_version,
             "depth": "marigold" if depth_dict else "table",
             "reclaimed": reclaimed,
+            "edge_trimmed": edge_trimmed,
         },
         "anchors": anchors,
         "parts": parts,

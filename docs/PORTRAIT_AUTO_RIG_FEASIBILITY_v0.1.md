@@ -567,6 +567,42 @@ geometrically continuous and still read as a mask deforming. The blend is
 therefore a slider defaulting to 0, and `DEFAULT_MOTION.head_turn.max_x` stays
 at the parallax rig's 0.8 until someone has watched the shell turn on a GPU.
 
+**2026-08-29 -- the line across the jaw was a layer's own edge.** Watching the
+rig move turned up two strokes the portrait does not have: a heavy one under
+the jaw and a faint one where the neck meets the garment.
+
+The heavy one is a decomposition artifact, not a rig one, and it is the same
+fault as the ring the expression pack's donor `mouth` layer drew. A layer's
+outermost pixels are painted toward its outline, so where `face` ends at the
+chin its last two rows composite to luma 80 and 162 against an original of 223
+and 225 -- a black stroke on light skin, two pixels above the chin line the
+picture actually has. The layer behind it, `head`, has 215 and 236 there: the
+right answer was already in the stack.
+
+`rig.trim_layer_edges` asks `reclaim_occluded`'s question at every layer's own
+boundary rather than between one named pair -- where the edge is decisively
+wrong and what is behind is right, the edge hands over. Same core-seeded region
+and clamped feather, two differences forced by the shape: no morphological
+opening, because a 3 px band does not survive a 3x3 open, and a feather of 0.4
+rather than 1.0, because here the handover *is* a boundary and a sigma of 1
+leaves half the rim behind (the jaw stroke came back at -56 instead of -13).
+
+| | composite mae | bad ratio |
+| --- | --- | --- |
+| raw layers | 18.30 | 8.57% |
+| after `reclaim_occluded` | 17.02 | 7.48% |
+| ... and `trim_layer_edges` | **15.89** | **6.98%** |
+
+The second run moves the same way, 15.07 to 13.90 and 6.84% to 6.16%, which is
+the only reason to believe the band and margin are not fitted to one picture.
+At the jaw the two bad rows go from -63 and -143 to +8 and -13.
+
+The faint line remains: where the neck's bottom meets the garment the two
+alphas sum to 1.64 and the overlap darkens one row by 4 luma, with the garment's
+flat 230 sitting 3 above the original below it. That is an overlap to normalize
+rather than an edge to hand over, and 4 luma over two rows is where this stopped
+being worth another pass.
+
 ## Out of scope
 
 Deferred deliberately, not forgotten:
