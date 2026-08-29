@@ -85,10 +85,9 @@
   <h2>Idle</h2>
   <label class="row"><input type="checkbox" id="autoIdle"> Auto idle motion</label>
   <p class="hint">Off by default: the page opens on the rest pose, so what you
-     see first is the decomposition rather than the animation. Idle tilts and
-     breathes but does not turn &mdash; a turn moves every part by a different
-     amount, so it opens seams, and idle must not be what finds them. Use the
-     turn sliders for that.</p>
+     see first is the decomposition rather than the animation. Idle turns no
+     further than &plusmn;0.3, which is below where the reveal along an edge
+     merges into one tear; the sliders reach 1.5 for finding that.</p>
   <label class="row"><input type="checkbox" id="doBlink" checked> Blink</label>
   <label class="row"><input type="checkbox" id="doBreathe" checked> Breathing</label>
   <label>Breath <span class="val" id="breathAmpv">3.0px</span>
@@ -162,6 +161,18 @@
 const TURN_BASE = 0.015;   // every head part moves at least this much
 const TURN_SPAN = 0.045;   // ... plus this much more the nearer it is
 const TURN_Y_SCALE = 0.7;  // vertical parallax reads stronger, so damp it
+
+// How far the idle loop may turn, whatever the manifest allows.
+//
+// The manifest's `max_x` is the point past which the rig visibly tears, and
+// scaling idle by it was the first answer and not enough of one: the reveal
+// does not begin there, it merges there. Counted on A-001, the largest
+// contiguous region a turn exposes is 584 px of scattered edge at 0.2 and
+// 1027 at 0.4, and somewhere between 0.4 and 0.6 those merge into one gash
+// down the temple -- 3275 px at 0.6. Idle plays unattended and must not be
+// what discovers that, so it stays below where the merge begins. The sliders
+// reach 1.5, which is what found it.
+const IDLE_TURN = 0.3;
 const CHEST_WIDEN = 0.004; // ribcage expansion, as a fraction of chest width
 
 // Ellipsoid shell (H6), read from Anime2.5DRig's 3D-shell mode. Depth parallax
@@ -885,18 +896,12 @@ function frame(now) {
   state.lastFrame = now;
 
   if (document.getElementById("autoIdle").checked) {
-    // Tilt only, and only as far as the manifest allows.
-    //
-    // The turn is depth-differential by construction: every part moves by a
-    // different amount, which is the whole illusion and also means it can only
-    // ever open the seams between them -- the temple gash H1 measured, the
-    // reclaimed window sliding against the neck it was cut for. A tilt rotates
-    // about the neck pivot scaled by the same weight field the rig is built
-    // on, so everything sharing a weight turns rigidly together and the one
-    // gradient is continuous by construction. Nothing can come apart.
-    //
-    // Idle is what plays unattended, so it must never be what discovers an
-    // artifact. The sliders reach well past this, which is what they are for.
+    // Two incommensurable periods so the loop never visibly repeats, and the
+    // turn held well inside where it starts to cost something.
+    const turn = state.manifest.motion.head_turn;
+    const limit = Math.min(turn.max_x, IDLE_TURN);
+    setSlider("turnX", (Math.sin(t * 0.37) * 0.73 + Math.sin(t * 0.13) * 0.27) * limit);
+    setSlider("turnY", Math.sin(t * 0.29 + 1.1) * 0.45 * Math.min(turn.max_y, IDLE_TURN));
     setSlider("tilt", Math.sin(t * 0.23 + 0.6) * state.manifest.motion.head_tilt.max_deg);
   }
 

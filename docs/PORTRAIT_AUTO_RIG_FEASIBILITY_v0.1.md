@@ -227,7 +227,11 @@ Exactly four, matching the fork plan's M4 wording:
    between the rotated and the rest projection, so at slider 0 -- and at any
    slider value with the head at rest -- the render is bit-identical to the
    parallax rig, and the slider isolates the turn's shape from its amount.
-2. **Head tilt (Z), +/-2 degrees**, rotating about `neck_pivot`.
+2. **Head tilt (Z), +/-2 degrees**, rotating about `neck_pivot`. Unlike the
+   turn it cannot open a seam: it rotates about the pivot scaled by the same
+   weight field the rig is built on, so parts sharing a weight turn rigidly
+   together and the single gradient stays continuous. That asymmetry is why
+   idle caps the turn and not the tilt.
 3. **Breathing.** One continuous vertical displacement field, not a per-group
    transform: full lift above the chest line, falling linearly to zero at
    `body_pivot`, plus a slight ribcage widening. Giving the head a translation
@@ -453,9 +457,11 @@ region where hair-dark pixels turn skin-light:
 
 Up to 0.8 the reveal stays scattered along edges; between 0.8 and 1.0 it merges
 into one coherent gash down the temple. `DEFAULT_MOTION.head_turn.max_x` is now
-0.8, and the preview's idle animation scales by the manifest's limits rather
-than by constants of its own, so idle motion can never be what discovers the
-edge. The manual sliders still reach +/-1.5, which is what found it.
+0.8. Scaling idle by that limit was the first answer and not enough of one: the
+reveal does not *begin* at 0.8, it merges there, and idle plays unattended. So
+idle is capped at 0.3 -- below where 1027 px of scattered edge become one 3275
+px gash -- whatever the manifest allows. The manual sliders still reach +/-1.5,
+which is what found the edge.
 
 The nature of the failure is worth recording, because it revises H1 rather than
 confirming it. Our layers **are** occlusion-complete -- the `face` layer is
