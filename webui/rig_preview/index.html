@@ -83,9 +83,20 @@
   <div class="meta" id="runmeta">no run loaded</div>
 
   <h2>Idle</h2>
-  <label class="row"><input type="checkbox" id="autoIdle" checked> Auto idle motion</label>
+  <label class="row"><input type="checkbox" id="autoIdle"> Auto idle motion</label>
+  <p class="hint">Off by default: the page opens on the rest pose, so what you
+     see first is the decomposition rather than the animation.</p>
   <label class="row"><input type="checkbox" id="doBlink" checked> Blink</label>
   <label class="row"><input type="checkbox" id="doBreathe" checked> Breathing</label>
+  <label>Breath <span class="val" id="breathAmpv">3.0px</span>
+    <input type="range" id="breathAmp" min="0" max="20" step="0.5" value="3"></label>
+  <label>Lid line <span class="val" id="lidLinev">0.85</span>
+    <input type="range" id="lidLine" min="0.5" max="1" step="0.01" value="0.85"></label>
+  <label>Lid thickness <span class="val" id="lidThickv">0.18</span>
+    <input type="range" id="lidThick" min="0.02" max="0.6" step="0.01" value="0.18"></label>
+  <p class="hint">A closed eye should read as one clean line. The lash layer
+     holds an upper and a lower stroke: squash too far and they average into a
+     grey band, too little and they stay two lines.</p>
   <div class="row">
     <button id="winkL">Wink L</button>
     <button id="winkR">Wink R</button>
@@ -113,6 +124,10 @@
       <option value="detached">detached 0.0</option>
     </select></label>
   <p class="hint">Compare against the two degenerate cases (H3).</p>
+  <label>Collar follow <span class="val" id="collarv">manifest</span>
+    <input type="range" id="collar" min="0.16" max="1" step="0.01" value="0.45"></label>
+  <p class="hint">How much a stand collar rides with the head. Too low and the
+     chin cuts into it; too high and the shoulders wobble.</p>
   <label class="row"><input type="checkbox" id="wire"> Show mesh</label>
 
   <h2>Parts</h2>
@@ -129,6 +144,7 @@
 const TURN_BASE = 0.015;   // every head part moves at least this much
 const TURN_SPAN = 0.045;   // ... plus this much more the nearer it is
 const TURN_Y_SCALE = 0.7;  // vertical parallax reads stronger, so damp it
+const CHEST_WIDEN = 0.004; // ribcage expansion, as a fraction of chest width
 
 const EYE_TAGS = new Set([
   "eyewhite", "eyewhitel", "eyewhiter",
@@ -136,6 +152,32 @@ const EYE_TAGS = new Set([
   "eyelash", "eyelashl", "eyelashr",
   "eyes", "eyel", "eyer",
 ]);
+
+// The lash is the closed eye. A shut anime eye is a dark line, not an absence,
+// and the `face` layer underneath is inpainted skin with no eye drawn on it --
+// correctly so -- which means anything that collapses to zero height leaves a
+// blank cheek. So the lash keeps a fraction of its height and lands on the lid
+// line, while the white and the iris do vanish behind it. A synthesized
+// closed-eye layer would be better and is deliberately out of scope for v0.1.
+const LID_TAGS = new Set(["eyelash", "eyelashl", "eyelashr"]);
+
+// How much of the lash's height survives a full close. The layer holds two
+// strokes -- an upper lash arc and a thinner lower lash, with a near-empty gap
+// between them -- so squashing it too far averages both strokes and the gap
+// into one grey band instead of a line, while too little squash leaves the two
+// strokes visibly apart. The readable value depends on how the eye was drawn,
+// which is why it is a slider.
+const LID_MIN_SCALE = 0.18;
+
+// An eye closes by the upper lid coming *down*, so everything collapses onto
+// the lower lid rather than onto the middle of the opening. Closing to the
+// centre leaves the lash as a short bar floating in the socket with skin above
+// and below it, which reads as a squint rather than a blink. 1.0 is the bottom
+// of the eye opening, 0.5 its centre.
+const LID_LINE_RATIO = 0.85;
+
+// Which layer defines the eye opening the lid closes onto, best first.
+const EYE_OPENING_TAGS = ["eyewhite", "irides", "eyes"];
 
 const VERT_SRC = `
 attribute vec2 a_pos;
@@ -167,6 +209,8 @@ const state = {
   turnX: 0, turnY: 0, tiltDeg: 0,
   blink: { l: 0, r: 0 },
   blinkTimer: 0, blinkPhase: null,
+  canMipmap: false,
+  collarOverride: null,   // null = use whatever the manifest baked in
   t0: performance.now(),
 };
 
@@ -288,19 +332,36 @@ function weightAt(spec, y) {
   return spec.value;
 }
 
+/** Vertical breathing profile: 1 above the chest, falling linearly to 0 at the
+ *  planted bottom of the torso. One field for every part, so the head, the
+ *  neck and the shoulders cannot drift apart at their seams. */
+function breathRamp(y) {
+  const top = state.breathTop, bottom = state.breathBottom;
+  if (!(bottom > top)) return 1;          // no torso to plant against
+  if (y <= top) return 1;
+  if (y >= bottom) return 0;
+  return (bottom - y) / (bottom - top);
+}
+
 function buildMesh(part) {
   const [x1, y1, x2, y2] = part.xyxy;
   const cell = Math.max(4, part.mesh.cell);
   const cols = Math.max(1, Math.round((x2 - x1) / cell));
   const rows = Math.max(1, Math.round((y2 - y1) / cell));
-  const rest = [], uv = [], weight = [];
+  const rest = [], uv = [], weight = [], ramp = [];
+  const spec = part.weight;
+  const span = spec.mode === "gradient_y" ? spec.top - spec.bottom : 0;
   for (let r = 0; r <= rows; r++) {
     for (let c = 0; c <= cols; c++) {
       const u = c / cols, v = r / rows;
       const x = x1 + (x2 - x1) * u, y = y1 + (y2 - y1) * v;
+      const w = weightAt(spec, y);
       rest.push(x, y);
       uv.push(u, v);
-      weight.push(weightAt(part.weight, y));
+      weight.push(w);
+      // Where this vertex sits along its gradient, 0 at the bottom value and 1
+      // at the top, so a slider can re-aim the top without a rebuild.
+      ramp.push(span === 0 ? 0 : (w - spec.bottom) / span);
     }
   }
   const idx = [], wire = [];
@@ -316,7 +377,8 @@ function buildMesh(part) {
   }
   return {
     rest: new Float32Array(rest), uv: new Float32Array(uv),
-    weight: new Float32Array(weight), live: new Float32Array(rest),
+    weight: new Float32Array(weight), ramp: new Float32Array(ramp),
+    live: new Float32Array(rest),
     index: new Uint16Array(idx), wireIndex: new Uint16Array(wire),
     count: idx.length, wireCount: wire.length,
   };
@@ -333,8 +395,14 @@ function compile(gl, type, src) {
 }
 
 function initGL(canvas) {
-  const gl = canvas.getContext("webgl", { premultipliedAlpha: false, antialias: true });
+  // WebGL2 first, only for its NPOT mipmap support: a blinking eye squashes its
+  // lash to a fifth of its height, and minifying that far with a plain LINEAR
+  // sampler takes two texels out of the six it should be averaging, which turns
+  // a lash into a shimmering band. WebGL1 remains a working fallback.
+  const opts = { premultipliedAlpha: false, antialias: true };
+  const gl = canvas.getContext("webgl2", opts) || canvas.getContext("webgl", opts);
   if (!gl) throw new Error("WebGL is not available in this browser.");
+  state.canMipmap = typeof gl.texStorage2D === "function";  // i.e. WebGL2
   const prog = gl.createProgram();
   gl.attachShader(prog, compile(gl, gl.VERTEX_SHADER, VERT_SRC));
   gl.attachShader(prog, compile(gl, gl.FRAGMENT_SHADER, FRAG_SRC));
@@ -362,10 +430,15 @@ function makeTexture(gl, bitmap) {
   // Part crops are arbitrary sizes, so no mipmaps and clamp at the edges.
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_S, gl.CLAMP_TO_EDGE);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_WRAP_T, gl.CLAMP_TO_EDGE);
-  gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
   gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
   gl.pixelStorei(gl.UNPACK_PREMULTIPLY_ALPHA_WEBGL, false);
   gl.texImage2D(gl.TEXTURE_2D, 0, gl.RGBA, gl.RGBA, gl.UNSIGNED_BYTE, bitmap);
+  if (state.canMipmap) {
+    gl.generateMipmap(gl.TEXTURE_2D);
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR_MIPMAP_LINEAR);
+  } else {
+    gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+  }
   return tex;
 }
 
@@ -384,6 +457,17 @@ function build(manifest, images) {
   gl.uniform2f(loc.canvas, state.canvasW, state.canvasH);
 
   const anchors = manifest.anchors || {};
+
+  // The eye opening, per side, taken from whichever layer actually draws it --
+  // the lash's own box includes the upper lashes and sits too high to close on.
+  const opening = {};
+  for (const suffix of ["l", "r", ""]) {
+    for (const base of EYE_OPENING_TAGS) {
+      const found = manifest.parts.find((p) => p.tag === base + suffix);
+      if (found) { opening[suffix] = found.xyxy; break; }
+    }
+  }
+
   state.parts = manifest.parts.slice().sort((a, b) => a.z - b.z).map((part) => {
     const mesh = buildMesh(part);
     const isEye = EYE_TAGS.has(part.tag);
@@ -391,16 +475,33 @@ function build(manifest, images) {
     // ("back hair", "topwear") and must not claim an eye anchor.
     const side = !isEye ? null : part.tag.endsWith("l") ? "l" : part.tag.endsWith("r") ? "r" : null;
     const eyeAnchor = side === "l" ? anchors.eye_left : side === "r" ? anchors.eye_right : null;
+    const box = opening[side || ""] || part.xyxy;
     return {
       spec: part, mesh, visible: true,
       tex: makeTexture(gl, images.get(part.name)),
       buf: { pos: gl.createBuffer(), uv: gl.createBuffer(),
              idx: gl.createBuffer(), wire: gl.createBuffer() },
       isEye,
+      // A body part with a gradient is a collar riding over the neck, and its
+      // strength is the one weight in the manifest that is a taste call.
+      isCollar: part.group === "body" && part.weight.mode === "gradient_y",
+      isLid: LID_TAGS.has(part.tag),
       eyeSide: side,
       eyeCenterY: eyeAnchor ? eyeAnchor[1] : (part.xyxy[1] + part.xyxy[3]) / 2,
+      openTop: box[1],
+      openBottom: box[3],
     };
   });
+
+  // The chest band the breathing field is measured against. `topwear` is the
+  // torso proper; body_remainder can reach far up the canvas and would drag the
+  // band with it, so it is only a fallback.
+  const torso = state.parts.filter((p) => p.spec.group === "body");
+  const chest = torso.find((p) => p.spec.tag === "topwear") || torso[0];
+  state.breathTop = chest ? chest.spec.xyxy[1] : 0;
+  state.breathBottom = anchors.body_pivot ? anchors.body_pivot[1]
+                     : chest ? chest.spec.xyxy[3] : state.canvasH;
+  state.chestCx = chest ? (chest.spec.xyxy[0] + chest.spec.xyxy[2]) / 2 : state.canvasW / 2;
 
   for (const p of state.parts) {
     gl.bindBuffer(gl.ARRAY_BUFFER, p.buf.uv);
@@ -412,6 +513,21 @@ function build(manifest, images) {
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, p.buf.wire);
     gl.bufferData(gl.ELEMENT_ARRAY_BUFFER, p.mesh.wireIndex, gl.STATIC_DRAW);
   }
+
+  const collarPart = state.parts.find((p) => p.isCollar);
+  if (collarPart) document.getElementById("collar").value = collarPart.spec.weight.top;
+
+  const amp = document.getElementById("breathAmp");
+  amp.value = manifest.motion.breathing.amplitude_px;
+  document.getElementById("breathAmpv").textContent =
+    Number(amp.value).toFixed(1) + "px";
+
+  const lid = document.getElementById("lidLine");
+  lid.value = manifest.motion.blink.lid_ratio ?? LID_LINE_RATIO;
+  document.getElementById("lidLinev").textContent = Number(lid.value).toFixed(2);
+  const thick = document.getElementById("lidThick");
+  thick.value = manifest.motion.blink.lid_thickness ?? LID_MIN_SCALE;
+  document.getElementById("lidThickv").textContent = Number(thick.value).toFixed(2);
 
   renderPanel();
   requestAnimationFrame(frame);
@@ -481,6 +597,10 @@ function effectiveWeight(part, i, overrides) {
     if (overrides.neck === "rigid") return 1.0;
     if (overrides.neck === "detached") return 0.0;
   }
+  if (part.isCollar && overrides.collar != null) {   // loose: also skips undefined
+    const bottom = part.spec.weight.bottom;
+    return bottom + part.mesh.ramp[i] * (overrides.collar - bottom);
+  }
   return part.mesh.weight[i];
 }
 
@@ -488,7 +608,6 @@ function deform(part, now, motion) {
   const { rest, live } = part.mesh;
   const anchors = state.manifest.anchors || {};
   const pivot = anchors.neck_pivot;
-  const bodyPivotY = anchors.body_pivot ? anchors.body_pivot[1] : state.canvasH;
   const span = Math.max(state.canvasW, state.canvasH);
   const parallax = span * (TURN_BASE + TURN_SPAN * (1 - part.spec.depth));
   const tilt = pivot ? motion.tiltRad : 0;
@@ -503,7 +622,9 @@ function deform(part, now, motion) {
     // Eyes close toward their own centre line before anything moves them, so
     // the lid stays put while the head turns.
     if (part.isEye && blink > 0) {
-      y = part.eyeCenterY + (y - part.eyeCenterY) * (1 - blink);
+      const floor = part.isLid ? motion.lidThickness : 0;
+      const lid = part.openTop + motion.lidRatio * (part.openBottom - part.openTop);
+      y = lid + (y - lid) * (1 - blink * (1 - floor));
     }
 
     // Depth-differential parallax: near parts travel further than far ones.
@@ -519,11 +640,19 @@ function deform(part, now, motion) {
       y = pivot[1] + dx * sin + dy * cos;
     }
 
+    // Breathing is one continuous displacement field over y, not a per-group
+    // formula. Giving the head a translation and the torso a scale meant the
+    // two disagreed at the collar and the neck visibly stretched: everything
+    // above the chest has to rise by the *same* amount the chest top rises.
     if (motion.breath !== 0) {
-      if (part.spec.group === "body") {
-        y = bodyPivotY + (y - bodyPivotY) * (1 + motion.breath * 0.004);
-      } else {
-        y -= motion.breath * state.manifest.motion.breathing.amplitude_px;
+      const ramp = breathRamp(y);
+      if (ramp > 0) {
+        y -= motion.breath * motion.breathAmp * ramp;
+        if (part.spec.group === "body" && motion.chestX !== 0) {
+          // A ribcage widens as well as rises; without it the torso reads as
+          // bobbing rather than breathing.
+          x = state.chestCx + (x - state.chestCx) * (1 + motion.breath * motion.chestX * ramp);
+        }
       }
     }
 
@@ -536,9 +665,13 @@ function frame(now) {
   const t = (now - state.t0) / 1000;
 
   if (document.getElementById("autoIdle").checked) {
-    // Two incommensurable periods so the loop never visibly repeats.
-    setSlider("turnX", Math.sin(t * 0.37) * 0.55 + Math.sin(t * 0.13) * 0.2);
-    setSlider("turnY", Math.sin(t * 0.29 + 1.1) * 0.35);
+    // Two incommensurable periods so the loop never visibly repeats, scaled by
+    // the manifest's declared limits rather than by constants of its own: past
+    // `max_x` the parallax slides the hair off the head it was covering, and
+    // idle motion must never be what discovers that.
+    const turn = state.manifest.motion.head_turn;
+    setSlider("turnX", (Math.sin(t * 0.37) * 0.73 + Math.sin(t * 0.13) * 0.27) * turn.max_x);
+    setSlider("turnY", Math.sin(t * 0.29 + 1.1) * 0.45 * turn.max_y);
     setSlider("tilt", Math.sin(t * 0.23 + 0.6) * state.manifest.motion.head_tilt.max_deg);
   }
 
@@ -558,9 +691,14 @@ function frame(now) {
     blink: blinkAmount(now),
     breath: document.getElementById("doBreathe").checked
       ? Math.sin(t * 2 * Math.PI / state.manifest.motion.breathing.period_s) : 0,
+    breathAmp: parseFloat(document.getElementById("breathAmp").value),
+    lidRatio: parseFloat(document.getElementById("lidLine").value),
+    lidThickness: parseFloat(document.getElementById("lidThick").value),
+    chestX: CHEST_WIDEN,
     overrides: {
       ghost: document.getElementById("ghost").checked,
       neck: document.getElementById("neckMode").value,
+      collar: state.collarOverride,
     },
   };
 
@@ -620,6 +758,26 @@ for (const id of ["turnX", "turnY", "tilt"]) {
     syncSlider(id);
   });
 }
+
+document.getElementById("lidThick").addEventListener("input", () => {
+  document.getElementById("lidThickv").textContent =
+    parseFloat(document.getElementById("lidThick").value).toFixed(2);
+});
+
+document.getElementById("lidLine").addEventListener("input", () => {
+  document.getElementById("lidLinev").textContent =
+    parseFloat(document.getElementById("lidLine").value).toFixed(2);
+});
+
+document.getElementById("collar").addEventListener("input", () => {
+  state.collarOverride = parseFloat(document.getElementById("collar").value);
+  document.getElementById("collarv").textContent = state.collarOverride.toFixed(2);
+});
+
+document.getElementById("breathAmp").addEventListener("input", () => {
+  document.getElementById("breathAmpv").textContent =
+    parseFloat(document.getElementById("breathAmp").value).toFixed(1) + "px";
+});
 
 document.getElementById("blinkNow").addEventListener("click",
   () => startBlink(performance.now(), ["l", "r"]));

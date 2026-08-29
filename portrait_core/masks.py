@@ -64,6 +64,24 @@ def _border_contacts(binary: np.ndarray) -> dict[str, bool]:
     }
 
 
+def bbox_fill_ratio(binary: np.ndarray) -> float:
+    """How much of its own bounding box the foreground fills.
+
+    A real subject silhouette leaves plenty of its box empty -- around 0.64 for
+    a framed upper-body portrait. A ratio at 1.0 means the "foreground" is an
+    axis-aligned filled rectangle, which is the signature of an opaque image
+    that was letterboxed or pillarboxed: the transparency is padding, not a
+    matte, and the alpha channel says nothing about where the subject is.
+    """
+    if not binary.any():
+        return 0.0
+    rows = np.any(binary, axis=1)
+    cols = np.any(binary, axis=0)
+    height = int(np.flatnonzero(rows)[-1] - np.flatnonzero(rows)[0] + 1)
+    width = int(np.flatnonzero(cols)[-1] - np.flatnonzero(cols)[0] + 1)
+    return float(binary.sum()) / float(height * width)
+
+
 def _evidence(alpha: np.ndarray, source: str, confidence: str, threshold: float,
               warnings: tuple[str, ...] = ()) -> MaskEvidence:
     binary = alpha > threshold
@@ -126,20 +144,36 @@ def resolve_subject_mask(
     )
     transparent_ratio = float(np.mean(source_alpha < (1.0 - float(alpha_cfg["presence_threshold"]))))
     foreground_ratio = float(np.mean(source_binary))
+    fill = bbox_fill_ratio(source_binary)
+    # Measuring *how much* transparency exists is not enough: a pillarboxed
+    # opaque image has plenty (the bars) while telling us nothing about the
+    # subject. Rejecting a foreground that fills its own bounding box is what
+    # separates padding from a matte -- without it the guard is handed the
+    # whole rectangle as the subject and dutifully "recovers" the background
+    # into body_remainder, which then reads as a REWORK verdict about layer
+    # quality rather than about the input.
+    padding_like = fill >= float(alpha_cfg["informative_bbox_fill_max"])
     informative = (
         transparent_ratio >= float(alpha_cfg["informative_transparency_min"])
         and float(alpha_cfg["subject_area_min"]) <= foreground_ratio <= float(alpha_cfg["subject_area_max"])
         and bool(np.any(source_binary))
+        and not padding_like
     )
     if informative:
         return _evidence(source_alpha, "source_alpha", "HIGH", threshold)
+
+    rejection = (
+        f"Source alpha fills {fill:.3f} of its bounding box: it is padding around an "
+        f"opaque image, not a subject matte."
+        if padding_like else "Source alpha was not informative."
+    )
 
     if provided_mask is not None:
         alpha, binary = normalize_foreground_mask(provided_mask, target_hw, threshold)
         ratio = float(np.mean(binary))
         if np.any(binary) and float(alpha_cfg["subject_area_min"]) <= ratio <= float(alpha_cfg["subject_area_max"]):
             return _evidence(alpha, "provided_mask", "HIGH", threshold,
-                             ("Source alpha was not informative; used provided mask.",))
+                             (f"{rejection} Used the provided mask.",))
 
     if segmentation_adapter is not None:
         segmented = segmentation_adapter(original_rgba[..., :3])
@@ -147,13 +181,14 @@ def resolve_subject_mask(
         ratio = float(np.mean(binary))
         if np.any(binary) and float(alpha_cfg["subject_area_min"]) <= ratio <= float(alpha_cfg["subject_area_max"]):
             return _evidence(alpha, "segmentation", "MEDIUM", threshold,
-                             ("Source alpha was not informative; used segmentation.",))
+                             (f"{rejection} Used segmentation.",))
 
     if generated_layers:
         alpha = compose_union_alpha(generated_layers)
         if np.any(alpha > threshold):
             return _evidence(alpha, "fallback_union", "LOW", threshold, (
+                rejection,
                 "No independent subject mask was available; generated union cannot prove missing pixels.",
             ))
 
-    raise ValueError("Unable to resolve a non-empty subject mask")
+    raise ValueError(f"Unable to resolve a non-empty subject mask. {rejection}")

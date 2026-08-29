@@ -45,6 +45,10 @@ __all__ = [
     "split_remainder",
     "split_eyes",
     "detect_anchors",
+    "RECLAIM_PAIRS",
+    "reclaim_occluded",
+    "composite_layers",
+    "composite_fidelity",
     "build_rig",
     "write_rig_project",
 ]
@@ -85,8 +89,30 @@ EYE_SPLIT_TAGS = ("eyewhite", "irides", "eyelash", "eyebrow", "eyes")
 # exists -- see the feasibility doc's open risk on `back hair`.
 HEAD_WEIGHT = 1.00
 BODY_WEIGHT = 0.16
-NECK_TOP_WEIGHT = 0.55
-NECK_BOTTOM_WEIGHT = 0.00
+
+# The neck bridges the head and the body, so its gradient has to *end* on their
+# weights exactly. These are not free parameters: a borrowed 0.55 at the top
+# against a head at 1.00 put a 0.45 discontinuity right at the jaw, and with
+# only the top quarter of the neck visible above a stand collar, the head
+# visibly slid off a neck moving at half its speed.
+NECK_TOP_WEIGHT = HEAD_WEIGHT
+NECK_BOTTOM_WEIGHT = BODY_WEIGHT
+
+# A stand collar (a gakuran, a turtleneck) touches the jaw, so leaving it fully
+# rigid while the head tilts reads as the chin cutting into it. A garment whose
+# top edge overlaps the neck therefore takes **the neck's own weight function**
+# over that overlap, rather than a ramp of its own.
+#
+# That is not a stylistic choice. `reclaim_occluded` cuts a window in the
+# garment for the neck to show through, so the window and its contents are two
+# sides of one seam: give them different weights and the window's edge slices
+# the neck as the head turns. An independent collar constant of 0.45 against a
+# neck at 0.571 on the collar line opened a 2.05 px crack there; sharing the
+# function leaves only what the two parts' different depths contribute, 0.43 px.
+#
+# Below the neck the gradient has already reached BODY_WEIGHT, so the rest of
+# the garment is unaffected.
+COLLAR_TAGS = frozenset({"topwear", "neckwear"})
 
 # The head rotates about a point near the *bottom* of the neck, which is what
 # makes a tilt read as a neck bending rather than a head sliding sideways.
@@ -99,15 +125,44 @@ MESH_REFERENCE_SIZE = 768
 MESH_CELL_PX = 42
 MESH_CELL_FINE_PX = 30
 
+# A garment layer sometimes comes back holding the skin visible through its own
+# opening -- opaque, and in front of the neck, so it paints flat light skin over
+# the neck's shading and hides the neck almost entirely. Measured on A-001:
+# `neck` visible on 272 of its 12096 pixels behind a V-neck, 117 of 7533 behind
+# a stand collar.
+#
+# Only these pairs are contested. Every other pairing tried either made the
+# composite worse (`topwear` over `face`, `head` over `face`) or moved tens of
+# thousands of pixels for no measurable gain (`back hair` over `head`), which is
+# the more dangerous outcome of the two.
+RECLAIM_PAIRS: tuple[tuple[str, str], ...] = (("topwear", "neck"), ("neckwear", "neck"))
+# How much better the back layer has to explain a pixel before that pixel can
+# seed a region, summed over RGB, and the smallest seed worth following.
+RECLAIM_MARGIN = 12
+RECLAIM_MIN_AREA_AT_768 = 200
+# Blur applied to the handover so the garment fades into the layer behind it
+# rather than stopping at a hard edge. Sub-pixel motion across a hard, jagged
+# alpha cut is what made the seam glitter once per breath.
+RECLAIM_FEATHER_PX = 1.0
+
 MANIFEST_VERSION = "0.1"
 RIG_SUBDIR = "rig"
 
+# `max_x` is measured, not chosen. Sweeping the turn on A-001 and counting the
+# largest contiguous region where hair-dark pixels became skin-light -- the
+# parallax sliding the hair off the head it used to cover -- the reveal stays
+# scattered up to 0.8 (839 px) and merges into one visible gash by 1.0
+# (2095 px). See the feasibility doc's H1 note.
 DEFAULT_MOTION: dict[str, Any] = {
-    "head_turn": {"max_x": 1.0, "max_y": 1.0},
+    "head_turn": {"max_x": 0.8, "max_y": 0.8},
     "head_tilt": {"max_deg": 2.0, "pivot": "neck_pivot"},
     "breathing": {"period_s": 4.0, "amplitude_px": 3.0},
+    #  places the closed lid inside the eye opening: 1.0 is the
+    # lower lid, 0.5 the centre. Closing onto the centre leaves the lash as a
+    # bar floating in the socket with skin above and below, which reads as a
+    # squint; a real lid comes down onto the lower one.
     "blink": {"close_s": 0.08, "hold_s": 0.34, "open_s": 0.16,
-              "interval_s": [1.6, 5.4]},
+              "interval_s": [1.6, 5.4], "lid_ratio": 0.85, "lid_thickness": 0.18},
 }
 
 
@@ -425,6 +480,167 @@ def neck_bbox(layer_dict: dict[str, np.ndarray], *,
     return _bbox(union) if union is not None else None
 
 
+def reclaim_occluded(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarray, *,
+                     pairs: tuple[tuple[str, str], ...] = RECLAIM_PAIRS,
+                     alpha_threshold: int = 10, margin: int = RECLAIM_MARGIN,
+                     min_area: int | None = None, feather: float | None = None,
+                     ) -> tuple[dict[str, np.ndarray], dict[str, int]]:
+    """Give a contested pixel to whichever layer explains the original better.
+
+    Where a garment and the neck both claim a pixel, the decomposition has
+    already been told which is right: the original image is ground truth here,
+    and one of the two layers matches it. Resolving the tie that way is not a
+    guess -- it is measured, per pixel, rather than assumed for a region.
+
+    Returns `(layers, {"front<-back": pixels})`. The front layer's alpha is
+    cleared where the back wins; nothing else is touched, and no layer's colour
+    is altered.
+
+    The margin decides **which regions** change hands, not where each region
+    ends. Applying it per pixel cut a decisively-neck area into lace: on A-001
+    the neck explained 93% of one band better, but only 59% cleared the margin,
+    so the handover stopped in ragged mid-region and left skin-coloured garment
+    behind. So a margin-qualified `core` seeds the region, and the region's
+    extent then follows plain "the back layer is better" out to where that
+    stops being true -- which is a real edge in the picture rather than an
+    artefact of the threshold. Boundary roughness drops from 0.121 to 0.079,
+    against 0.07 for a smooth blob of the same size.
+
+    The handover is feathered, because a hard alpha cut with a jagged boundary
+    glitters as sub-pixel motion moves it: 364 hard-edged boundary pixels
+    become 54. Feathering is clamped by the back layer's own alpha so it can
+    never open a gap where there is nothing behind to show through.
+    """
+    original = np.asarray(original_rgba)[..., :3].astype(np.int32)
+    feather = RECLAIM_FEATHER_PX if feather is None else feather
+    if min_area is None:
+        scale = original.shape[0] * original.shape[1] / (768.0 * 768.0)
+        min_area = max(64, int(round(RECLAIM_MIN_AREA_AT_768 * scale)))
+
+    out = dict(layer_dict)
+    moved: dict[str, int] = {}
+    kernel = np.ones((5, 5), np.uint8)
+
+    for front_tag, back_tag in pairs:
+        front, back = out.get(front_tag), out.get(back_tag)
+        if front is None or back is None:
+            continue
+        front, back = np.asarray(front), np.asarray(back)
+        contested = (front[..., 3] > alpha_threshold) & (back[..., 3] > alpha_threshold)
+        if not contested.any():
+            continue
+
+        front_err = np.abs(original - front[..., :3].astype(np.int32)).sum(axis=2)
+        back_err = np.abs(original - back[..., :3].astype(np.int32)).sum(axis=2)
+
+        # A seed: the back layer is decisively better here, over an area big
+        # enough that it is not noise.
+        core = cv2.morphologyEx(
+            (contested & (back_err + margin < front_err)).astype(np.uint8),
+            cv2.MORPH_OPEN, kernel).astype(bool)
+        if not core.any():
+            continue
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(core.astype(np.uint8), 8)
+        core = np.isin(labels, [i for i in range(1, count)
+                                if stats[i, cv2.CC_STAT_AREA] >= min_area])
+        if not core.any():
+            continue
+
+        # The extent: wherever the back layer is simply better, out to where it
+        # stops being so. Only regions holding a seed are taken.
+        region = cv2.morphologyEx(
+            (contested & (back_err < front_err)).astype(np.uint8),
+            cv2.MORPH_CLOSE, kernel).astype(bool) & contested
+        count, labels, _, _ = cv2.connectedComponentsWithStats(region.astype(np.uint8), 8)
+        seeded = set(np.unique(labels[core]).tolist()) - {0}
+        take = np.isin(labels, list(seeded)) if seeded else np.zeros_like(region)
+        if not take.any():
+            continue
+
+        handover = take.astype(np.float32)
+        if feather > 0:
+            handover = cv2.GaussianBlur(handover, (0, 0), float(feather))
+            # Never hand over more than the back layer can cover, or the fade
+            # becomes a hole with nothing behind it.
+            handover = np.clip(handover, 0.0, 1.0) * np.clip(
+                back[..., 3].astype(np.float32) / 255.0, 0.0, 1.0)
+
+        patched = np.array(front, copy=True)
+        patched[..., 3] = np.rint(
+            front[..., 3].astype(np.float32) * (1.0 - handover)).astype(np.uint8)
+        out[front_tag] = patched
+        moved[front_tag + "<-" + back_tag] = int(take.sum())
+
+    return out, moved
+
+
+def composite_layers(layer_dict: dict[str, np.ndarray], frame_size: tuple[int, int], *,
+                     order: tuple[str, ...] = RIG_Z_ORDER,
+                     alpha_threshold: int = 10) -> np.ndarray:
+    """Alpha-blend the layers back to front into one RGBA canvas.
+
+    `layers.make_preview` also blends, but in dict insertion order and only for
+    display. This composites in the canonical z-order and returns the array, so
+    it can be compared against the original -- which is the only way to see an
+    RGB loss. Every coverage metric in the report is computed on **alpha**:
+    a layer that is present, correctly shaped, and the wrong colour scores
+    exactly as well as a right one, and the `reconstruction` diagnostic cannot
+    show the difference either because it copies the original's RGB and
+    replaces only its alpha.
+    """
+    canvas_h, canvas_w = int(frame_size[0]), int(frame_size[1])
+    rgb = np.zeros((canvas_h, canvas_w, 3), np.float32)
+    acc = np.zeros((canvas_h, canvas_w, 1), np.float32)
+
+    def rank(tag: str) -> int:
+        return order.index(tag) if tag in order else -1
+
+    for tag in sorted(layer_dict, key=rank):
+        img = layer_dict.get(tag)
+        if img is None:
+            continue
+        arr = np.asarray(img)
+        if arr.ndim != 3 or arr.shape[-1] != 4 or not np.any(arr[..., 3] > alpha_threshold):
+            continue
+        src_a = arr[..., 3:4].astype(np.float32) / 255.0
+        rgb = arr[..., :3].astype(np.float32) * src_a + rgb * acc * (1.0 - src_a)
+        acc = src_a + acc * (1.0 - src_a)
+        rgb = rgb / np.maximum(acc, 1e-6)
+
+    out = np.zeros((canvas_h, canvas_w, 4), np.uint8)
+    out[..., :3] = np.rint(np.clip(rgb, 0, 255)).astype(np.uint8)
+    out[..., 3] = np.rint(np.clip(acc[..., 0] * 255.0, 0, 255)).astype(np.uint8)
+    return out
+
+
+def composite_fidelity(original_rgba: np.ndarray, composite: np.ndarray,
+                       subject_mask: np.ndarray, *, bad_threshold: int = 30) -> dict[str, float]:
+    """How closely a composite reproduces the original inside the subject.
+
+    `mae` is the mean per-pixel sum of absolute RGB differences; `bad_ratio` is
+    the share of subject pixels off by more than `bad_threshold`, which is
+    where a wrong colour stops being a soft gradient difference and starts
+    being a missing feature -- a dropped `eyewhite` leaves skin where the
+    sclera was and lands around 60.
+    """
+    original = np.asarray(original_rgba)[..., :3].astype(np.int32)
+    made = np.asarray(composite)[..., :3].astype(np.int32)
+    mask = np.asarray(subject_mask)
+    if mask.dtype != bool:
+        mask = mask > (0.5 if mask.max() <= 1.0 else 127)
+    total = int(mask.sum())
+    if total == 0:
+        return {"mae": 0.0, "bad_ratio": 0.0, "bad_px": 0, "subject_px": 0}
+    diff = np.abs(original - made).sum(axis=2)[mask]
+    bad = int((diff > bad_threshold).sum())
+    return {
+        "mae": round(float(diff.mean()), 3),
+        "bad_ratio": round(bad / total, 5),
+        "bad_px": bad,
+        "subject_px": total,
+    }
+
+
 def _weight_for(tag: str, group: str, box: tuple[int, int, int, int],
                 neck_box: tuple[int, int, int, int] | None,
                 gradient_tags: Collection[str]) -> dict[str, Any]:
@@ -434,14 +650,20 @@ def _weight_for(tag: str, group: str, box: tuple[int, int, int, int],
     head and its bottom has to stay with the body, which no arrangement of two
     rigid bones produces without a visible seam.
     """
+    if tag in gradient_tags:
+        # Explicit caller override, so it wins: the documented `back hair` risk,
+        # where hair reaching past the shoulder line tears at full head weight.
+        return {"mode": "gradient_y", "top": HEAD_WEIGHT, "bottom": BODY_WEIGHT,
+                "y_top": float(box[1]), "y_bottom": float(box[3])}
     if group == GROUP_NECK and neck_box is not None:
         return {"mode": "gradient_y", "top": NECK_TOP_WEIGHT, "bottom": NECK_BOTTOM_WEIGHT,
                 "y_top": float(neck_box[1]), "y_bottom": float(neck_box[3])}
-    if tag in gradient_tags:
-        # Escape hatch for the documented `back hair` risk: hair that reaches
-        # past the shoulder line tears if it follows the head at full weight.
-        return {"mode": "gradient_y", "top": HEAD_WEIGHT, "bottom": BODY_WEIGHT,
-                "y_top": float(box[1]), "y_bottom": float(box[3])}
+    if tag in COLLAR_TAGS and neck_box is not None and box[1] < neck_box[3]:
+        # The garment overlaps the neck, so its top edge is a collar: it shares
+        # the neck's gradient exactly, which is what keeps the reclaimed window
+        # and the neck showing through it moving together.
+        return {"mode": "gradient_y", "top": NECK_TOP_WEIGHT, "bottom": NECK_BOTTOM_WEIGHT,
+                "y_top": float(neck_box[1]), "y_bottom": float(neck_box[3])}
     if group == GROUP_HEAD:
         return {"mode": "constant", "value": HEAD_WEIGHT}
     if group == GROUP_NECK:
@@ -456,6 +678,7 @@ def _mesh_cell(frame_size: tuple[int, int], fine: bool) -> int:
 
 
 def build_rig(layer_dict: dict[str, np.ndarray], *,
+              original_rgba: np.ndarray | None = None,
               body_remainder: np.ndarray | None = None,
               depth_dict: dict[str, np.ndarray] | None = None,
               frame_size: tuple[int, int] | None = None,
@@ -494,7 +717,15 @@ def build_rig(layer_dict: dict[str, np.ndarray], *,
         frame_size = (int(sample.shape[0]), int(sample.shape[1]))
     canvas_h, canvas_w = int(frame_size[0]), int(frame_size[1])
 
-    # Stage B: remainder first, so the eye split and the anchors below see the
+    # Contested pixels first: a garment holding the skin from its own opening
+    # hides the neck almost completely, and the remainder split below reads the
+    # group unions this changes.
+    reclaimed: dict[str, int] = {}
+    if original_rgba is not None:
+        working, reclaimed = reclaim_occluded(working, original_rgba,
+                                              alpha_threshold=alpha_threshold)
+
+    # Stage B: remainder next, so the eye split and the anchors below see the
     # same layer set the manifest will describe.
     depth_parent = {tag: tag for tag in working}
     if body_remainder is not None:
@@ -546,6 +777,7 @@ def build_rig(layer_dict: dict[str, np.ndarray], *,
         crop_img, xyxy = cropped
         name = tag.replace(" ", "_")
         group = group_for_tag(tag)
+        weight = _weight_for(tag, group, tuple(xyxy), neck_box, gradient_tags)
         images[name] = crop_img
         parts.append({
             "name": name,
@@ -555,9 +787,11 @@ def build_rig(layer_dict: dict[str, np.ndarray], *,
             "group": group,
             "depth": depths[tag],
             "z": z,
-            "weight": _weight_for(tag, group, tuple(xyxy), neck_box, gradient_tags),
+            "weight": weight,
+            # Anything deforming along a gradient gets the finer cell: that is
+            # where a coarse grid shows up as faceting.
             "mesh": {"cell": _mesh_cell((canvas_h, canvas_w),
-                                        fine=group == GROUP_NECK or tag in gradient_tags)},
+                                        fine=weight["mode"] == "gradient_y")},
         })
 
     manifest = {
@@ -567,6 +801,7 @@ def build_rig(layer_dict: dict[str, np.ndarray], *,
             "run_id": run_id,
             "tag_version": tag_version,
             "depth": "marigold" if depth_dict else "table",
+            "reclaimed": reclaimed,
         },
         "anchors": anchors,
         "parts": parts,

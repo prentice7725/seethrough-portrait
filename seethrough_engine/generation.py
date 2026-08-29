@@ -128,9 +128,27 @@ def run_diffusion_stage(pipeline, device, rng, tag_version, num_inference_steps,
                          *, prompt_embeds=None, pooled_prompt_embeds=None,
                          body_embeds=None, body_pooled=None, head_embeds=None, head_pooled=None,
                          enable_head_detail=True, input_img=None, scale=1.0, pad_pos=None,
-                         resolution=1280, log: Callable[[str], None] = _NOOP_LOG) -> dict[str, np.ndarray]:
+                         resolution=1280, head_resolution=None,
+                         log: Callable[[str], None] = _NOOP_LOG) -> dict[str, np.ndarray]:
     """Run a single diffusion pass (body stage, plus the head stage for v3
-    when enabled) and return {tag: RGBA ndarray} in canvas (`fullpage`) space."""
+    when enabled) and return {tag: RGBA ndarray} in canvas (`fullpage`) space.
+
+    `head_resolution` sizes the v3 head pass independently of the body pass,
+    defaulting to `resolution` so the two move together unless asked otherwise.
+    The head stage crops the head and re-diffuses it on its own square canvas,
+    so the pixels it gets are `head_resolution`, not whatever the head happens
+    to occupy in the body canvas -- and that is what decides whether the fine
+    facial layers resolve at all. Measured on A-001: at 512 the model returns
+    no `eyewhite` layer and the layer stack reproduces the original to
+    mae 15.1; at 768 `eyewhite` appears and mae drops to 11.9.
+
+    Splitting them is safe because `center_square_pad_resize` computes
+    `pad_size`/`pad_pos` from the source *before* resizing, so they are in
+    crop pixels and carry no dependence on the target size; the head output is
+    mapped back through `scale`, which belongs to the body pass. Only
+    `canvas` below must stay at the body `resolution`.
+    """
+    head_resolution = int(head_resolution or resolution)
     run_layer_dict: dict[str, np.ndarray] = {}
 
     if tag_version == "v2":
@@ -163,13 +181,13 @@ def run_diffusion_stage(pipeline, device, rng, tag_version, num_inference_steps,
                 hy1 = int(hy1 / scale + pad_pos[1] / scale)
                 ih, iw = input_head.shape[:2]
                 input_head, head_pad_size, head_pad_pos = vendor.center_square_pad_resize(
-                    input_head, resolution, return_pad_info=True)
+                    input_head, head_resolution, return_pad_info=True)
 
                 out = pipeline(strength=1.0, num_inference_steps=num_inference_steps, batch_size=1,
                                generator=rng, guidance_scale=1.0,
                                prompt_embeds=head_embeds, pooled_prompt_embeds=head_pooled,
                                fullpage=input_head, group_index=1)
-                log("v3 head diffusion complete")
+                log(f"v3 head diffusion complete ({head_resolution}px head canvas)")
 
                 canvas = np.zeros((resolution, resolution, 4), dtype=np.uint8)
                 coords = np.array([head_pad_pos[1], head_pad_pos[1] + ih, head_pad_pos[0], head_pad_pos[0] + iw])
@@ -207,6 +225,7 @@ def run_portrait_pipeline(
     *,
     seed: int = 42,
     resolution: int = 1280,
+    head_resolution: int | None = None,
     num_inference_steps: int = 30,
     enable_head_detail: bool = True,
     auto_fill: bool = False,
@@ -292,7 +311,8 @@ def run_portrait_pipeline(
             body_embeds=body_embeds, body_pooled=body_pooled,
             head_embeds=head_embeds, head_pooled=head_pooled,
             enable_head_detail=enable_head_detail, input_img=input_img,
-            scale=scale, pad_pos=pad_pos, resolution=resolution, log=log,
+            scale=scale, pad_pos=pad_pos, resolution=resolution,
+            head_resolution=head_resolution, log=log,
         )
 
     layer_dict = _diffuse(seed)
@@ -383,6 +403,7 @@ def run_portrait_pipeline(
         run={
             "seed": int(seed),
             "resolution": int(resolution),
+        "head_resolution": int(head_resolution or resolution),
             "steps": int(num_inference_steps),
             "auto_fill": bool(auto_fill),
             "run_count": int(len(all_runs_layers) if all_runs_layers else 1),
