@@ -68,16 +68,43 @@ hierarchy, and stays inside Phase 2's "feasibility only" limit.
 Recorded so they are not rediscovered, and deliberately not scheduled: each one
 is outside M4, and M4 is a decision rather than a product.
 
-**Expression sheets as decomposition input.** PachiPakuGen (kazuya-bros), which
-runs the upstream See-Through implementation as a fixed-commit runtime, asks the
-user for seven extra images -- `eyes-closed`, `mouth-closed`, and the five vowel
-mouths -- drawn from the same character, and decomposes all eight together. This
-is the practical answer to the two layers this fork cannot synthesize: A-001's
+**M4.1, expression pack -- started.** PachiPakuGen (kazuya-bros), which runs the
+upstream See-Through implementation as a fixed-commit runtime, asks the user for
+seven extra images -- `eyes-closed`, `mouth-closed`, and the five vowel mouths --
+drawn from the same character, and decomposes all eight together. This is the
+practical answer to the two drawings this fork cannot synthesize: A-001's
 `mouth` is a closed mouth and there is no closed eye at all, which is why the
-rig currently closes an eye by keeping a fraction of the lash. The cost is a new
-problem this fork does not have today -- registering several generations of one
-character against each other -- which that tool solves with a manual alignment
-step. Belongs to Phase 1 scope, if anywhere.
+rig currently closes an eye by keeping a fraction of the lash.
+
+What makes it work is that the generated image is a **donor, not a portrait**.
+Only the region it actually changed is taken from it; everything else stays the
+original's own pixels. That is the difference between this and the fork's
+earlier modular attempt, which used the generated image as the portrait and lost
+the character's identity to the generator's drift.
+
+`seethrough_engine/expression.py` implements the recovery, and takes the two
+steps in the opposite order to PachiPakuGen. They composite the donor into a
+full frame and decompose it again, because at that point they have no layers.
+We already have layers, and Portrait Mode's `face` layer is featureless skin
+behind every feature -- luma standard deviation 0.5-0.8 under A-001's eye and
+mouth boxes, against 25.5 over the face as a whole -- so a recovered region
+drops in as one more part over clean skin. No second decomposition, no GPU, and
+no chance of the rest of the portrait coming back different.
+
+Two departures from their algorithm, both forced by that ordering:
+
+* Their regions are fixed fractions of the canvas, which suits a full-body
+  standing picture and not a bust. Ours come from the run's own anchors and
+  layer boxes, which is information they do not have at that stage.
+* Their single threshold is a percentile of the region, so it tracks how much of
+  the region the edit fills rather than how different the edit is. Recovery uses
+  the same core/extent hysteresis as `rig.reclaim_occluded`, over a drift level
+  measured on the part of the picture nothing is taken from.
+
+Scope is three images -- `base`, `eyes-closed`, `mouth-open` -- and the vowels
+are a later promotion. Remaining: wiring the pack into `rig_manifest.json` and
+giving the runtime an ownership rule, so a real closed eye replaces the lash
+squash when one exists and the squash stays as the fallback when it does not.
 
 **Seed selection before the batch.** The same tool decomposes a single image
 with the depth pass and PSD assembly skipped, purely so the user can look at
