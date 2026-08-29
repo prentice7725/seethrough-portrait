@@ -789,6 +789,45 @@ which is the question every future change should have to answer. A seam that
 appears where the baseline had none counts too, since the usual way to improve
 one boundary is to move the fault to the next.
 
+**2026-08-30 -- the last seam, and the condition that makes it safe.** With the
+guard ranking things the way the eye does, `neck | topwear` was first: 36 px of
+line at 1.91 luma of mean excess. It survived owning the pixel
+(`reclaim_occluded`), fitting the coverage (`fit_edge_alpha`) and fitting the
+colour (`fit_layer_tone`) because none of the three compares two *different
+generated layers* against each other. Only the original knows the answer there.
+
+`rig.fit_seam_residual` reads it in a narrow band on each side of the boundary
+and fades the correction to nothing three pixels in. A fade rather than a cut,
+for the reason this whole line of work exists: two levels spread over three
+pixels is a gradient and nobody sees it, while two levels at a boundary is a
+line.
+
+**The condition is checked, not assumed.** A band-local correction is fitted
+where two layers touch *now*; if they part under a turn it travels with one of
+them and lands on the wrong pixels. `seam_slide_px` computes how far the pair
+moves apart at full turn from the depth table and the weight they carry at the
+seam -- 0.12 px for `topwear` and `neck`, because a collar already shares the
+neck's weight gradient -- and a pair over half a pixel is skipped and says so in
+the manifest. This is why the same code cannot simply be pointed at every
+boundary: two layers that parallax against each other, which is most of the head
+group, would fail it.
+
+| | mean excess | longest run | band mae |
+| --- | --- | --- | --- |
+| before | 1.91 | 36 | 2.23 |
+| after | **0.62** | **10** | **1.55** |
+
+Two details were worth a level each. The correction is divided by the layer's
+own coverage, since a shift of R applied to a layer showing at alpha *a* moves
+the composite by *a*R* and a seam is exactly where the alphas are not 1. And it
+is rounded rather than truncated: these corrections are one or two levels, and
+truncation quietly ate most of one.
+
+What is left is a peak excess of 1.7 across three rows at the handover itself,
+where both layers contribute partially and a per-side correction cannot
+reproduce the blend. The guard now ranks `back hair | front hair` first at 25 px
+-- the borderline hair boundary that was looked at and found invisible at 4x.
+
 ## Verdict
 
 **Conditionally viable.** Portrait Mode's layers drive a pseudo-2.5D talking

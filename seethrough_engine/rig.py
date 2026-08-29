@@ -50,6 +50,8 @@ __all__ = [
     "reclaim_occluded",
     "fit_layer_tone",
     "fit_edge_alpha",
+    "fit_seam_residual",
+    "seam_slide_px",
     "composite_layers",
     "composite_fidelity",
     "build_rig",
@@ -799,6 +801,129 @@ def fit_edge_alpha(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarray,
     return out, moved
 
 
+# The last of the four. `reclaim_occluded` settles who owns a contested pixel,
+# `fit_edge_alpha` how much of a layer shows, `fit_layer_tone` each material's
+# colour -- and a residual survives all three exactly where two *different*
+# generated layers meet, because none of them compares the two against each
+# other. On A-001 that is 1 to 2 luma along the neck's boundary with the
+# garment, which the seam guard ranks first and a whole-image average cannot
+# see at all.
+#
+# It is fixed by the only thing that knows the answer: the original, read in a
+# narrow band on each side of the boundary and faded to nothing a few pixels in,
+# so the correction cannot introduce an edge of its own.
+SEAM_PAIRS: tuple[tuple[str, str], ...] = (("topwear", "neck"), ("neckwear", "neck"))
+SEAM_BAND_PX = 3
+SEAM_MAX_SHIFT = 12
+
+# A band-local correction is only valid while the two layers move together: it
+# is fitted where they touch *now*, and if they slide apart the correction goes
+# with one of them and lands on the wrong pixels. So the condition is checked
+# rather than assumed, from the depth table and the weight the two carry at the
+# seam. `topwear` and `neck` pass because a collar already shares the neck's
+# weight gradient; two layers that parallax against each other would not, which
+# is why this cannot simply be pointed at every boundary.
+SEAM_MAX_SLIDE_PX = 0.5
+
+
+def seam_slide_px(tag_a: str, tag_b: str, depths: dict[str, float],
+                  canvas: tuple[int, int], *, weight: float = BODY_WEIGHT,
+                  turn: float = 1.0) -> float:
+    """How far two layers move apart at full turn, in pixels.
+
+    The preview's parallax is `span * (TURN_BASE + TURN_SPAN * (1 - depth)) *
+    weight`, so two layers differ only through their depths. Constants mirrored
+    from `webui/rig_preview/index.html`; they are the rig's own scale, and a
+    check that quietly used different ones would be worthless.
+    """
+    turn_base, turn_span = 0.015, 0.045
+    span = float(max(canvas))
+    a = depths.get(tag_a)
+    b = depths.get(tag_b)
+    if a is None or b is None:
+        return float("inf")
+    return abs(a - b) * turn_span * span * weight * turn
+
+
+def fit_seam_residual(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarray, *,
+                      pairs: tuple[tuple[str, str], ...] = SEAM_PAIRS,
+                      order: tuple[str, ...] = RIG_Z_ORDER,
+                      band: int = SEAM_BAND_PX, max_shift: int = SEAM_MAX_SHIFT,
+                      max_slide: float = SEAM_MAX_SLIDE_PX,
+                      alpha_threshold: int = 10,
+                      ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """Take the residual out of both sides of a shared boundary.
+
+    Each layer is corrected on its own side, by what the original says is
+    missing there, faded to zero `band` pixels in. A fade rather than a cut:
+    two levels spread over three pixels is a gradient, which nobody sees, while
+    the same two levels at a boundary is a line, which is the thing being
+    removed.
+    """
+    original = np.asarray(original_rgba)[..., :3].astype(np.float32)
+    canvas_h, canvas_w = original.shape[:2]
+    depths = depth_table()
+    out = dict(layer_dict)
+    report: dict[str, Any] = {}
+
+    def rank(tag: str) -> int:
+        return order.index(tag) if tag in order else -1
+
+    for front_tag, back_tag in pairs:
+        if front_tag not in out or back_tag not in out:
+            continue
+        slide = seam_slide_px(front_tag, back_tag, depths, (canvas_h, canvas_w))
+        if slide > max_slide:
+            report[f"{front_tag}|{back_tag}"] = {"skipped": "slides", "slide_px": round(slide, 2)}
+            continue
+
+        composite = composite_layers(out, (canvas_h, canvas_w), order=order,
+                                     alpha_threshold=alpha_threshold)[..., :3].astype(np.float32)
+        owner = np.full((canvas_h, canvas_w), -1, np.int16)
+        for index, tag in enumerate(sorted(out, key=rank)):
+            owner[np.asarray(out[tag])[..., 3] > 128] = index
+        names = sorted(out, key=rank)
+        front, back = names.index(front_tag), names.index(back_tag)
+
+        # Where the two actually touch, in either direction.
+        contact = np.zeros((canvas_h, canvas_w), np.uint8)
+        for shift in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+            rolled = np.roll(owner, shift, axis=(0, 1))
+            contact |= (((owner == front) & (rolled == back))
+                        | ((owner == back) & (rolled == front))).astype(np.uint8)
+        if not contact.any():
+            report[f"{front_tag}|{back_tag}"] = {"skipped": "no contact"}
+            continue
+
+        residual = np.clip(original - composite, -max_shift, max_shift)
+        distance = cv2.distanceTransform(1 - contact, cv2.DIST_L2, 3)
+        falloff = np.clip(1.0 - distance / float(band), 0.0, 1.0)
+        falloff = falloff * falloff * (3.0 - 2.0 * falloff)     # smooth, so no inner edge
+
+        moved = {}
+        for tag, index in ((front_tag, front), (back_tag, back)):
+            side = (owner == index) & (falloff > 0)
+            if not side.any():
+                continue
+            layer = np.array(out[tag], copy=True)
+            # Divided by the layer's own coverage: a correction of R applied to
+            # a layer showing at alpha a moves the composite by a*R, and at a
+            # seam the alphas are exactly where they are not 1. Clamped, so a
+            # nearly transparent pixel cannot demand an enormous shift.
+            coverage = np.clip(layer[..., 3].astype(np.float32) / 255.0, 0.5, 1.0)
+            correction = residual / coverage[..., None] * (falloff * side)[..., None]
+            # Rounded, not truncated: the corrections here are one or two
+            # levels, and truncation would quietly eat most of one of them.
+            layer[..., :3] = np.rint(np.clip(layer[..., :3].astype(np.float32)
+                                             + np.clip(correction, -max_shift, max_shift),
+                                             0, 255)).astype(np.uint8)
+            out[tag] = layer
+            moved[tag] = int(side.sum())
+        report[f"{front_tag}|{back_tag}"] = {"slide_px": round(slide, 2), "px": moved}
+
+    return out, report
+
+
 def composite_layers(layer_dict: dict[str, np.ndarray], frame_size: tuple[int, int], *,
                      order: tuple[str, ...] = RIG_Z_ORDER,
                      alpha_threshold: int = 10) -> np.ndarray:
@@ -948,12 +1073,15 @@ def build_rig(layer_dict: dict[str, np.ndarray], *,
     reclaimed: dict[str, int] = {}
     tone_fit: dict[str, list[int]] = {}
     edge_fit: dict[str, int] = {}
+    seam_fit: dict[str, Any] = {}
     if original_rgba is not None:
         working, reclaimed = reclaim_occluded(working, original_rgba,
                                               alpha_threshold=alpha_threshold)
         working, tone_fit = fit_layer_tone(working, original_rgba)
         working, edge_fit = fit_edge_alpha(working, original_rgba,
                                            alpha_threshold=alpha_threshold)
+        working, seam_fit = fit_seam_residual(working, original_rgba,
+                                              alpha_threshold=alpha_threshold)
 
     # Stage B: remainder next, so the eye split and the anchors below see the
     # same layer set the manifest will describe.
@@ -1034,6 +1162,7 @@ def build_rig(layer_dict: dict[str, np.ndarray], *,
             "reclaimed": reclaimed,
             "tone_fit": tone_fit,
             "edge_fit": edge_fit,
+            "seam_fit": seam_fit,
         },
         "anchors": anchors,
         "parts": parts,

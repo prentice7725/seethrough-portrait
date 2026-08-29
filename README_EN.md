@@ -373,7 +373,8 @@ time. All three were already in the composite metric; nothing had been looking:
 | --- | --- | --- |
 | `reclaim_occluded` | pixels a garment and the neck both claim | the garment holding the skin from its own opening, hiding the neck |
 | `fit_edge_alpha` | solves a layer's edge alpha against the original | a black stroke under the jaw; a double chin |
-| `fit_layer_tone` | each layer's colour bias, one constant per material | a step where two layers meet, drawn as a line across the neck |
+| `fit_layer_tone` | each layer's colour bias, one constant per material | a step where two layers meet |
+| `fit_seam_residual` | the residual in the band where two generated layers touch | the line across the neck (mean excess 1.91 to 0.62) |
 
 Composite mae **18.30 → 9.21**, bad ratio **8.57% → 5.42%** -- on layers the
 model had already produced, with no GPU pass.

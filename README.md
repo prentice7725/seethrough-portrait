@@ -385,7 +385,8 @@ python -m seethrough_engine.seams --record <run ...>        # 기준선 갱신
 | --- | --- | --- |
 | `reclaim_occluded` | 옷과 목이 다투는 픽셀 | 옷이 제 여밈 사이 피부를 들고 있어 목이 거의 안 보임 |
 | `fit_edge_alpha` | 레이어 경계 알파를 원본에 맞춰 풂 | 턱 밑에 없던 검은 획, 이중턱 |
-| `fit_layer_tone` | 레이어별·재질별 색 치우침 | 두 레이어가 만나는 곳의 계단 = 목을 가로지르는 선 |
+| `fit_layer_tone` | 레이어별·재질별 색 치우침 | 두 레이어가 만나는 곳의 계단 |
+| `fit_seam_residual` | 두 생성 레이어가 맞닿은 띠의 잔차 | 목을 가로지르는 선 (평균 초과 1.91 → 0.62) |
 
 composite mae **18.30 → 9.21**, bad ratio **8.57% → 5.42%**. 전부 모델이 이미
 내놓은 레이어에서, GPU 패스 없이.
