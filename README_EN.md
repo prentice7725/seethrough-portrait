@@ -339,6 +339,31 @@ topmost layer is the face's own skin or features, so a differently-drawn lock of
 hair cannot come along. Turning off `Use expression art` in the preview falls
 back to the v0.1 blink (the lash squashed onto the lid line) for comparison.
 
+### Seam guard
+
+Whole-image metrics are **blind to a thin, long artifact.** Composite mae was
+down to 8.84 while a line across the neck was still the first thing anyone saw:
+an average over a 216,000-pixel silhouette cannot weigh 276 pixels of boundary
+one pixel wide.
+
+`seethrough_engine/seams.py` measures **boundaries** instead of areas. Wherever
+the topmost layer changes from one pixel to the next, it compares the step the
+composite makes against the step the *original* makes in the same place. A real
+edge -- a collar, a jaw, a lash -- steps in both and scores nothing.
+
+```bash
+python -m seethrough_engine.seams <run dir>            # the report
+python -m seethrough_engine.seams --check <run dir>    # regression against the baseline
+python -m seethrough_engine.seams --record <run ...>   # re-record the baseline
+```
+
+`--check` compares against [`docs/seam_baseline.json`](docs/seam_baseline.json)
+rather than an absolute bar. A bar set where we would like to be fails on the
+day it is written and teaches nothing after that; a baseline fails when a change
+makes a seam worse, which is the question every future change should have to
+answer. A seam that appears where the baseline had none counts too, since the
+usual way to improve one boundary is to move the fault to the next.
+
 ### Composite fidelity
 
 Rendering the rig is what made **decomposition faults visible** for the first

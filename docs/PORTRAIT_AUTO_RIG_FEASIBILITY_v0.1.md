@@ -711,6 +711,53 @@ Deferred deliberately, not forgotten:
 5. The milestone ends with a written verdict -- viable, conditionally viable,
    or not viable -- per the fork plan's Phase 2 wording.
 
+**2026-08-30 -- the metric that finds a line.** The whole-subject composite
+metrics reached mae 8.84 while a line across the neck was still the first thing
+anyone saw. That is not a failure of the fix, it is a failure of the measure:
+`composite_fidelity` averages over a silhouette of 216,000 pixels and the seam
+is 276 of them, one pixel wide. An average cannot weigh that and should not be
+asked to.
+
+`seethrough_engine/seams.py` measures boundaries instead of areas. Wherever the
+topmost layer changes from one pixel to the next, it compares the step the
+composite makes against the step the *original* makes in the same place. A real
+edge -- a collar, a jaw, a lash -- steps in both and scores nothing.
+
+Two things had to be right before the numbers matched what the eye reports:
+
+* **Only where the picture is flat.** The first ranking put `face | eyebrowr` on
+  top at 70 luma of excess, which is invisible: it lies along a drawn brow where
+  the original steps 120, and sharpening an edge that is already an edge changes
+  nothing. What the eye finds is the opposite -- a line across skin that has
+  none, the neck seam at 2 luma. So a boundary pixel counts only where the
+  original is locally flat.
+* **The run survives a gap.** A seam sitting at 1 to 2 luma dips below any
+  threshold every few pixels, and counting raw contiguous runs reported 11 px
+  for a line that is plainly 150 long. The mask is closed before the runs are
+  measured, because the eye integrates along a line and this should too.
+
+The A-001 baseline, worst first by the length of the line:
+
+| boundary | flat px | mean excess | longest run |
+| --- | --- | --- | --- |
+| `back hair` \| `head_remainder` | 445 | 7.01 | 125 |
+| `face` \| `eyebrowr` | 23 | 73.59 | 53 |
+| `face` \| `mouth` | 44 | 45.42 | 51 |
+| `back hair` \| `topwear` | 55 | 36.52 | 46 |
+| `neck` \| `topwear` | 110 | 2.83 | 36 |
+
+The seam this was built for is fifth. The four above it were never looked at,
+and two of them are the stroke layers `fit_edge_alpha` deliberately exempts --
+which is either the right call or a fault hiding behind it, and now there is a
+number either way.
+
+`--check` compares against `docs/seam_baseline.json` rather than an absolute
+bar. A bar set where we would like to be fails on the day it is written and
+teaches nothing after that; a baseline fails when a change makes a seam worse,
+which is the question every future change should have to answer. A seam that
+appears where the baseline had none counts too, since the usual way to improve
+one boundary is to move the fault to the next.
+
 ## Verdict
 
 **Conditionally viable.** Portrait Mode's layers drive a pseudo-2.5D talking
