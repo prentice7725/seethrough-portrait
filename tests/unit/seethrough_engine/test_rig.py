@@ -8,6 +8,8 @@ import numpy as np
 from seethrough_engine.rig import (
     fit_edge_alpha,
     fit_layer_tone,
+    fit_seam_residual,
+    seam_slide_px,
     BODY_REMAINDER,
     BODY_WEIGHT,
     EYE_SPLIT_TAGS,
@@ -139,6 +141,66 @@ class ToneFitTests(unittest.TestCase):
     def test_only_colour_moves_and_alpha_does_not(self):
         original, layers = self.scene()
         out, _ = fit_layer_tone(layers, original)
+        for tag in layers:
+            self.assertTrue(np.array_equal(out[tag][..., 3], layers[tag][..., 3]))
+
+
+class SeamResidualTests(unittest.TestCase):
+    """What survives owning the pixel, fitting the coverage and fitting the
+    colour: two different generated layers meeting, each right on its own and
+    disagreeing where they touch."""
+
+    def scene(self, neck_bias=-2, garment_bias=2):
+        original = np.zeros((CANVAS, CANVAS, 4), dtype=np.uint8)
+        original[20:110, 20:110, :3] = 200
+        original[20:110, 20:110, 3] = 255
+        neck = np.zeros_like(original)
+        neck[20:64, 20:110, :3] = 200 + neck_bias
+        neck[20:64, 20:110, 3] = 255
+        garment = np.zeros_like(original)
+        garment[64:110, 20:110, :3] = 200 + garment_bias
+        garment[64:110, 20:110, 3] = 255
+        return original, {"neck": neck, "topwear": garment}
+
+    def test_the_residual_at_the_boundary_is_taken_out(self):
+        original, layers = self.scene()
+        out, report = fit_seam_residual(layers, original)
+        self.assertIn("px", report["topwear|neck"])
+        self.assertAlmostEqual(int(out["neck"][63, 60, 0]), 200, delta=1)
+        self.assertAlmostEqual(int(out["topwear"][64, 60, 0]), 200, delta=1)
+
+    def test_it_fades_out_rather_than_ending(self):
+        """Two levels spread over three pixels is a gradient, which nobody sees.
+        The same two levels at a boundary is a line, which is the thing being
+        removed -- so the correction must not create an edge of its own."""
+        # A larger bias than the real one, so the fade is resolvable in whole
+        # levels rather than rounding to the same number three times.
+        original, layers = self.scene(neck_bias=-8)
+        out, _ = fit_seam_residual(layers, original)
+        near = int(out["neck"][63, 60, 0])
+        mid = int(out["neck"][62, 60, 0])
+        far = int(out["neck"][40, 60, 0])
+        self.assertGreater(near, mid)
+        self.assertGreater(mid, far)
+        self.assertEqual(far, int(layers["neck"][40, 60, 0]))
+
+    def test_a_pair_that_slides_apart_is_refused(self):
+        """A band-local correction is fitted where two layers touch now. If they
+        part under a turn it goes with one of them and lands on the wrong
+        pixels, so the condition is checked rather than assumed."""
+        original, layers = self.scene()
+        _, report = fit_seam_residual(layers, original, max_slide=0.0)
+        self.assertEqual(report["topwear|neck"]["skipped"], "slides")
+
+    def test_the_slide_is_computed_from_the_depths(self):
+        depths = {"topwear": 0.10, "neck": 0.90}
+        far = seam_slide_px("topwear", "neck", depths, (768, 768))
+        near = seam_slide_px("topwear", "neck", {"topwear": 0.50, "neck": 0.52}, (768, 768))
+        self.assertGreater(far, near * 10)
+
+    def test_alpha_is_not_touched(self):
+        original, layers = self.scene()
+        out, _ = fit_seam_residual(layers, original)
         for tag in layers:
             self.assertTrue(np.array_equal(out[tag][..., 3], layers[tag][..., 3]))
 

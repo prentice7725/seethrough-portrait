@@ -711,6 +711,123 @@ Deferred deliberately, not forgotten:
 5. The milestone ends with a written verdict -- viable, conditionally viable,
    or not viable -- per the fork plan's Phase 2 wording.
 
+**2026-08-30 -- the metric that finds a line.** The whole-subject composite
+metrics reached mae 8.84 while a line across the neck was still the first thing
+anyone saw. That is not a failure of the fix, it is a failure of the measure:
+`composite_fidelity` averages over a silhouette of 216,000 pixels and the seam
+is 276 of them, one pixel wide. An average cannot weigh that and should not be
+asked to.
+
+`seethrough_engine/seams.py` measures boundaries instead of areas. Wherever the
+topmost layer changes from one pixel to the next, it compares the step the
+composite makes against the step the *original* makes in the same place. A real
+edge -- a collar, a jaw, a lash -- steps in both and scores nothing.
+
+Four things had to be right before the numbers matched what the eye reports:
+
+* **Only where the picture is flat.** The first ranking put `face | eyebrowr` on
+  top at 70 luma of excess, which is invisible: it lies along a drawn brow where
+  the original steps 120, and sharpening an edge that is already an edge changes
+  nothing. What the eye finds is the opposite -- a line across skin that has
+  none, the neck seam at 2 luma. So a boundary pixel counts only where the
+  original is locally flat.
+* **The run survives a gap.** A seam sitting at 1 to 2 luma dips below any
+  threshold every few pixels, and counting raw contiguous runs reported 11 px
+  for a line that is plainly 150 long. The mask is closed before the runs are
+  measured, because the eye integrates along a line and this should too.
+
+* **The neighbourhood has to be quiet, not just the step.** With the first two
+  rules the ranking put `back hair | head_remainder` on top with a 125 px run --
+  and at 3x magnification the two pictures are the same. Each flagged pixel does
+  sit between two locally flat values, and it also sits inside a hair strand,
+  where a 3-luma error beside a 100-luma strand edge is masked. Measured, that
+  region's local gradient energy is 187 against the neck seam's 3.4, with the
+  subject's own median at 11. So a pixel counts only where the picture around it
+  is quiet as well as flat.
+
+* **A line has a direction.** Along a real seam the composite is consistently
+  darker than the picture or consistently lighter; along a boundary that merely
+  has noisy pixels the sign flips from one to the next -- +10.0, +10.5, -0.8,
+  +1.7, -7.2 across five pixels of A-001's hair boundary. Only pixels agreeing
+  with the boundary's own dominant sign count.
+
+Two variants were tried and rejected, both of which sound more sophisticated
+than the rule that works. Scaling the quiet bar to the picture's own median
+energy is wrong in principle: masking is local, so a drawing that is loud
+everywhere must not be allowed to call its loud regions quiet. And ranking by
+error size over local activity -- the textbook masking ratio -- puts the hair
+boundaries first and does not place the neck seam in the top eight, which is
+exactly backwards. What makes a seam visible is not that it is large relative
+to its surroundings; it is that it is *coherent* on quiet ground.
+
+The A-001 baseline, worst first by the length of the line:
+
+| boundary | quiet px | mean excess | longest run |
+| --- | --- | --- | --- |
+| `neck` \| `topwear` | 77 | 1.91 | 36 |
+| `back hair` \| `front hair` | 145 | 4.82 | 25 |
+| `face` \| `mouth` | 16 | 32.47 | 15 |
+| `back hair` \| `topwear` | 10 | 35.80 | 6 |
+| `body_remainder` \| `topwear` | 9 | 19.03 | 5 |
+
+The seam this was built for is now first, and the hair boundary that led the
+first ranking has fallen off the table entirely. That progression is the point:
+the guard found something, the something turned out to be invisible when looked
+at, and the rule got sharper rather than the finding being waved away. The donor
+run ranks differently and sensibly -- `face | mouth` at 115 px and `face | nose`
+at 86, both around a mouth held wide open, which is the hardest thing in that
+picture to decompose.
+
+`back hair | front hair` at 25 px was looked at too, at 4x, and is a genuine
+borderline: two hair layers whose boundary sits at a local energy of 34 against
+the bar of 40. It is left in the table rather than tuned out of it.
+
+`--check` compares against `docs/seam_baseline.json` rather than an absolute
+bar. A bar set where we would like to be fails on the day it is written and
+teaches nothing after that; a baseline fails when a change makes a seam worse,
+which is the question every future change should have to answer. A seam that
+appears where the baseline had none counts too, since the usual way to improve
+one boundary is to move the fault to the next.
+
+**2026-08-30 -- the last seam, and the condition that makes it safe.** With the
+guard ranking things the way the eye does, `neck | topwear` was first: 36 px of
+line at 1.91 luma of mean excess. It survived owning the pixel
+(`reclaim_occluded`), fitting the coverage (`fit_edge_alpha`) and fitting the
+colour (`fit_layer_tone`) because none of the three compares two *different
+generated layers* against each other. Only the original knows the answer there.
+
+`rig.fit_seam_residual` reads it in a narrow band on each side of the boundary
+and fades the correction to nothing three pixels in. A fade rather than a cut,
+for the reason this whole line of work exists: two levels spread over three
+pixels is a gradient and nobody sees it, while two levels at a boundary is a
+line.
+
+**The condition is checked, not assumed.** A band-local correction is fitted
+where two layers touch *now*; if they part under a turn it travels with one of
+them and lands on the wrong pixels. `seam_slide_px` computes how far the pair
+moves apart at full turn from the depth table and the weight they carry at the
+seam -- 0.12 px for `topwear` and `neck`, because a collar already shares the
+neck's weight gradient -- and a pair over half a pixel is skipped and says so in
+the manifest. This is why the same code cannot simply be pointed at every
+boundary: two layers that parallax against each other, which is most of the head
+group, would fail it.
+
+| | mean excess | longest run | band mae |
+| --- | --- | --- | --- |
+| before | 1.91 | 36 | 2.23 |
+| after | **0.62** | **10** | **1.55** |
+
+Two details were worth a level each. The correction is divided by the layer's
+own coverage, since a shift of R applied to a layer showing at alpha *a* moves
+the composite by *a*R* and a seam is exactly where the alphas are not 1. And it
+is rounded rather than truncated: these corrections are one or two levels, and
+truncation quietly ate most of one.
+
+What is left is a peak excess of 1.7 across three rows at the handover itself,
+where both layers contribute partially and a per-side correction cannot
+reproduce the blend. The guard now ranks `back hair | front hair` first at 25 px
+-- the borderline hair boundary that was looked at and found invisible at 4x.
+
 ## Verdict
 
 **Conditionally viable.** Portrait Mode's layers drive a pseudo-2.5D talking

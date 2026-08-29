@@ -353,6 +353,29 @@ python -m seethrough_engine.expression <run> --from-run <도너 run> eye_closed 
 그려진 머리카락이 딸려오지 않습니다. 프리뷰에서 `Use expression art`를 끄면
 예전 방식(속눈썹 압축 블링크)으로 돌아가 나란히 비교할 수 있습니다.
 
+### 이음매 가드
+
+전역 지표는 **가늘고 긴 결함에 둔감합니다.** composite mae가 8.84까지 내려간
+상태에서도 목을 가로지르는 선이 제일 먼저 눈에 띄었습니다 — 21만 픽셀 실루엣의
+평균으로는 276픽셀짜리 1px 폭 이음매를 무게 잡을 수 없습니다.
+
+`seethrough_engine/seams.py`는 면적 대신 **경계**를 잽니다. 최상단 레이어가
+바뀌는 자리마다, 합성이 만드는 단차와 **원본이 같은 자리에서 만드는 단차**를
+비교합니다. 옷깃·턱·속눈썹처럼 원본에도 있는 경계는 0점입니다.
+
+```bash
+python -m seethrough_engine.seams <run 디렉터리>            # 보고서
+python -m seethrough_engine.seams --check <run 디렉터리>    # 기준선 대비 회귀 검사
+python -m seethrough_engine.seams --record <run ...>        # 기준선 갱신
+```
+
+`--check`는 절대 기준이 아니라 [`docs/seam_baseline.json`](docs/seam_baseline.json)
+대비로 판정합니다. 원하는 수준으로 절대선을 그으면 쓰는 날 바로 실패하고 그
+뒤로는 아무것도 못 가르칩니다. 기준선은 **변경이 이음매를 나쁘게 만들었을 때**
+실패하고, 그게 앞으로 모든 변경이 답해야 할 질문입니다. 없던 이음매가 새로
+생겨도 실패합니다 — 한 경계를 고치는 흔한 방법이 결함을 옆 경계로 옮기는
+것이니까요.
+
 ### 합성 충실도
 
 리그를 그려보니 **분해의 결함이 처음으로 눈에 보였습니다.** 셋 다 이미 합성
@@ -362,7 +385,8 @@ python -m seethrough_engine.expression <run> --from-run <도너 run> eye_closed 
 | --- | --- | --- |
 | `reclaim_occluded` | 옷과 목이 다투는 픽셀 | 옷이 제 여밈 사이 피부를 들고 있어 목이 거의 안 보임 |
 | `fit_edge_alpha` | 레이어 경계 알파를 원본에 맞춰 풂 | 턱 밑에 없던 검은 획, 이중턱 |
-| `fit_layer_tone` | 레이어별·재질별 색 치우침 | 두 레이어가 만나는 곳의 계단 = 목을 가로지르는 선 |
+| `fit_layer_tone` | 레이어별·재질별 색 치우침 | 두 레이어가 만나는 곳의 계단 |
+| `fit_seam_residual` | 두 생성 레이어가 맞닿은 띠의 잔차 | 목을 가로지르는 선 (평균 초과 1.91 → 0.62) |
 
 composite mae **18.30 → 9.21**, bad ratio **8.57% → 5.42%**. 전부 모델이 이미
 내놓은 레이어에서, GPU 패스 없이.

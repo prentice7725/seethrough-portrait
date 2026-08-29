@@ -43,6 +43,10 @@ docs/*
 !docs/M1_IMPLEMENTATION_SPEC.md
 !docs/TEST_PROTOCOL_A001.md
 !docs/M2_IMPLEMENTATION_SPEC.md
+!docs/PORTRAIT_AUTO_RIG_FEASIBILITY_v0.1.md
+# The seam guard compares against this; without it in the repo there is nothing
+# for a change to be measured against on a fresh clone.
+!docs/seam_baseline.json
 
 # Standalone webui (M2) run outputs and downloaded model checkpoints
 webui/outputs/

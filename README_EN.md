@@ -339,6 +339,31 @@ topmost layer is the face's own skin or features, so a differently-drawn lock of
 hair cannot come along. Turning off `Use expression art` in the preview falls
 back to the v0.1 blink (the lash squashed onto the lid line) for comparison.
 
+### Seam guard
+
+Whole-image metrics are **blind to a thin, long artifact.** Composite mae was
+down to 8.84 while a line across the neck was still the first thing anyone saw:
+an average over a 216,000-pixel silhouette cannot weigh 276 pixels of boundary
+one pixel wide.
+
+`seethrough_engine/seams.py` measures **boundaries** instead of areas. Wherever
+the topmost layer changes from one pixel to the next, it compares the step the
+composite makes against the step the *original* makes in the same place. A real
+edge -- a collar, a jaw, a lash -- steps in both and scores nothing.
+
+```bash
+python -m seethrough_engine.seams <run dir>            # the report
+python -m seethrough_engine.seams --check <run dir>    # regression against the baseline
+python -m seethrough_engine.seams --record <run ...>   # re-record the baseline
+```
+
+`--check` compares against [`docs/seam_baseline.json`](docs/seam_baseline.json)
+rather than an absolute bar. A bar set where we would like to be fails on the
+day it is written and teaches nothing after that; a baseline fails when a change
+makes a seam worse, which is the question every future change should have to
+answer. A seam that appears where the baseline had none counts too, since the
+usual way to improve one boundary is to move the fault to the next.
+
 ### Composite fidelity
 
 Rendering the rig is what made **decomposition faults visible** for the first
@@ -348,7 +373,8 @@ time. All three were already in the composite metric; nothing had been looking:
 | --- | --- | --- |
 | `reclaim_occluded` | pixels a garment and the neck both claim | the garment holding the skin from its own opening, hiding the neck |
 | `fit_edge_alpha` | solves a layer's edge alpha against the original | a black stroke under the jaw; a double chin |
-| `fit_layer_tone` | each layer's colour bias, one constant per material | a step where two layers meet, drawn as a line across the neck |
+| `fit_layer_tone` | each layer's colour bias, one constant per material | a step where two layers meet |
+| `fit_seam_residual` | the residual in the band where two generated layers touch | the line across the neck (mean excess 1.91 to 0.62) |
 
 Composite mae **18.30 → 9.21**, bad ratio **8.57% → 5.42%** -- on layers the
 model had already produced, with no GPU pass.
