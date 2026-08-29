@@ -450,6 +450,56 @@ class ReclaimOccludedTests(unittest.TestCase):
         # the opening is now a hole in the garment, so the neck shows through
         self.assertFalse((out["topwear"][65:83, 57:73, 3] > 10).any())
 
+    def test_the_region_extends_past_the_margin_qualified_core(self):
+        """The margin decides which regions change hands, not where each one
+        ends. Applied per pixel it cut a decisively-neck area into lace: on
+        A-001 the neck explained 93% of a band better while only 59% cleared
+        the margin, leaving skin-coloured garment behind in ragged patches."""
+        plain, plain_original = contested_scene()
+        _, plain_moved = reclaim_occluded(plain, plain_original)
+
+        # The same scene plus a band the neck wins by a hair: under the margin,
+        # so it can never seed a region, but touching one that is already
+        # seeded. Following the edge should take it; thresholding should not.
+        layers, original = contested_scene()
+        layers["topwear"][88:96, 52:78, :3] = 196
+        original[88:96, 52:78, :3] = 200
+        out, moved = reclaim_occluded(layers, original)
+
+        self.assertGreater(moved["topwear<-neck"], plain_moved["topwear<-neck"],
+                           "the region stopped at the margin instead of at the edge")
+        cleared = out["topwear"][88:93, 57:73, 3] < 128
+        self.assertGreater(cleared.mean(), 0.9)
+
+    def test_an_area_with_no_decisive_core_is_left_alone(self):
+        """Being better by a hair everywhere is not evidence of a
+        mis-assignment; without a seed nothing changes hands."""
+        layers, original = contested_scene()
+        layers["topwear"][60:88, 52:78, :3] = 196
+        original[60:88, 52:78, :3] = 200
+        _, moved = reclaim_occluded(layers, original)
+        self.assertEqual(moved, {})
+
+    def test_the_handover_is_feathered(self):
+        """A hard alpha cut along a jagged boundary glitters as sub-pixel
+        motion moves it -- one flicker per breath at the collar."""
+        layers, original = contested_scene()
+        out, _ = reclaim_occluded(layers, original)
+        alpha = out["topwear"][..., 3]
+        self.assertTrue(((alpha > 0) & (alpha < 255)).any(),
+                        "the handover has no partial alpha at all")
+        hard = reclaim_occluded(layers, original, feather=0)[0]["topwear"][..., 3]
+        self.assertFalse(((hard > 0) & (hard < 255)).any())
+
+    def test_feathering_never_opens_a_gap(self):
+        """The fade is clamped by the layer behind it: softening the garment
+        where nothing shows through would be a hole, not a blend."""
+        layers, original = contested_scene()
+        out, _ = reclaim_occluded(layers, original)
+        softened = (out["topwear"][..., 3] < layers["topwear"][..., 3])
+        behind = layers["neck"][..., 3] > 0
+        self.assertFalse((softened & ~behind).any())
+
     def test_the_real_collar_is_left_alone(self):
         """Where the garment genuinely covers the neck it explains the original
         and must keep its pixels -- otherwise the collar turns into skin."""

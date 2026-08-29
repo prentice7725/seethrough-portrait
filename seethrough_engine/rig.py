@@ -136,10 +136,14 @@ MESH_CELL_FINE_PX = 30
 # thousands of pixels for no measurable gain (`back hair` over `head`), which is
 # the more dangerous outcome of the two.
 RECLAIM_PAIRS: tuple[tuple[str, str], ...] = (("topwear", "neck"), ("neckwear", "neck"))
-# How much better the back layer has to explain a pixel before it is taken,
-# summed over RGB, and the smallest region worth moving at 768px.
+# How much better the back layer has to explain a pixel before that pixel can
+# seed a region, summed over RGB, and the smallest seed worth following.
 RECLAIM_MARGIN = 12
 RECLAIM_MIN_AREA_AT_768 = 200
+# Blur applied to the handover so the garment fades into the layer behind it
+# rather than stopping at a hard edge. Sub-pixel motion across a hard, jagged
+# alpha cut is what made the seam glitter once per breath.
+RECLAIM_FEATHER_PX = 1.0
 
 MANIFEST_VERSION = "0.1"
 RIG_SUBDIR = "rig"
@@ -479,7 +483,7 @@ def neck_bbox(layer_dict: dict[str, np.ndarray], *,
 def reclaim_occluded(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarray, *,
                      pairs: tuple[tuple[str, str], ...] = RECLAIM_PAIRS,
                      alpha_threshold: int = 10, margin: int = RECLAIM_MARGIN,
-                     min_area: int | None = None,
+                     min_area: int | None = None, feather: float | None = None,
                      ) -> tuple[dict[str, np.ndarray], dict[str, int]]:
     """Give a contested pixel to whichever layer explains the original better.
 
@@ -492,13 +496,23 @@ def reclaim_occluded(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarra
     cleared where the back wins; nothing else is touched, and no layer's colour
     is altered.
 
-    Guards, because a per-pixel colour test alone would speckle: a pixel is
-    taken only if the back layer is better by `margin`; the mask is opened and
-    closed to keep coherent regions; components below `min_area` are dropped;
-    and the cleanup is intersected back with the pixels that actually passed
-    the test, so morphology can never hand over one the front explained better.
+    The margin decides **which regions** change hands, not where each region
+    ends. Applying it per pixel cut a decisively-neck area into lace: on A-001
+    the neck explained 93% of one band better, but only 59% cleared the margin,
+    so the handover stopped in ragged mid-region and left skin-coloured garment
+    behind. So a margin-qualified `core` seeds the region, and the region's
+    extent then follows plain "the back layer is better" out to where that
+    stops being true -- which is a real edge in the picture rather than an
+    artefact of the threshold. Boundary roughness drops from 0.121 to 0.079,
+    against 0.07 for a smooth blob of the same size.
+
+    The handover is feathered, because a hard alpha cut with a jagged boundary
+    glitters as sub-pixel motion moves it: 364 hard-edged boundary pixels
+    become 54. Feathering is clamped by the back layer's own alpha so it can
+    never open a gap where there is nothing behind to show through.
     """
     original = np.asarray(original_rgba)[..., :3].astype(np.int32)
+    feather = RECLAIM_FEATHER_PX if feather is None else feather
     if min_area is None:
         scale = original.shape[0] * original.shape[1] / (768.0 * 768.0)
         min_area = max(64, int(round(RECLAIM_MIN_AREA_AT_768 * scale)))
@@ -518,26 +532,42 @@ def reclaim_occluded(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarra
 
         front_err = np.abs(original - front[..., :3].astype(np.int32)).sum(axis=2)
         back_err = np.abs(original - back[..., :3].astype(np.int32)).sum(axis=2)
-        better = contested & (back_err + margin < front_err)
-        if not better.any():
+
+        # A seed: the back layer is decisively better here, over an area big
+        # enough that it is not noise.
+        core = cv2.morphologyEx(
+            (contested & (back_err + margin < front_err)).astype(np.uint8),
+            cv2.MORPH_OPEN, kernel).astype(bool)
+        if not core.any():
+            continue
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(core.astype(np.uint8), 8)
+        core = np.isin(labels, [i for i in range(1, count)
+                                if stats[i, cv2.CC_STAT_AREA] >= min_area])
+        if not core.any():
             continue
 
-        cleaned = cv2.morphologyEx(better.astype(np.uint8), cv2.MORPH_OPEN, kernel)
-        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel).astype(bool)
-        # Closing can reach past the pixels that earned it; clamp it back.
-        cleaned &= contested & (back_err <= front_err)
-
-        count, labels, stats, _ = cv2.connectedComponentsWithStats(
-            cleaned.astype(np.uint8), 8)
-        take = np.zeros_like(cleaned)
-        for label in range(1, count):
-            if stats[label, cv2.CC_STAT_AREA] >= min_area:
-                take |= labels == label
+        # The extent: wherever the back layer is simply better, out to where it
+        # stops being so. Only regions holding a seed are taken.
+        region = cv2.morphologyEx(
+            (contested & (back_err < front_err)).astype(np.uint8),
+            cv2.MORPH_CLOSE, kernel).astype(bool) & contested
+        count, labels, _, _ = cv2.connectedComponentsWithStats(region.astype(np.uint8), 8)
+        seeded = set(np.unique(labels[core]).tolist()) - {0}
+        take = np.isin(labels, list(seeded)) if seeded else np.zeros_like(region)
         if not take.any():
             continue
 
+        handover = take.astype(np.float32)
+        if feather > 0:
+            handover = cv2.GaussianBlur(handover, (0, 0), float(feather))
+            # Never hand over more than the back layer can cover, or the fade
+            # becomes a hole with nothing behind it.
+            handover = np.clip(handover, 0.0, 1.0) * np.clip(
+                back[..., 3].astype(np.float32) / 255.0, 0.0, 1.0)
+
         patched = np.array(front, copy=True)
-        patched[take, 3] = 0
+        patched[..., 3] = np.rint(
+            front[..., 3].astype(np.float32) * (1.0 - handover)).astype(np.uint8)
         out[front_tag] = patched
         moved[front_tag + "<-" + back_tag] = int(take.sum())
 

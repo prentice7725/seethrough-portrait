@@ -463,6 +463,34 @@ lash's, which includes the upper lashes and sits too high -- at
 `blink.lid_ratio` (0.85, where 1.0 is the lower lid). Exposed as a slider,
 since how far down a closed eye should sit is a matter of the art style.
 
+**2026-08-29 -- the reclaimed seam, and where the neck's shadow went.** Hiding
+the neck in the preview showed the garment's window as a torn edge that
+glittered once per breath, with flat pink skin left along the collar. Three
+faults, one cause each.
+
+*The tear.* The margin was being applied per pixel, so it decided not only
+which regions changed hands but where each one ended. On A-001 the neck
+explained 93% of one band better while only 59% cleared the margin, and the
+handover stopped in ragged mid-region. A margin-qualified core now seeds the
+region and the extent follows plain "the back layer is better" out to where
+that stops -- a real edge in the picture rather than an artefact of the
+threshold. Boundary roughness 0.121 -> 0.079, against 0.07 for a smooth blob
+of the same size.
+
+*The glitter.* The alpha was cut hard. A jagged hard edge moved by sub-pixel
+amounts resamples differently every frame. The handover is feathered now,
+clamped by the back layer's own alpha so it can never open a gap: 364 hard-
+edged boundary pixels become 54, and those are where the neck itself runs out.
+
+*The pink.* It was the jaw's shadow on the neck, flattened. `topwear` had
+absorbed a copy of that skin and painted it as an even light tone
+([246,217,201] against the original's [231,200,180], error 62.1), while the
+`neck` layer had the shadow all along (error 18.9). Handing the pixels back
+restores it -- down the centre of the neck, luma 227-228 before and 184-197
+after, against the original's 182-194.
+
+Composite over the whole subject: mae 18.74 -> 17.46, bad 8.83% -> 7.75%.
+
 ## Out of scope
 
 Deferred deliberately, not forgotten:
