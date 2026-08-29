@@ -16,7 +16,7 @@ const controls = {};
 function control(id) {
   if (!controls[id]) {
     controls[id] = {
-      id, checked: id === "autoIdle" || id === "doBlink" || id === "doBreathe",
+      id, checked: id === "doBlink" || id === "doBreathe",   // mirrors the page defaults
       value: id === "neckMode" ? "gradient" : "0",
       textContent: "", innerHTML: "",
       addEventListener() {}, append() {}, appendChild() {},
