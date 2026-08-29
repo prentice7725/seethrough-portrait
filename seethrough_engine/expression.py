@@ -481,11 +481,15 @@ def _placement(part, rig_parts):
     """Where a recovered sprite is drawn: over the parts it replaces, at the
     depth of the nearest of them, so it parallaxes with the face it belongs to
     instead of with whatever the table would have given a new tag."""
-    # A transplanted sprite says what it is made of, and hands over exactly
-    # those layers. The diff path cannot: it recovered a region, not a set of
-    # features, so it falls back to the table of what an edit of that kind
-    # stands in for.
-    tags = part.diagnostics.get("replaces_tags") or REPLACED_TAGS.get((part.kind, part.side), ())
+    # Two different questions. What the sprite is *made of* is what the donor
+    # had -- a closed eye is a lid and a brow, and the donor run has no
+    # `eyewhite` at all, because there is no white to see. What has to *stop
+    # drawing* is the base's whole feature: the donor lacking an eyewhite is
+    # precisely why the base's must be hidden, or the open eye's sclera stays
+    # visible around the shut lid. So the table is the floor, and anything extra
+    # the sprite carries is added to it.
+    tags = set(REPLACED_TAGS.get((part.kind, part.side), ()))
+    tags |= set(part.diagnostics.get("replaces_tags", ()))
     replaced = [p for p in rig_parts if p.get("tag") in tags]
     if not replaced:
         return {"replaces": [], "z": None, "depth": None}

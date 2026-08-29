@@ -481,6 +481,23 @@ class TransplantTests(unittest.TestCase):
             entry = block["parts"]["eye_closed_l"]
             self.assertEqual(sorted(entry["replaces"]), ["eyebrowl", "eyelashl"])
 
+    def test_a_feature_the_donor_does_not_have_is_still_hidden(self):
+        """A closed eye has no white, so the donor run has no `eyewhite` layer.
+        That is exactly why the base's has to stop drawing: left on, the open
+        eye's sclera stays visible around the shut lid."""
+        with tempfile.TemporaryDirectory() as root:
+            base = self._run(os.path.join(root, "base"))
+            donor = self._run(os.path.join(root, "donor"), scale=1.5)
+            # the base has an open eye's white; the donor, being shut, does not
+            manifest = read_manifest(base)
+            manifest["parts"].append({
+                "name": "eyewhitel", "tag": "eyewhitel", "image": "rig/images/face.png",
+                "xyxy": [92, 100, 118, 118], "group": "head", "z": 6, "depth": 0.35,
+                "weight": {"mode": "constant", "value": 1.0}, "mesh": {"cell": 42}})
+            pack = transplant_pack(base, donor, ["eye_closed"])
+            block = write_expression_pack(base, pack, manifest["parts"])
+            self.assertIn("eyewhitel", block["parts"]["eye_closed_l"]["replaces"])
+
     def test_its_matte_is_the_model_s_and_not_a_grown_rectangle(self):
         with tempfile.TemporaryDirectory() as root:
             base = self._run(os.path.join(root, "base"))
