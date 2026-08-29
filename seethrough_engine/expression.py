@@ -53,6 +53,9 @@ __all__ = [
     "build_expression_pack",
     "write_expression_pack",
     "attach_to_run",
+    "align_runs",
+    "transplant_pack",
+    "transplant_to_run",
 ]
 
 # Which layer boxes define each region's extent. A closed eye is drawn where
@@ -478,7 +481,11 @@ def _placement(part, rig_parts):
     """Where a recovered sprite is drawn: over the parts it replaces, at the
     depth of the nearest of them, so it parallaxes with the face it belongs to
     instead of with whatever the table would have given a new tag."""
-    tags = REPLACED_TAGS.get((part.kind, part.side), ())
+    # A transplanted sprite says what it is made of, and hands over exactly
+    # those layers. The diff path cannot: it recovered a region, not a set of
+    # features, so it falls back to the table of what an edit of that kind
+    # stands in for.
+    tags = part.diagnostics.get("replaces_tags") or REPLACED_TAGS.get((part.kind, part.side), ())
     replaced = [p for p in rig_parts if p.get("tag") in tags]
     if not replaced:
         return {"replaces": [], "z": None, "depth": None}
@@ -510,6 +517,136 @@ def write_expression_pack(out_dir, pack, rig_parts=(), subdir="rig/images") -> d
             **_placement(part, rig_parts),
         }
     return {"version": "0.1", "parts": entries, "report": pack["report"]}
+
+
+# What each expression state is made of when the donor has been decomposed in
+# its own right. A closed eye is drawn as a lid and lashes, so `eyelash` is
+# usually the whole of it; the brow comes along because a shut eye's brow is
+# drawn differently, and taking it means the base's brow has to hand over too.
+TRANSPLANT_SOURCES = {
+    ("eye", "l"): ("eyewhitel", "iridesl", "eyelashl", "eyebrowl"),
+    ("eye", "r"): ("eyewhiter", "iridesr", "eyelashr", "eyebrowr"),
+    ("mouth", None): ("mouth",),
+}
+
+# The layer whose shape does not depend on the expression, and so is what the
+# two runs are aligned by. `face` is inpainted skin with no features drawn on
+# it -- the same silhouette whether the eyes are open or shut -- while every
+# anchor a rig has (eye centres, mouth centre) is exactly what the donor
+# changed. Aligning by the thing that moved is how the parts end up misplaced.
+ALIGN_TAGS = ("face", "head")
+
+
+def _run_manifest(run_dir):
+    names = [f for f in os.listdir(run_dir) if f.endswith("_rig_manifest.json")]
+    if not names:
+        raise FileNotFoundError(f"no *_rig_manifest.json in {run_dir}")
+    path = os.path.join(run_dir, names[0])
+    with open(path, encoding="utf-8") as f:
+        return path, names[0][: -len("_rig_manifest.json")], json.load(f)
+
+
+def _load_layer(run_dir, manifest, tag):
+    for part in manifest["parts"]:
+        if part["tag"] == tag:
+            path = os.path.join(run_dir, *part["image"].split("/"))
+            if os.path.isfile(path):
+                return np.array(Image.open(path).convert("RGBA")), tuple(part["xyxy"])
+    return None, None
+
+
+def align_runs(donor_manifest, donor_dir, base_manifest, base_dir):
+    """The similarity that puts the donor run's canvas onto the base run's.
+
+    Fitted to the alignment layer's bounding box: one uniform scale and one
+    offset, which is all two renders of the same drawing differ by.
+    """
+    for tag in ALIGN_TAGS:
+        src_img, src_box = _load_layer(donor_dir, donor_manifest, tag)
+        dst_img, dst_box = _load_layer(base_dir, base_manifest, tag)
+        if src_box is None or dst_box is None:
+            continue
+        scale = (dst_box[2] - dst_box[0]) / (src_box[2] - src_box[0])
+        return np.array([[scale, 0, dst_box[0] - src_box[0] * scale],
+                         [0, scale, dst_box[1] - src_box[1] * scale]],
+                        dtype=np.float32), tag, scale
+    raise ValueError(
+        "neither run has a layer to align by; expected one of " + ", ".join(ALIGN_TAGS))
+
+
+def transplant_pack(base_dir, donor_dir, states) -> dict[str, Any]:
+    """Take the donor run's *own layers* for the features that changed.
+
+    The alternative to diffing, and better where a second decomposition is
+    affordable: a decomposition emits a layer with the matte the model drew,
+    while a diff emits a region with a matte inferred from a threshold, grown
+    by a dilation and softened by a blur. The inferred one is visible as a ring
+    of donor skin around the feature and as a straight cut wherever the region's
+    rectangle crossed the drawing.
+
+    `states` maps a state name to nothing but its kind, as elsewhere:
+    `("eye_closed", "mouth_open")`.
+    """
+    _, _, base_manifest = _run_manifest(base_dir)
+    _, _, donor_manifest = _run_manifest(donor_dir)
+    canvas = (base_manifest["canvas"]["width"], base_manifest["canvas"]["height"])
+    warp, align_tag, scale = align_runs(donor_manifest, donor_dir, base_manifest, base_dir)
+
+    base_tags = {p["tag"] for p in base_manifest["parts"]}
+    parts: list[ExpressionPart] = []
+    report: dict[str, Any] = {"canvas": list(canvas), "source": "transplant",
+                              "aligned_by": align_tag, "scale": round(float(scale), 4),
+                              "states": {}}
+    for state in states:
+        kind = "mouth" if state.startswith("mouth") else "eye"
+        entries: dict[str, Any] = {}
+        for (source_kind, side), tags in TRANSPLANT_SOURCES.items():
+            if source_kind != kind:
+                continue
+            # Every layer of the feature, drawn back to front onto one canvas:
+            # the runtime hands a feature to one part, not to four.
+            merged = np.zeros((canvas[1], canvas[0], 4), dtype=np.float32)
+            taken = []
+            for tag in tags:
+                image, box = _load_layer(donor_dir, donor_manifest, tag)
+                if image is None:
+                    continue
+                full = np.zeros((donor_manifest["canvas"]["height"],
+                                 donor_manifest["canvas"]["width"], 4), dtype=np.uint8)
+                full[box[1]:box[3], box[0]:box[2]] = image
+                placed = cv2.warpAffine(full, warp, canvas, flags=cv2.INTER_AREA,
+                                        borderValue=(0, 0, 0, 0)).astype(np.float32)
+                a = placed[:, :, 3:4] / 255.0
+                merged[:, :, :3] = merged[:, :, :3] * (1 - a) + placed[:, :, :3] * a
+                merged[:, :, 3:4] = np.clip(merged[:, :, 3:4] + placed[:, :, 3:4], 0, 255)
+                taken.append(tag)
+            name = f"{state}_{side}" if side else state
+            alpha = merged[:, :, 3]
+            if not taken or float(alpha.sum()) < MIN_PART_AREA * 255.0:
+                entries[name] = {"recovered": False, "taken": taken}
+                continue
+            ys, xs = np.nonzero(alpha > 2)
+            x1, y1, x2, y2 = int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+            sprite = np.clip(merged[y1:y2, x1:x2], 0, 255).astype(np.uint8)
+            parts.append(ExpressionPart(
+                name=name, kind=kind, side=side, image=sprite, xyxy=(x1, y1, x2, y2),
+                diagnostics={"source": "transplant", "taken": taken,
+                             "replaces_tags": [t for t in taken if t in base_tags],
+                             "sprite_area": int((sprite[:, :, 3] > 0).sum()),
+                             "scale": round(float(scale), 4)}))
+            entries[name] = parts[-1].diagnostics
+        report["states"][state] = entries
+    return {"parts": parts, "report": report}
+
+
+def transplant_to_run(base_dir, donor_dir, states) -> dict[str, Any]:
+    """`transplant_pack`, written into the base run's manifest."""
+    manifest_path, _, manifest = _run_manifest(base_dir)
+    pack = transplant_pack(base_dir, donor_dir, states)
+    manifest["expressions"] = write_expression_pack(base_dir, pack, manifest["parts"])
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+    return manifest["expressions"]
 
 
 def attach_to_run(run_dir, donors) -> dict[str, Any]:
@@ -546,16 +683,27 @@ def attach_to_run(run_dir, donors) -> dict[str, Any]:
 
 
 def main(argv=None) -> int:
-    """`python -m seethrough_engine.expression <run dir> eye_closed=<png> ...`"""
+    """Attach an expression pack to a finished run, either way round:
+
+      python -m seethrough_engine.expression <run> eye_closed=<png> mouth_open=<png>
+      python -m seethrough_engine.expression <run> --from-run <donor run> eye_closed mouth_open
+
+    The first recovers the regions a donor image changed; the second takes the
+    donor run's own layers, which needs a second decomposition and gives the
+    model's matte instead of an inferred one.
+    """
     argv = list(sys.argv[1:] if argv is None else argv)
-    if len(argv) < 2 or any("=" not in a for a in argv[1:]):
+    if len(argv) >= 3 and argv[1] == "--from-run":
+        block = transplant_to_run(argv[0], argv[2], argv[3:] or ["eye_closed", "mouth_open"])
+    elif len(argv) >= 2 and all("=" in a for a in argv[1:]):
+        run_dir, donors = argv[0], {}
+        for arg in argv[1:]:
+            state, path = arg.split("=", 1)
+            donors[state] = np.array(Image.open(path).convert("RGBA"))
+        block = attach_to_run(run_dir, donors)
+    else:
         print(main.__doc__, file=sys.stderr)
         return 2
-    run_dir, donors = argv[0], {}
-    for arg in argv[1:]:
-        state, path = arg.split("=", 1)
-        donors[state] = np.array(Image.open(path).convert("RGBA"))
-    block = attach_to_run(run_dir, donors)
     for name, entry in block["parts"].items():
         print(f"{name:16s} {entry['image']}  replaces {entry['replaces']}")
     if not block["parts"]:

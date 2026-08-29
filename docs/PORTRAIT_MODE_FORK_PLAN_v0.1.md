@@ -126,6 +126,27 @@ sprites were 36.8% and 16.2% `front hair` by area, plus 3.7% and 10.8% `ears`.
 With it they are face, eyewhite, irides, eyelash and eyebrow only -- no hair, no
 ears -- and each sprite shrank by roughly a third.
 
+It also showed what a diff cannot fix. Recovery infers a matte from a threshold,
+grows it with a dilation and softens it with a blur, and that shows: the mouth
+sprite is 48% partially transparent, a ring of donor skin laid over the base's
+own, and each eye sprite carries a straight cut 21 px long where the region's
+rectangle crossed the drawing. Neither is in the picture. Both are visible.
+
+**So the pack has a second source, and it is the better one where a second
+decomposition is affordable.** Decompose the donor in its own right and take its
+`eyelash`, `eyebrow` and `mouth` layers: the matte is then the one the model
+drew. This is what PachiPakuGen does, and their manual alignment step -- nudging
+each recovered feature into place -- is arithmetic here, because both runs have
+layers. The two runs are aligned by `face`, whose shape the expression cannot
+change; aligning by the eye or mouth anchors would be aligning by the thing that
+moved. A transplanted sprite also declares which layers it is made of, so it
+hands over exactly those, brow included, instead of falling back to a table.
+
+    python -m seethrough_engine.expression <run> --from-run <donor run> eye_closed mouth_open
+
+The runtime does not change: both sources produce the same manifest block, so
+ownership, the crossfade and the fallback to the lash squash are shared.
+
 Scope is three images -- `base`, `eyes-closed`, `mouth-open` -- and the vowels
 are a later promotion.
 

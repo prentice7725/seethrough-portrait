@@ -1,12 +1,16 @@
+import json
 import os
 import tempfile
 import unittest
 
 import cv2
 import numpy as np
+from PIL import Image
 
 from seethrough_engine.expression import (
     BOUNDARY_CORRECTION,
+    align_runs,
+    transplant_pack,
     build_expression_pack,
     claimable_mask,
     register_donor,
@@ -66,6 +70,11 @@ def with_open_mouth(base):
     donor[my1:my2, mx1:mx2, :3] = SKIN
     donor[162:184, mx1:mx2, :3] = (70, 25, 35)
     return donor
+
+
+def read_manifest(run_dir):
+    with open(os.path.join(run_dir, "a_rig_manifest.json"), encoding="utf-8") as f:
+        return json.load(f)
 
 
 def rois():
@@ -405,6 +414,93 @@ class ClaimableTests(unittest.TestCase):
         alpha = left.image[:, :, 3] > 64
         owned = ~self.claimable[ay1:ay2, ax1:ax2]
         self.assertEqual(int((alpha & owned).sum()), 0)
+
+
+class TransplantTests(unittest.TestCase):
+    """The other way to get a drawing the decomposition cannot produce: decompose
+    the donor too, and take its layers. The matte is then the model's rather than
+    one inferred from a threshold."""
+
+    LAYERS = {
+        "face": ((56, 16, 200, 256), (232, 202, 182)),
+        "eyelashl": ((90, 96, 120, 120), (30, 25, 30)),
+        "eyebrowl": ((92, 84, 118, 92), (60, 45, 40)),
+        "mouth": ((116, 164, 142, 176), (150, 70, 80)),
+    }
+
+    def _run(self, directory, scale=1.0, offset=(0, 0), canvas=256):
+        """A run directory with just enough in it: a manifest and its layers."""
+        os.makedirs(os.path.join(directory, "rig", "images"), exist_ok=True)
+        parts = []
+        for z, (tag, (box, colour)) in enumerate(self.LAYERS.items()):
+            x1, y1, x2, y2 = [int(round(v * scale)) for v in box]
+            x1 += offset[0]; x2 += offset[0]; y1 += offset[1]; y2 += offset[1]
+            img = np.zeros((y2 - y1, x2 - x1, 4), dtype=np.uint8)
+            img[:, :, :3] = colour
+            img[:, :, 3] = 255
+            Image.fromarray(img).save(os.path.join(directory, "rig", "images", f"{tag}.png"))
+            parts.append({"name": tag, "tag": tag, "image": f"rig/images/{tag}.png",
+                          "xyxy": [x1, y1, x2, y2], "group": "head", "z": z,
+                          "depth": 0.5, "weight": {"mode": "constant", "value": 1.0},
+                          "mesh": {"cell": 42}})
+        side = int(round(canvas * scale))
+        manifest = {"version": "0.1", "canvas": {"width": side, "height": side},
+                    "source": {}, "anchors": {}, "parts": parts, "motion": {}}
+        with open(os.path.join(directory, "a_rig_manifest.json"), "w", encoding="utf-8") as f:
+            json.dump(manifest, f)
+        return directory
+
+    def test_the_two_runs_are_aligned_by_a_layer_the_expression_cannot_move(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = self._run(os.path.join(root, "base"))
+            donor = self._run(os.path.join(root, "donor"), scale=1.5, offset=(20, -10))
+            warp, tag, scale = align_runs(read_manifest(donor), donor,
+                                          read_manifest(base), base)
+            self.assertEqual(tag, "face")
+            self.assertAlmostEqual(scale, 1 / 1.5, places=2)
+
+    def test_a_transplanted_part_lands_where_the_feature_it_replaces_is(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = self._run(os.path.join(root, "base"))
+            donor = self._run(os.path.join(root, "donor"), scale=1.5, offset=(20, -10))
+            pack = transplant_pack(base, donor, ["eye_closed"])
+            part = next(p for p in pack["parts"] if p.side == "l")
+            # the lash and the brow together, back where the base draws them
+            lash, brow = self.LAYERS["eyelashl"][0], self.LAYERS["eyebrowl"][0]
+            want = (min(lash[0], brow[0]), min(lash[1], brow[1]),
+                    max(lash[2], brow[2]), max(lash[3], brow[3]))
+            for got, expected in zip(part.xyxy, want):
+                self.assertLess(abs(got - expected), 3, f"{part.xyxy} against {want}")
+
+    def test_it_hands_over_exactly_the_layers_it_is_made_of(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = self._run(os.path.join(root, "base"))
+            donor = self._run(os.path.join(root, "donor"), scale=1.5)
+            pack = transplant_pack(base, donor, ["eye_closed"])
+            block = write_expression_pack(base, pack, read_manifest(base)["parts"])
+            entry = block["parts"]["eye_closed_l"]
+            self.assertEqual(sorted(entry["replaces"]), ["eyebrowl", "eyelashl"])
+
+    def test_its_matte_is_the_model_s_and_not_a_grown_rectangle(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = self._run(os.path.join(root, "base"))
+            donor = self._run(os.path.join(root, "donor"), scale=1.5)
+            part = next(p for p in transplant_pack(base, donor, ["eye_closed"])["parts"]
+                        if p.side == "l")
+            alpha = part.image[:, :, 3]
+            feathered = int(((alpha > 8) & (alpha < 247)).sum())
+            solid = int((alpha >= 247).sum())
+            self.assertLess(feathered, solid * 0.35,
+                            "the transplanted matte is as soft as an inferred one")
+
+    def test_a_state_the_donor_has_no_layers_for_is_reported_not_invented(self):
+        with tempfile.TemporaryDirectory() as root:
+            base = self._run(os.path.join(root, "base"))
+            donor = self._run(os.path.join(root, "donor"))
+            pack = transplant_pack(base, donor, ["eye_closed"])
+            names = {p.name for p in pack["parts"]}
+            self.assertNotIn("eye_closed_r", names)
+            self.assertFalse(pack["report"]["states"]["eye_closed"]["eye_closed_r"]["recovered"])
 
 
 class WriteTests(unittest.TestCase):
