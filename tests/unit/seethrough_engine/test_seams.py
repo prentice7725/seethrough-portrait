@@ -11,7 +11,7 @@ from seethrough_engine.seams import check_run, seam_report, write_baseline
 CANVAS = 128
 
 
-def build_run(directory, *, garment_bias=0, draw_edge=False):
+def build_run(directory, *, garment_bias=0, draw_edge=False, busy=False):
     """A minimal run: skin above, garment below, meeting at y=64.
 
     `garment_bias` shifts the garment layer off the original, which is the
@@ -22,6 +22,9 @@ def build_run(directory, *, garment_bias=0, draw_edge=False):
     original = np.zeros((CANVAS, CANVAS, 4), dtype=np.uint8)
     original[20:110, 20:110, :3] = 200
     original[20:110, 20:110, 3] = 255
+    if busy:
+        # Strands: the picture is loud here, and a few levels cannot be seen.
+        original[20:110, 20:110:3, :3] = 60
     if draw_edge:
         original[63:65, 20:110, :3] = 40
 
@@ -32,6 +35,9 @@ def build_run(directory, *, garment_bias=0, draw_edge=False):
     garment = np.zeros_like(original)
     garment[64:110, 20:110, :3] = np.clip(200 + garment_bias, 0, 255)
     garment[64:110, 20:110, 3] = 255
+    if busy:
+        skin[20:64, 20:110:3, :3] = 60
+        garment[64:110, 20:110:3, :3] = np.clip(60 + garment_bias, 0, 255)
     if draw_edge:
         skin[63, 20:110, :3] = 40
         garment[64, 20:110, :3] = 40
@@ -96,6 +102,17 @@ class SeamReportTests(unittest.TestCase):
             Image.fromarray(image).save(path)
             row = row_for(seam_report(directory), "neck | topwear")
             self.assertGreater(row["longest_run_px"], 60)
+
+    def test_the_same_error_inside_a_busy_region_is_not_flagged(self):
+        """A few levels beside a hundred-level strand edge is masked. The first
+        ranking put a hair boundary on top with a 125 px run, and at 3x the two
+        pictures were the same."""
+        with tempfile.TemporaryDirectory() as root:
+            quiet = seam_report(build_run(os.path.join(root, "quiet"), garment_bias=6))
+            busy = seam_report(build_run(os.path.join(root, "busy"),
+                                         garment_bias=6, busy=True))
+            self.assertGreater(row_for(quiet, "neck | topwear")["longest_run_px"], 60)
+            self.assertLess(row_for(busy, "neck | topwear")["longest_run_px"], 10)
 
 
 class SeamGuardTests(unittest.TestCase):

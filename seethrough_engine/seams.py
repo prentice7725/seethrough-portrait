@@ -40,6 +40,7 @@ from PIL import Image
 __all__ = [
     "STEP_THRESHOLD",
     "FLAT_STEP",
+    "QUIET_ENERGY",
     "seam_report",
     "check_run",
     "load_baseline",
@@ -59,6 +60,19 @@ STEP_THRESHOLD = 1.0
 # was noticed at 2 luma while the brow at 70 was not. So a pixel only counts
 # when the original is locally flat.
 FLAT_STEP = 4.0
+
+# ... and only where the *neighbourhood* is quiet, not just the one step across
+# the boundary. The first ranking put `back hair | head_remainder` on top with a
+# 125 px run, and at 3x magnification the two pictures are the same: each
+# flagged pixel does sit between two locally flat values, but it sits inside a
+# hair strand, and a 3-luma error beside a 100-luma strand edge is masked. On
+# A-001 the local gradient energy of that region measures 187 against the neck
+# seam's 3.4, and the subject's own median is 11.
+#
+# This is the guard correcting itself: it found something, the something turned
+# out to be invisible, and the rule got sharper rather than the finding being
+# waved away.
+QUIET_ENERGY = 40.0
 
 # `--check` compares against a recorded baseline rather than an absolute bar.
 # An absolute bar set where we would like to be fails on the day it is written
@@ -116,7 +130,8 @@ def _render(run_dir, manifest):
 
 
 def seam_report(run_dir: str, *, step_threshold: float = STEP_THRESHOLD,
-                flat_step: float = FLAT_STEP, band: int = BAND_PX) -> dict[str, Any]:
+                flat_step: float = FLAT_STEP, quiet_energy: float = QUIET_ENERGY,
+                band: int = BAND_PX) -> dict[str, Any]:
     """Every boundary between two layers, and how much of it is a line."""
     base_name, manifest = _run_manifest(run_dir)
     composite, _, owner, tags = _render(run_dir, manifest)
@@ -124,6 +139,11 @@ def seam_report(run_dir: str, *, step_threshold: float = STEP_THRESHOLD,
                         .convert("RGBA"))
     subject = original[:, :, 3] > 128
     lc, lo = _luma(composite), _luma(original[:, :, :3])
+    # How busy the picture is around each pixel, which is what decides whether
+    # an error of a few levels can be seen at all.
+    energy = cv2.boxFilter(np.abs(cv2.Sobel(lo, cv2.CV_32F, 1, 0, ksize=3))
+                           + np.abs(cv2.Sobel(lo, cv2.CV_32F, 0, 1, ksize=3)), -1, (7, 7))
+    quiet = energy < quiet_energy
 
     seams: dict[tuple[int, int], dict[str, Any]] = {}
     height, width = owner.shape
@@ -145,15 +165,18 @@ def seam_report(run_dir: str, *, step_threshold: float = STEP_THRESHOLD,
             entry = seams.setdefault(key, {"excess": [], "mask": None})
             entry["excess"].append(float(excess[y, x]))
             entry.setdefault("flat", []).append(float(step_o[y, x]))
+            entry.setdefault("quiet", []).append(bool(quiet[y, x]))
             if entry["mask"] is None:
                 entry["mask"] = np.zeros((height, width), np.uint8)
-            if excess[y, x] > step_threshold and step_o[y, x] < flat_step:
+            if (excess[y, x] > step_threshold and step_o[y, x] < flat_step
+                    and quiet[y, x]):
                 entry["mask"][y, x] = 1
 
     rows = []
     for (i, j), entry in seams.items():
         values = np.array(entry["excess"], np.float32)
         flat = np.array(entry["flat"], np.float32) < flat_step
+        flat &= np.array(entry["quiet"], bool)
         if values.size < 8:
             continue
         mask = entry["mask"]
@@ -231,8 +254,8 @@ def write_baseline(path: str, run_dirs) -> dict[str, Any]:
 
 
 def _print(report, limit=8):
-    print(f"run {report['run']}   (counted where the original is flat and the "
-          f"composite steps {report['step_threshold']}+ luma more)")
+    print(f"run {report['run']}   (counted where the original is flat and quiet "
+          f"and the composite steps {report['step_threshold']}+ luma more)")
     print(f"  {'pair':34s} {'bound':>6s} {'flat':>6s} {'mean':>6s} {'p95':>6s} "
           f"{'max':>6s} {'over':>5s} {'longest':>8s} {'band mae':>9s}")
     for row in report["seams"][:limit]:

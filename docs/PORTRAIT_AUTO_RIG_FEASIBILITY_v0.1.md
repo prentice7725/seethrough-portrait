@@ -723,7 +723,7 @@ topmost layer changes from one pixel to the next, it compares the step the
 composite makes against the step the *original* makes in the same place. A real
 edge -- a collar, a jaw, a lash -- steps in both and scores nothing.
 
-Two things had to be right before the numbers matched what the eye reports:
+Three things had to be right before the numbers matched what the eye reports:
 
 * **Only where the picture is flat.** The first ranking put `face | eyebrowr` on
   top at 70 luma of excess, which is invisible: it lies along a drawn brow where
@@ -736,20 +736,34 @@ Two things had to be right before the numbers matched what the eye reports:
   for a line that is plainly 150 long. The mask is closed before the runs are
   measured, because the eye integrates along a line and this should too.
 
+* **The neighbourhood has to be quiet, not just the step.** With the first two
+  rules the ranking put `back hair | head_remainder` on top with a 125 px run --
+  and at 3x magnification the two pictures are the same. Each flagged pixel does
+  sit between two locally flat values, and it also sits inside a hair strand,
+  where a 3-luma error beside a 100-luma strand edge is masked. Measured, that
+  region's local gradient energy is 187 against the neck seam's 3.4, with the
+  subject's own median at 11. So a pixel counts only where the picture around it
+  is quiet as well as flat.
+
 The A-001 baseline, worst first by the length of the line:
 
-| boundary | flat px | mean excess | longest run |
+| boundary | quiet px | mean excess | longest run |
 | --- | --- | --- | --- |
-| `back hair` \| `head_remainder` | 445 | 7.01 | 125 |
-| `face` \| `eyebrowr` | 23 | 73.59 | 53 |
-| `face` \| `mouth` | 44 | 45.42 | 51 |
-| `back hair` \| `topwear` | 55 | 36.52 | 46 |
-| `neck` \| `topwear` | 110 | 2.83 | 36 |
+| `neck` \| `topwear` | 77 | 1.91 | 36 |
+| `back hair` \| `front hair` | 145 | 4.82 | 31 |
+| `face` \| `mouth` | 16 | 32.47 | 15 |
+| `back hair` \| `topwear` | 10 | 35.80 | 7 |
+| `back hair` \| `head_remainder` | 5 | 4.29 | 3 |
 
-The seam this was built for is fifth. The four above it were never looked at,
-and two of them are the stroke layers `fit_edge_alpha` deliberately exempts --
-which is either the right call or a fault hiding behind it, and now there is a
-number either way.
+The seam this was built for is now first, and the hair boundary that led the
+first ranking is last at 3 px. That progression is the point: the guard found
+something, the something turned out to be invisible when looked at, and the rule
+got sharper rather than the finding being waved away. The donor run ranks
+differently and sensibly -- `face | mouth` at 116 px and `face | nose` at 86,
+both around a mouth held wide open, which is the hardest thing in that picture
+to decompose.
+
+`back hair | front hair` at 31 px is the one nobody has looked at yet.
 
 `--check` compares against `docs/seam_baseline.json` rather than an absolute
 bar. A bar set where we would like to be fails on the day it is written and
