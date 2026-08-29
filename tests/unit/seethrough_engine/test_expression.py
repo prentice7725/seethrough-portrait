@@ -2,11 +2,14 @@ import os
 import tempfile
 import unittest
 
+import cv2
 import numpy as np
 
 from seethrough_engine.expression import (
     BOUNDARY_CORRECTION,
     build_expression_pack,
+    claimable_mask,
+    register_donor,
     drift_level,
     expression_rois,
     extract_part,
@@ -302,6 +305,106 @@ class PlacementTests(unittest.TestCase):
             block = write_expression_pack(out, self.pack)
         self.assertEqual(block["parts"]["eye_closed_l"]["replaces"], [])
         self.assertIsNone(block["parts"]["eye_closed_l"]["z"])
+
+
+class RegistrationTests(unittest.TestCase):
+    """A generated donor is rarely the crop the decomposition ran on, and every
+    threshold here compares the two pixel for pixel."""
+
+    def setUp(self):
+        self.base = base_portrait()
+
+    def test_a_donor_already_in_the_base_s_frame_is_left_alone(self):
+        donor = with_closed_eyes(self.base)
+        self.assertTrue(np.array_equal(register_donor(self.base, donor), donor))
+
+    # A flat background in a colour that is not in the picture, which is what a
+    # generator is asked for, and no matte -- which is what it hands back.
+    BG = (255, 0, 255)
+
+    def _reframed(self, image, scale, pad):
+        """The same drawing at another zoom, on a canvas of another shape."""
+        flat = np.where(image[:, :, 3:4] > 128, image[:, :, :3],
+                        np.array(self.BG, dtype=np.uint8)).astype(np.uint8)
+        ys, xs = np.nonzero(image[:, :, 3] > 128)
+        crop = flat[ys.min():ys.max() + 1, xs.min():xs.max() + 1]
+        big = cv2.resize(crop, None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+        out = np.zeros((big.shape[0] + 2 * pad, big.shape[1] + pad, 4), dtype=np.uint8)
+        out[:, :, :3] = self.BG
+        out[:, :, 3] = 255
+        out[pad:pad + big.shape[0], pad // 2:pad // 2 + big.shape[1], :3] = big
+        return out
+
+    def test_a_donor_at_another_scale_and_crop_comes_back_registered(self):
+        donor = self._reframed(with_closed_eyes(self.base), 1.6, 90)
+        registered = register_donor(self.base, donor)
+        self.assertEqual(registered.shape[:2], self.base.shape[:2])
+        a = registered[:, :, 3] > 128
+        b = self.base[:, :, 3] > 128
+        iou = float((a & b).sum() / (a | b).sum())
+        self.assertGreater(iou, 0.98, f"silhouette IoU {iou:.3f}")
+
+    def test_and_the_expression_is_still_recoverable_afterwards(self):
+        donor = self._reframed(with_closed_eyes(self.base), 1.6, 90)
+        pack = build_expression_pack(self.base, {"eye_closed": donor}, ANCHORS, PART_BOXES)
+        self.assertEqual(sorted(p.name for p in pack["parts"]),
+                         ["eye_closed_l", "eye_closed_r"])
+
+    def test_a_donor_with_no_silhouette_is_refused_rather_than_guessed_at(self):
+        blank = np.zeros((300, 200, 4), dtype=np.uint8)
+        with self.assertRaises(ValueError):
+            register_donor(self.base, blank)
+
+
+class ClaimableTests(unittest.TestCase):
+    """The decomposition already says where the hair is. A donor is a different
+    generation, so its hair is drawn differently too, and that difference sits
+    inside the eye region."""
+
+    def setUp(self):
+        self.base = base_portrait()
+        # A fringe hanging over the left eye, in front of the face.
+        self.fringe = (88, 92, 106, 112)
+        self.rig_parts = [
+            {"name": "face", "tag": "face", "z": 8, "xyxy": (56, 16, 200, 256)},
+            {"name": "eyelashl", "tag": "eyelashl", "z": 15, "xyxy": EYE_L["eyelashl"]},
+            {"name": "front hair", "tag": "front hair", "z": 19, "xyxy": self.fringe},
+        ]
+        self.images = {}
+        for part in self.rig_parts:
+            x1, y1, x2, y2 = part["xyxy"]
+            img = np.zeros((y2 - y1, x2 - x1, 4), dtype=np.uint8)
+            img[:, :, 3] = 255
+            self.images[part["name"]] = img
+        self.claimable = claimable_mask(self.rig_parts, self.images, self.base.shape[:2])
+
+    def test_the_face_is_claimable_and_the_hair_over_it_is_not(self):
+        self.assertTrue(self.claimable[200, 150])
+        x1, y1, x2, y2 = self.fringe
+        self.assertFalse(self.claimable[(y1 + y2) // 2, (x1 + x2) // 2])
+
+    def test_a_layer_under_the_hair_does_not_make_it_claimable(self):
+        # The face covers the fringe's pixels too; topmost ownership is what counts.
+        x1, y1, x2, y2 = self.fringe
+        self.assertFalse(self.claimable[y1 + 1:y2 - 1, x1 + 1:x2 - 1].any())
+
+    def test_a_donor_that_redrew_the_hair_does_not_get_to_repaint_it(self):
+        donor = with_closed_eyes(self.base)
+        x1, y1, x2, y2 = self.fringe
+        donor[y1:y2, x1:x2, :3] = (20, 15, 12)     # its fringe sits differently
+        loose = build_expression_pack(self.base, {"eye_closed": donor}, ANCHORS, PART_BOXES)
+        tight = build_expression_pack(self.base, {"eye_closed": donor}, ANCHORS,
+                                      PART_BOXES, self.claimable)
+        left = next(p for p in tight["parts"] if p.side == "l")
+        looseleft = next(p for p in loose["parts"] if p.side == "l")
+        self.assertGreater(int((looseleft.image[:, :, 3] > 64).sum()),
+                           int((left.image[:, :, 3] > 64).sum()),
+                           "the constraint recovered as much as the unconstrained pass")
+        # nothing the hair owns may end up in the sprite
+        ax1, ay1, ax2, ay2 = left.xyxy
+        alpha = left.image[:, :, 3] > 64
+        owned = ~self.claimable[ay1:ay2, ax1:ax2]
+        self.assertEqual(int((alpha & owned).sum()), 0)
 
 
 class WriteTests(unittest.TestCase):

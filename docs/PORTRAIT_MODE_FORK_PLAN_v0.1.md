@@ -91,7 +91,7 @@ mouth boxes, against 25.5 over the face as a whole -- so a recovered region
 drops in as one more part over clean skin. No second decomposition, no GPU, and
 no chance of the rest of the portrait coming back different.
 
-Two departures from their algorithm, both forced by that ordering:
+Four departures from their algorithm, each of them something the layers pay for:
 
 * Their regions are fixed fractions of the canvas, which suits a full-body
   standing picture and not a bust. Ours come from the run's own anchors and
@@ -100,6 +100,31 @@ Two departures from their algorithm, both forced by that ordering:
   the region the edit fills rather than how different the edit is. Recovery uses
   the same core/extent hysteresis as `rig.reclaim_occluded`, over a drift level
   measured on the part of the picture nothing is taken from.
+* A donor is rarely the crop the decomposition ran on -- the model returns
+  whatever framing it likes -- and both their method and ours compare the two
+  pixel for pixel. Since it is the same drawing, one uniform scale and one
+  offset suffice, and the subject's silhouette gives them. Their guide asks the
+  user to preserve placement and canvas size instead.
+* **What a facial edit may repaint is decided by the layers, not by the
+  region.** A donor is a different generation, so its hair is drawn differently
+  too, and that difference sits inside the eye region and joins the eye through
+  the brow. It is invisible at rest and wrong in motion: the swallowed hair
+  would travel at the eye's depth on the head shell while the real `front hair`
+  travels on the hair shell, and the two would part exactly when the head turns.
+  Only pixels whose topmost layer is the face's own skin or features can be
+  claimed. Nothing has to guess where the hair is -- the decomposition said so.
+
+**2026-08-29 -- the first real donor.** A generated closed-eyes-and-open-mouth
+image of the same character, 1152x1712 against the run's 768 square, on a flat
+background, at a different crop. Registered by silhouette to IoU 0.991; drift
+over the body outside every region measured at 23, against 13 for the synthetic
+donor the extractor was built on. All three parts recovered, and of 9843 changed
+pixels, 0 outside them.
+
+The claimable constraint was written because of this donor. Without it the eye
+sprites were 36.8% and 16.2% `front hair` by area, plus 3.7% and 10.8% `ears`.
+With it they are face, eyewhite, irides, eyelash and eyebrow only -- no hair, no
+ears -- and each sprite shrank by roughly a third.
 
 Scope is three images -- `base`, `eyes-closed`, `mouth-open` -- and the vowels
 are a later promotion.

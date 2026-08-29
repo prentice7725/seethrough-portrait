@@ -44,6 +44,8 @@ __all__ = [
     "Roi",
     "ExpressionPart",
     "expression_rois",
+    "register_donor",
+    "claimable_mask",
     "drift_level",
     "infer_edit_mask",
     "match_to_base_boundary",
@@ -108,6 +110,46 @@ BOUNDARY_CORRECTION = 0.55
 
 # Below this many pixels a recovered region is noise, not a drawing.
 MIN_PART_AREA = 40
+
+# What a facial edit is allowed to repaint: the face's own skin and features.
+# A donor is a different generation, so its hair is drawn differently too, and
+# that difference sits inside the eye region and connects to the eye through the
+# brow. Left alone it is invisible at rest and wrong in motion -- the swallowed
+# hair would travel at the eye's depth on the head shell while the real `front
+# hair` travels on the hair shell, and the two would slide apart exactly when
+# the head turns. Nothing here has to guess where the hair is: the decomposition
+# already said so, which is the one thing a PSD-less pipeline cannot do.
+CLAIMABLE_TAGS = frozenset({
+    "face", "head", "nose", "mouth",
+    "eyewhite", "eyewhitel", "eyewhiter",
+    "irides", "iridesl", "iridesr",
+    "eyelash", "eyelashl", "eyelashr",
+    "eyebrow", "eyebrowl", "eyebrowr",
+    "eyes", "eyel", "eyer",
+})
+
+
+def claimable_mask(rig_parts, images, shape) -> np.ndarray:
+    """Where an expression may repaint, as a boolean canvas: the pixels whose
+    topmost layer at rest is one of `CLAIMABLE_TAGS`.
+
+    Topmost, not "any layer covers it": the hair in front of a cheek owns that
+    pixel, and repainting it would put a second copy of the hair under the real
+    one."""
+    owner = np.full(shape, -1, dtype=np.int16)
+    parts = sorted(rig_parts, key=lambda p: p["z"])
+    for index, part in enumerate(parts):
+        image = images.get(part["name"])
+        if image is None:
+            continue
+        x1, y1, x2, y2 = part["xyxy"]
+        window = owner[y1:y2, x1:x2]
+        window[image[:, :, 3] > 128] = index
+    claimable = np.zeros(shape, dtype=bool)
+    for index, part in enumerate(parts):
+        if part["tag"] in CLAIMABLE_TAGS:
+            claimable |= owner == index
+    return claimable
 
 
 @dataclass(frozen=True)
@@ -207,17 +249,42 @@ def expression_rois(anchors, part_boxes, canvas) -> list[Roi]:
     return rois
 
 
-def _resize_like(image, base):
-    if image.shape[:2] == base.shape[:2]:
-        return image
-    bh, bw = base.shape[:2]
-    ih, iw = image.shape[:2]
-    if abs((iw / ih) - (bw / bh)) > 0.02 * (bw / bh):
-        raise ValueError(
-            f"donor is {iw}x{ih} against a {bw}x{bh} base and the aspect ratios "
-            "differ by more than 2%: it is a different framing, not a different "
-            "expression")
-    return cv2.resize(image, (bw, bh), interpolation=cv2.INTER_AREA)
+def _silhouette_box(alpha):
+    ys, xs = np.nonzero(alpha > 128)
+    if xs.size == 0:
+        return None
+    return int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
+
+
+def register_donor(base, donor):
+    """Bring a donor into the base's frame.
+
+    A generated donor is rarely the same crop as the picture that was
+    decomposed -- the model returns whatever framing it likes -- and every
+    threshold here compares the two pixel for pixel. Since both are the same
+    drawing, one uniform scale and one offset are enough, and the silhouette
+    gives them: match the subject's bounding box.
+
+    A donor that is already the base's size is left alone. Fitting a box to an
+    image that is already registered can only move it, and the expression
+    itself (a lock of hair drawn one pixel differently) is enough to move the
+    box.
+    """
+    if donor.shape[:2] == base.shape[:2]:
+        return donor
+    if donor.shape[2] == 3 or int((donor[:, :, 3] > 128).all()):
+        # No matte of its own: the background is whatever fills its border.
+        from .matting import key_flat_background
+        donor, _ = key_flat_background(donor[:, :, :3])
+    src = _silhouette_box(donor[:, :, 3])
+    dst = _silhouette_box(base[:, :, 3])
+    if src is None or dst is None:
+        raise ValueError("cannot register a donor without a subject silhouette")
+    scale = (dst[2] - dst[0]) / (src[2] - src[0])
+    warp = np.array([[scale, 0, dst[0] - src[0] * scale],
+                     [0, scale, dst[1] - src[1] * scale]], dtype=np.float32)
+    return cv2.warpAffine(donor, warp, (base.shape[1], base.shape[0]),
+                          flags=cv2.INTER_AREA, borderValue=(0, 0, 0, 0))
 
 
 def _keep_seeded_components(extent, core, anchor, max_components):
@@ -250,7 +317,7 @@ def drift_level(base, donor, rois) -> int:
     the picture a donor is supposed to leave alone, so whatever difference is
     found there is the generator's noise floor for this image.
     """
-    donor = _resize_like(donor, base)
+    donor = register_donor(base, donor)
     outside = base[:, :, 3] > 128
     for roi in rois:
         x1, y1, x2, y2 = roi.box
@@ -262,7 +329,7 @@ def drift_level(base, donor, rois) -> int:
     return int(np.percentile(diff[outside], DRIFT_PERCENTILE))
 
 
-def infer_edit_mask(base, donor, roi: Roi, drift: int = 0):
+def infer_edit_mask(base, donor, roi: Roi, drift: int = 0, claimable=None):
     """Where the donor differs from the base, inside one region.
 
     Returns a feathered uint8 mask over the whole canvas and a diagnostics dict.
@@ -272,6 +339,8 @@ def infer_edit_mask(base, donor, roi: Roi, drift: int = 0):
     diff = np.max(np.abs(base[:, :, :3].astype(np.int16)
                          - donor[:, :, :3].astype(np.int16)), axis=2).astype(np.uint8)
     region = roi.mask(base.shape[:2]) > 0
+    if claimable is not None:
+        region = region & claimable
     values = diff[region]
     if values.size == 0:
         return np.zeros(base.shape[:2], dtype=np.uint8), {"reason": "empty roi"}
@@ -340,11 +409,12 @@ def match_to_base_boundary(base, donor, mask):
     return out.astype(np.uint8), [round(float(d), 2) for d in delta]
 
 
-def extract_part(base, donor, roi: Roi, name: str, drift: int = 0) -> ExpressionPart | None:
+def extract_part(base, donor, roi: Roi, name: str, drift: int = 0,
+                 claimable=None) -> ExpressionPart | None:
     """One region of a donor, as a cropped RGBA sprite, or None if the donor
     did not change it."""
-    donor = _resize_like(donor, base)
-    mask, diagnostics = infer_edit_mask(base, donor, roi, drift)
+    donor = register_donor(base, donor)
+    mask, diagnostics = infer_edit_mask(base, donor, roi, drift, claimable)
     if not mask.any():
         return None
     adjusted, delta = match_to_base_boundary(base, donor, mask)
@@ -367,7 +437,7 @@ def extract_part(base, donor, roi: Roi, name: str, drift: int = 0) -> Expression
                           xyxy=(x1, y1, x2, y2), diagnostics=diagnostics)
 
 
-def build_expression_pack(base, donors, anchors, part_boxes) -> dict[str, Any]:
+def build_expression_pack(base, donors, anchors, part_boxes, claimable=None) -> dict[str, Any]:
     """Recover every region each donor changed.
 
     `donors` maps a state name to an image: `{"eye_closed": rgba,
@@ -386,7 +456,7 @@ def build_expression_pack(base, donors, anchors, part_boxes) -> dict[str, Any]:
             if roi.kind != kind:
                 continue
             name = f"{state}_{roi.side}" if roi.side else state
-            part = extract_part(base, donor, roi, name, drift)
+            part = extract_part(base, donor, roi, name, drift, claimable)
             entries[roi.name] = part.diagnostics if part else {"recovered": False, "drift": drift}
             if part is not None:
                 parts.append(part)
@@ -461,7 +531,14 @@ def attach_to_run(run_dir, donors) -> dict[str, Any]:
     boxes = {p["tag"]: tuple(p["xyxy"]) for p in manifest["parts"]}
     anchors = {k: tuple(v) for k, v in manifest.get("anchors", {}).items()}
 
-    pack = build_expression_pack(base, donors, anchors, boxes)
+    images = {}
+    for part in manifest["parts"]:
+        path = os.path.join(run_dir, *part["image"].split("/"))
+        if os.path.isfile(path):
+            images[part["name"]] = np.array(Image.open(path).convert("RGBA"))
+    claimable = claimable_mask(manifest["parts"], images, base.shape[:2])
+
+    pack = build_expression_pack(base, donors, anchors, boxes, claimable)
     manifest["expressions"] = write_expression_pack(run_dir, pack, manifest["parts"])
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
