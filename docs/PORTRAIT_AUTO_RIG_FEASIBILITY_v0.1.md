@@ -723,7 +723,7 @@ topmost layer changes from one pixel to the next, it compares the step the
 composite makes against the step the *original* makes in the same place. A real
 edge -- a collar, a jaw, a lash -- steps in both and scores nothing.
 
-Three things had to be right before the numbers matched what the eye reports:
+Four things had to be right before the numbers matched what the eye reports:
 
 * **Only where the picture is flat.** The first ranking put `face | eyebrowr` on
   top at 70 luma of excess, which is invisible: it lies along a drawn brow where
@@ -745,25 +745,42 @@ Three things had to be right before the numbers matched what the eye reports:
   subject's own median at 11. So a pixel counts only where the picture around it
   is quiet as well as flat.
 
+* **A line has a direction.** Along a real seam the composite is consistently
+  darker than the picture or consistently lighter; along a boundary that merely
+  has noisy pixels the sign flips from one to the next -- +10.0, +10.5, -0.8,
+  +1.7, -7.2 across five pixels of A-001's hair boundary. Only pixels agreeing
+  with the boundary's own dominant sign count.
+
+Two variants were tried and rejected, both of which sound more sophisticated
+than the rule that works. Scaling the quiet bar to the picture's own median
+energy is wrong in principle: masking is local, so a drawing that is loud
+everywhere must not be allowed to call its loud regions quiet. And ranking by
+error size over local activity -- the textbook masking ratio -- puts the hair
+boundaries first and does not place the neck seam in the top eight, which is
+exactly backwards. What makes a seam visible is not that it is large relative
+to its surroundings; it is that it is *coherent* on quiet ground.
+
 The A-001 baseline, worst first by the length of the line:
 
 | boundary | quiet px | mean excess | longest run |
 | --- | --- | --- | --- |
 | `neck` \| `topwear` | 77 | 1.91 | 36 |
-| `back hair` \| `front hair` | 145 | 4.82 | 31 |
+| `back hair` \| `front hair` | 145 | 4.82 | 25 |
 | `face` \| `mouth` | 16 | 32.47 | 15 |
-| `back hair` \| `topwear` | 10 | 35.80 | 7 |
-| `back hair` \| `head_remainder` | 5 | 4.29 | 3 |
+| `back hair` \| `topwear` | 10 | 35.80 | 6 |
+| `body_remainder` \| `topwear` | 9 | 19.03 | 5 |
 
 The seam this was built for is now first, and the hair boundary that led the
-first ranking is last at 3 px. That progression is the point: the guard found
-something, the something turned out to be invisible when looked at, and the rule
-got sharper rather than the finding being waved away. The donor run ranks
-differently and sensibly -- `face | mouth` at 116 px and `face | nose` at 86,
-both around a mouth held wide open, which is the hardest thing in that picture
-to decompose.
+first ranking has fallen off the table entirely. That progression is the point:
+the guard found something, the something turned out to be invisible when looked
+at, and the rule got sharper rather than the finding being waved away. The donor
+run ranks differently and sensibly -- `face | mouth` at 115 px and `face | nose`
+at 86, both around a mouth held wide open, which is the hardest thing in that
+picture to decompose.
 
-`back hair | front hair` at 31 px is the one nobody has looked at yet.
+`back hair | front hair` at 25 px was looked at too, at 4x, and is a genuine
+borderline: two hair layers whose boundary sits at a local energy of 34 against
+the bar of 40. It is left in the table rather than tuned out of it.
 
 `--check` compares against `docs/seam_baseline.json` rather than an absolute
 bar. A bar set where we would like to be fails on the day it is written and

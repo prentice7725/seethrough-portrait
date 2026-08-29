@@ -2,6 +2,7 @@
   "20260829_144808_b89a16bd": {
     "run": "20260829_144808_b89a16bd",
     "step_threshold": 1.0,
+    "quiet_energy": 40.0,
     "seams": [
       {
         "pair": "neck | topwear",
@@ -10,7 +11,7 @@
         "mean_excess": 1.91,
         "p95_excess": 5.67,
         "max_excess": 12.44,
-        "over_threshold_px": 46,
+        "over_threshold_px": 43,
         "longest_run_px": 36,
         "band_residual": 2.23
       },
@@ -21,9 +22,9 @@
         "mean_excess": 4.82,
         "p95_excess": 9.79,
         "max_excess": 13.66,
-        "over_threshold_px": 92,
-        "longest_run_px": 31,
-        "band_residual": 3.59
+        "over_threshold_px": 59,
+        "longest_run_px": 25,
+        "band_residual": 3.64
       },
       {
         "pair": "face | mouth",
@@ -43,9 +44,9 @@
         "mean_excess": 35.8,
         "p95_excess": 113.6,
         "max_excess": 114.06,
-        "over_threshold_px": 7,
-        "longest_run_px": 7,
-        "band_residual": 35.19
+        "over_threshold_px": 5,
+        "longest_run_px": 6,
+        "band_residual": 33.55
       },
       {
         "pair": "body_remainder | topwear",
@@ -415,6 +416,7 @@
   "20260829_221038_3ae5fcef": {
     "run": "20260829_221038_3ae5fcef",
     "step_threshold": 1.0,
+    "quiet_energy": 40.0,
     "seams": [
       {
         "pair": "face | mouth",
@@ -423,8 +425,8 @@
         "mean_excess": 15.12,
         "p95_excess": 28.72,
         "max_excess": 37.48,
-        "over_threshold_px": 123,
-        "longest_run_px": 116,
+        "over_threshold_px": 122,
+        "longest_run_px": 115,
         "band_residual": 4.23
       },
       {
@@ -445,20 +447,9 @@
         "mean_excess": 8.61,
         "p95_excess": 16.57,
         "max_excess": 20.09,
-        "over_threshold_px": 92,
+        "over_threshold_px": 70,
         "longest_run_px": 28,
-        "band_residual": 3.96
-      },
-      {
-        "pair": "neck | topwear",
-        "boundary_px": 257,
-        "flat_px": 97,
-        "mean_excess": 0.97,
-        "p95_excess": 4.74,
-        "max_excess": 12.12,
-        "over_threshold_px": 25,
-        "longest_run_px": 16,
-        "band_residual": 1.65
+        "band_residual": 4.01
       },
       {
         "pair": "back hair | topwear",
@@ -467,9 +458,20 @@
         "mean_excess": 24.17,
         "p95_excess": 107.15,
         "max_excess": 108.85,
-        "over_threshold_px": 16,
+        "over_threshold_px": 14,
         "longest_run_px": 12,
-        "band_residual": 37.13
+        "band_residual": 37.77
+      },
+      {
+        "pair": "neck | topwear",
+        "boundary_px": 257,
+        "flat_px": 97,
+        "mean_excess": 0.97,
+        "p95_excess": 4.74,
+        "max_excess": 12.12,
+        "over_threshold_px": 17,
+        "longest_run_px": 10,
+        "band_residual": 1.84
       },
       {
         "pair": "body_remainder | topwear",

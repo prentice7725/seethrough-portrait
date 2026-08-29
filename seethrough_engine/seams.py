@@ -40,7 +40,8 @@ from PIL import Image
 __all__ = [
     "STEP_THRESHOLD",
     "FLAT_STEP",
-    "QUIET_ENERGY",
+    "QUIET_ENERGY_FACTOR",
+    "QUIET_ENERGY_FLOOR",
     "seam_report",
     "check_run",
     "load_baseline",
@@ -72,7 +73,24 @@ FLAT_STEP = 4.0
 # This is the guard correcting itself: it found something, the something turned
 # out to be invisible, and the rule got sharper rather than the finding being
 # waved away.
+#
+# Fixed rather than scaled to the picture's own median, which was tried and is
+# wrong in principle: masking is local, so a busy drawing must not raise the bar
+# for its own quiet parts. Scaled to the median, a picture that is loud
+# everywhere calls its loud regions quiet.
 QUIET_ENERGY = 40.0
+
+# A line has a direction. Along a real seam the composite is consistently darker
+# than the picture, or consistently lighter; along a boundary that merely has
+# noisy pixels the sign flips from one to the next -- measured on A-001's hair
+# boundary, +10.0, +10.5, -0.8, +1.7, -7.2. Only pixels agreeing with the
+# boundary's own dominant sign count, which is what separates a line from a
+# scatter of equally large errors.
+#
+# Magnitude does not separate them: ranked by error size over local activity,
+# the hair boundaries come first and the neck seam -- the one anybody actually
+# saw -- does not make the top eight.
+SIGN_AGREEMENT = True
 
 # `--check` compares against a recorded baseline rather than an absolute bar.
 # An absolute bar set where we would like to be fails on the day it is written
@@ -144,6 +162,8 @@ def seam_report(run_dir: str, *, step_threshold: float = STEP_THRESHOLD,
     energy = cv2.boxFilter(np.abs(cv2.Sobel(lo, cv2.CV_32F, 1, 0, ksize=3))
                            + np.abs(cv2.Sobel(lo, cv2.CV_32F, 0, 1, ksize=3)), -1, (7, 7))
     quiet = energy < quiet_energy
+    # Which way the composite is wrong at each pixel, for the sign test below.
+    residual = lc - lo
 
     seams: dict[tuple[int, int], dict[str, Any]] = {}
     height, width = owner.shape
@@ -166,11 +186,14 @@ def seam_report(run_dir: str, *, step_threshold: float = STEP_THRESHOLD,
             entry["excess"].append(float(excess[y, x]))
             entry.setdefault("flat", []).append(float(step_o[y, x]))
             entry.setdefault("quiet", []).append(bool(quiet[y, x]))
+            entry.setdefault("residual", []).append(float(residual[y, x]))
+            entry.setdefault("where", []).append((y, x))
             if entry["mask"] is None:
                 entry["mask"] = np.zeros((height, width), np.uint8)
             if (excess[y, x] > step_threshold and step_o[y, x] < flat_step
                     and quiet[y, x]):
-                entry["mask"][y, x] = 1
+                entry["candidate"] = entry.get("candidate", [])
+                entry["candidate"].append((y, x, float(residual[y, x])))
 
     rows = []
     for (i, j), entry in seams.items():
@@ -179,7 +202,16 @@ def seam_report(run_dir: str, *, step_threshold: float = STEP_THRESHOLD,
         flat &= np.array(entry["quiet"], bool)
         if values.size < 8:
             continue
+        # A line has a direction: only the pixels agreeing with the boundary's
+        # dominant sign are part of it.
         mask = entry["mask"]
+        candidates = entry.get("candidate", [])
+        if candidates:
+            signs = np.array([c[2] for c in candidates], np.float32)
+            dominant = 1.0 if float(np.median(signs)) >= 0 else -1.0
+            for y, x, value in candidates:
+                if (value >= 0) == (dominant >= 0):
+                    mask[y, x] = 1
         # The longest contiguous stretch of boundary that steps too far. This is
         # the figure the eye responds to; the mean is what an area metric sees.
         #
@@ -208,7 +240,8 @@ def seam_report(run_dir: str, *, step_threshold: float = STEP_THRESHOLD,
         })
     rows.sort(key=lambda r: (-r["longest_run_px"], -r["mean_excess"]))
     return {"run": os.path.basename(os.path.normpath(run_dir)),
-            "step_threshold": step_threshold, "seams": rows}
+            "step_threshold": step_threshold,
+            "quiet_energy": round(quiet_energy, 1), "seams": rows}
 
 
 def check_run(run_dir: str, baseline: dict[str, Any], *,
@@ -254,8 +287,9 @@ def write_baseline(path: str, run_dirs) -> dict[str, Any]:
 
 
 def _print(report, limit=8):
-    print(f"run {report['run']}   (counted where the original is flat and quiet "
-          f"and the composite steps {report['step_threshold']}+ luma more)")
+    print(f"run {report['run']}   (counted where the original steps under "
+          f"{FLAT_STEP} luma, its neighbourhood is under {report.get('quiet_energy')}, "
+          f"and the composite steps {report['step_threshold']}+ more)")
     print(f"  {'pair':34s} {'bound':>6s} {'flat':>6s} {'mean':>6s} {'p95':>6s} "
           f"{'max':>6s} {'over':>5s} {'longest':>8s} {'band mae':>9s}")
     for row in report["seams"][:limit]:
