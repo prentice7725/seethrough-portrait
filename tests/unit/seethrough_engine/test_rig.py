@@ -8,6 +8,7 @@ import numpy as np
 from seethrough_engine.rig import (
     BODY_REMAINDER,
     BODY_WEIGHT,
+    COLLAR_WEIGHT,
     EYE_SPLIT_TAGS,
     GROUP_BODY,
     GROUP_HEAD,
@@ -15,11 +16,15 @@ from seethrough_engine.rig import (
     HEAD_REMAINDER,
     HEAD_WEIGHT,
     NECK_REMAINDER,
+    RECLAIM_PAIRS,
     RIG_Z_ORDER,
     build_rig,
+    composite_fidelity,
+    composite_layers,
     depth_table,
     detect_anchors,
     group_for_tag,
+    reclaim_occluded,
     split_eyes,
     split_remainder,
     write_rig_project,
@@ -212,6 +217,19 @@ class BuildRigTests(unittest.TestCase):
         self.assertIn("eyewhiter", names)
         self.assertNotIn("eyewhite", names)  # would double-draw the eyes
 
+    def test_the_original_is_optional_and_changes_nothing_when_absent(self):
+        """Default behaviour must not move: without the original there is no
+        ground truth to resolve a contested pixel against."""
+        manifest, _ = build_rig(self.layers, frame_size=(CANVAS, CANVAS))
+        self.assertEqual(manifest["source"]["reclaimed"], {})
+
+    def test_passing_the_original_records_what_moved(self):
+        layers, original = contested_scene()
+        layers["face"] = rgba([(52, 20, 76, 52)])
+        manifest, _ = build_rig(layers, original_rgba=original,
+                                frame_size=(CANVAS, CANVAS))
+        self.assertEqual(set(manifest["source"]["reclaimed"]), {"topwear<-neck"})
+
     def test_remainder_regions_become_parts_in_their_own_groups(self):
         manifest, _ = build_rig(self.layers, body_remainder=self.remainder,
                                 frame_size=(CANVAS, CANVAS))
@@ -244,6 +262,44 @@ class BuildRigTests(unittest.TestCase):
         # neck and neck_remainder must share one gradient or they deform
         # differently along the seam between them.
         self.assertEqual(weights["neck"], weights[NECK_REMAINDER])
+
+    def test_the_neck_gradient_ends_exactly_on_the_head_and_the_body(self):
+        """These endpoints are not free parameters. A neck top below
+        HEAD_WEIGHT puts a step at the jaw, and a bottom that is not
+        BODY_WEIGHT puts one at the collar -- and with a stand collar hiding
+        three quarters of the neck, the jaw step is all you see."""
+        manifest, _ = build_rig(self.layers, frame_size=(CANVAS, CANVAS))
+        weights = {part["tag"]: part["weight"] for part in manifest["parts"]}
+        self.assertEqual(weights["neck"]["top"], HEAD_WEIGHT)
+        self.assertEqual(weights["neck"]["bottom"], BODY_WEIGHT)
+        self.assertEqual(weights["face"], {"mode": "constant", "value": HEAD_WEIGHT})
+
+    def test_a_collar_overlapping_the_neck_gets_a_ramp(self):
+        layers = dict(self.layers)
+        layers["topwear"] = rgba([(36, 66, 92, 124)])  # collar rides up over the neck
+        manifest, _ = build_rig(layers, frame_size=(CANVAS, CANVAS))
+        weights = {part["tag"]: part["weight"] for part in manifest["parts"]}
+        self.assertEqual(weights["topwear"]["mode"], "gradient_y")
+        self.assertEqual(weights["topwear"]["top"], COLLAR_WEIGHT)
+        self.assertEqual(weights["topwear"]["bottom"], BODY_WEIGHT)
+        # The ramp ends where the neck ends inside the torso, not at the hem.
+        self.assertEqual(weights["topwear"]["y_bottom"], 72.0)
+
+    def test_a_garment_clear_of_the_neck_stays_rigid(self):
+        """A low neckline is not a collar; ramping it would wobble the torso."""
+        layers = dict(self.layers)
+        layers["topwear"] = rgba([(36, 80, 92, 124)])
+        manifest, _ = build_rig(layers, frame_size=(CANVAS, CANVAS))
+        weights = {part["tag"]: part["weight"] for part in manifest["parts"]}
+        self.assertEqual(weights["topwear"], {"mode": "constant", "value": BODY_WEIGHT})
+
+    def test_gradient_parts_get_the_finer_mesh(self):
+        """At CANVAS=128 both cells clamp to the 8px floor, so this has to run
+        at a realistic size to say anything."""
+        big = {tag: np.kron(img, np.ones((6, 6, 1), np.uint8)) for tag, img in self.layers.items()}
+        manifest, _ = build_rig(big, frame_size=(CANVAS * 6, CANVAS * 6))
+        parts = {part["tag"]: part for part in manifest["parts"]}
+        self.assertLess(parts["neck"]["mesh"]["cell"], parts["face"]["mesh"]["cell"])
 
     def test_body_follows_the_head_a_little(self):
         manifest, _ = build_rig(self.layers, frame_size=(CANVAS, CANVAS))
@@ -291,6 +347,171 @@ class BuildRigTests(unittest.TestCase):
     def test_frame_size_is_required_when_nothing_has_content(self):
         with self.assertRaises(ValueError):
             build_rig({"face": np.zeros((CANVAS, CANVAS, 4), dtype=np.uint8)})
+
+
+class CompositeTests(unittest.TestCase):
+    """The gap these close: every coverage metric is alpha-only, and the
+    `reconstruction` diagnostic copies the original's RGB, so a layer that is
+    present and correctly shaped but the wrong colour scores as a clean PASS."""
+
+    def test_composite_reproduces_a_complete_stack(self):
+        layers = portrait_layers()
+        composite = composite_layers(layers, (CANVAS, CANVAS))
+        # Rebuild what the stack should look like: the frontmost layer wins.
+        expected = np.zeros((CANVAS, CANVAS, 4), np.uint8)
+        for tag in sorted(layers, key=lambda t: RIG_Z_ORDER.index(t)):
+            covered = layers[tag][..., 3] > 10
+            expected[covered] = layers[tag][covered]
+        np.testing.assert_array_equal(composite[..., 3] > 10, expected[..., 3] > 10)
+
+    def test_draw_order_decides_which_layer_shows(self):
+        back = rgba([(0, 0, 32, 32)], value=10)
+        front = rgba([(0, 0, 32, 32)], value=250)
+        composite = composite_layers({"face": front, "back hair": back}, (CANVAS, CANVAS))
+        self.assertGreater(int(composite[5, 5, 0]), 200)  # face is in front of back hair
+
+    def test_a_perfect_stack_scores_zero(self):
+        original = rgba([(0, 0, 64, 64)], value=200)
+        metrics = composite_fidelity(original, original, original[..., 3] > 10)
+        self.assertEqual(metrics["mae"], 0.0)
+        self.assertEqual(metrics["bad_ratio"], 0.0)
+
+    def test_a_dropped_feature_layer_shows_up(self):
+        """A missing `eyewhite` leaves skin where the sclera was: alpha coverage
+        is unchanged, so only an RGB comparison can see it."""
+        skin = rgba([(0, 0, 32, 32)], value=200)
+        white = rgba([(10, 10, 20, 20)], value=255)
+        original = composite_layers({"face": skin, "eyewhite": white}, (CANVAS, CANVAS))
+        without = composite_layers({"face": skin}, (CANVAS, CANVAS))
+        subject = original[..., 3] > 10
+        # Alpha is identical -- the coverage metrics would see nothing wrong.
+        np.testing.assert_array_equal(original[..., 3] > 10, without[..., 3] > 10)
+        metrics = composite_fidelity(original, without, subject)
+        self.assertGreater(metrics["bad_ratio"], 0.0)
+        self.assertGreater(metrics["mae"], 0.0)
+
+    def test_the_remainder_is_what_separates_the_two_figures(self):
+        """The rendered stack includes the recovered remainder; the semantic
+        layers alone do not. Scoring only the latter makes a remainder-heavy
+        run look catastrophic for a reason nobody ever sees on screen."""
+        skin = rgba([(0, 0, 32, 32)], value=200)
+        recovered = rgba([(40, 40, 60, 60)], value=120)
+        original = composite_layers({"face": skin, "body_remainder": recovered},
+                                    (CANVAS, CANVAS))
+        subject = original[..., 3] > 10
+        rendered = composite_fidelity(
+            original, composite_layers({"face": skin, "body_remainder": recovered},
+                                       (CANVAS, CANVAS)), subject)
+        semantic = composite_fidelity(
+            original, composite_layers({"face": skin}, (CANVAS, CANVAS)), subject)
+        # The rendered stack is exact; the semantic-only figure is wrong by
+        # precisely the share of the subject the remainder carries.
+        self.assertEqual(rendered["bad_ratio"], 0.0)
+        remainder_share = float((recovered[..., 3] > 10).sum()) / float(subject.sum())
+        self.assertAlmostEqual(semantic["bad_ratio"], remainder_share, places=4)
+
+    def test_empty_subject_is_not_a_division_by_zero(self):
+        blank = np.zeros((CANVAS, CANVAS, 4), np.uint8)
+        self.assertEqual(composite_fidelity(blank, blank, blank[..., 3] > 10)["subject_px"], 0)
+
+    def test_float_and_uint8_masks_are_both_accepted(self):
+        original = rgba([(0, 0, 64, 64)], value=200)
+        subject = original[..., 3]
+        self.assertEqual(composite_fidelity(original, original, subject)["subject_px"],
+                         int((subject > 127).sum()))
+        self.assertEqual(
+            composite_fidelity(original, original, subject.astype(np.float32) / 255.0)["subject_px"],
+            int((subject > 127).sum()))
+
+
+def contested_scene():
+    """A garment holding the skin from its own opening: `topwear` covers the
+    neck opaquely, and where it does it is painted a near-skin colour that is
+    not quite what the original shows. Returns `(layers, original)`."""
+    neck = rgba([(50, 50, 80, 95)], value=200)
+    topwear = rgba([(40, 60, 90, 124)], value=90)
+    topwear[60:88, 52:78, :3] = 205  # absorbed skin, close to the neck but off
+
+    original = np.zeros((CANVAS, CANVAS, 4), np.uint8)
+    original[..., 3] = 255
+    original[50:95, 50:80, :3] = 200          # neck
+    original[60:124, 40:90, :3] = 90          # garment over it
+    original[60:88, 52:78, :3] = 200          # ... except the opening: skin
+    return {"neck": neck, "topwear": topwear}, original
+
+
+class ReclaimOccludedTests(unittest.TestCase):
+    def test_the_garment_gives_back_the_skin_it_absorbed(self):
+        layers, original = contested_scene()
+        out, moved = reclaim_occluded(layers, original)
+        self.assertEqual(set(moved), {"topwear<-neck"})
+        self.assertGreater(moved["topwear<-neck"], 400)
+        # the opening is now a hole in the garment, so the neck shows through
+        self.assertFalse((out["topwear"][65:83, 57:73, 3] > 10).any())
+
+    def test_the_real_collar_is_left_alone(self):
+        """Where the garment genuinely covers the neck it explains the original
+        and must keep its pixels -- otherwise the collar turns into skin."""
+        layers, original = contested_scene()
+        out, _ = reclaim_occluded(layers, original)
+        self.assertTrue((out["topwear"][90:95, 55:75, 3] > 10).all())
+
+    def test_the_back_layer_is_never_modified(self):
+        layers, original = contested_scene()
+        out, _ = reclaim_occluded(layers, original)
+        np.testing.assert_array_equal(out["neck"], layers["neck"])
+
+    def test_only_alpha_moves_never_colour(self):
+        layers, original = contested_scene()
+        out, _ = reclaim_occluded(layers, original)
+        np.testing.assert_array_equal(out["topwear"][..., :3], layers["topwear"][..., :3])
+
+    def test_a_faithful_garment_is_a_no_op(self):
+        layers, original = contested_scene()
+        layers["topwear"][60:88, 52:78, :3] = 90
+        original[60:88, 52:78, :3] = 90
+        out, moved = reclaim_occluded(layers, original)
+        self.assertEqual(moved, {})
+        np.testing.assert_array_equal(out["topwear"], layers["topwear"])
+
+    def test_speckle_is_not_worth_moving(self):
+        """A scattering of single pixels is noise in the decomposition, not a
+        region the model mis-assigned."""
+        layers, original = contested_scene()
+        layers["topwear"][60:88, 52:78, :3] = 90
+        original[60:88, 52:78, :3] = 90
+        for y in range(62, 86, 6):
+            for x in range(54, 76, 6):
+                original[y, x, :3] = 200
+        _, moved = reclaim_occluded(layers, original)
+        self.assertEqual(moved, {})
+
+    def test_only_the_listed_pairs_are_contested(self):
+        """Other pairings were measured and rejected: `topwear` over `face` and
+        `head` over `face` made the composite worse, and `back hair` over
+        `head` moved 21k pixels for no measurable gain."""
+        self.assertEqual(RECLAIM_PAIRS, (("topwear", "neck"), ("neckwear", "neck")))
+        layers, original = contested_scene()
+        layers["face"] = layers.pop("neck")
+        out, moved = reclaim_occluded(layers, original)
+        self.assertEqual(moved, {})
+
+    def test_a_missing_layer_is_not_an_error(self):
+        _, moved = reclaim_occluded({"topwear": rgba([(0, 0, 32, 32)])},
+                                    np.zeros((CANVAS, CANVAS, 4), np.uint8))
+        self.assertEqual(moved, {})
+
+    def test_it_improves_how_well_the_stack_reproduces_the_original(self):
+        """The point of resolving the tie by measurement: it is checkable.
+        On A-001 this moved the composite from mae 18.74 to 17.54."""
+        layers, original = contested_scene()
+        subject = original[..., 3] > 10
+        before = composite_fidelity(
+            original, composite_layers(layers, (CANVAS, CANVAS)), subject)
+        out, _ = reclaim_occluded(layers, original)
+        after = composite_fidelity(
+            original, composite_layers(out, (CANVAS, CANVAS)), subject)
+        self.assertLess(after["mae"], before["mae"])
 
 
 class WriteRigProjectTests(unittest.TestCase):

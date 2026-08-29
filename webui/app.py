@@ -33,6 +33,8 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
+HEAD_RES_MATCH = "same as body"
+
 OUTPUT_ROOT = Path(__file__).resolve().parent / "outputs"
 # Opened straight from disk rather than served: the preview reads a run folder
 # through a directory picker, so it needs no server and works on an unzipped
@@ -107,6 +109,58 @@ def _ensure_rgba(image: np.ndarray) -> np.ndarray:
     return arr
 
 
+def _prepare_subject_image(image_rgba: np.ndarray, has_provided_mask: bool,
+                           key_background: bool, log) -> np.ndarray:
+    """Make sure the upload carries a real subject matte, keying a flat
+    background into alpha when it does not.
+
+    The image models in this workflow cannot emit RGBA, so a portrait arrives
+    opaque on a solid background. `resolve_subject_mask` would catch that, but
+    only after a full diffusion pass, and the failure is visible in the upload
+    alone: an opaque region filling its own bounding box is padding, not a
+    matte. Left to run, the Silhouette Guard takes the whole rectangle as the
+    subject and recovers the *background* into body_remainder, which surfaces
+    as a REWORK verdict blaming layer quality for an input problem.
+    """
+    from portrait_core import PortraitConfig
+    from portrait_core.masks import bbox_fill_ratio
+    from seethrough_engine import matting
+
+    alpha_cfg = PortraitConfig.load().section("alpha")
+    threshold = float(alpha_cfg["binary_threshold"]) * 255.0
+    fill = bbox_fill_ratio(image_rgba[..., 3] > threshold)
+    if fill < float(alpha_cfg["informative_bbox_fill_max"]):
+        return image_rgba  # already has a usable matte
+
+    if has_provided_mask:
+        return image_rgba  # the mask supplies what the alpha does not
+
+    if not key_background:
+        raise gr.Error(
+            f"This image has no subject matte: its opaque area fills {fill:.1%} of its "
+            "bounding box, so the alpha channel is just padding. Tick "
+            "\"Flat background to alpha\", upload a transparent-background PNG, or "
+            "supply a subject mask (white = subject)."
+        )
+
+    found = matting.detect_flat_background(image_rgba)
+    if not found["flat"]:
+        raise gr.Error(
+            f"Cannot key this background: {found['reason']}. Flat-background keying "
+            "needs one solid colour behind the subject. Use a transparent PNG or "
+            "supply a subject mask instead."
+        )
+
+    keyed, info = matting.key_flat_background(image_rgba)
+    log(f"Keyed a flat background rgb{tuple(info['color'])}: "
+        f"{info['border_share']:.0%} of the border, spread {info['border_std']}, "
+        f"{info['foreground_ratio']:.1%} of the canvas kept, "
+        f"{info['soft_edge_px']} anti-aliased edge pixels")
+    for warning in info["warnings"]:
+        log(f"  keying note: {warning}")
+    return keyed
+
+
 def _verdict_badge(verdict: str) -> str:
     color = VERDICT_COLORS.get(verdict, "#6b7280")
     return (
@@ -143,6 +197,8 @@ def run_a001(
     spine_depth_order,
     export_rig,
     rig_hair_gradient,
+    key_background,
+    head_resolution,
     progress=gr.Progress(track_tqdm=True),
 ):
     if image is None:
@@ -167,9 +223,6 @@ def run_a001(
         progress(progress_state["value"], desc=msg)
 
     try:
-        progress(0.05, desc="Loading model...")
-        pipeline = _get_pipeline(model_name)
-
         image_rgba = _ensure_rgba(image)
         provided_mask = None
         if subject_mask is not None:
@@ -177,13 +230,22 @@ def run_a001(
             if mask_arr.ndim == 3:
                 mask_arr = mask_arr[..., 0]
             provided_mask = mask_arr.astype(np.float32) / (255.0 if mask_arr.max() > 1.0 else 1.0)
+        # Before the model load, not after the diffusion pass.
+        image_rgba = _prepare_subject_image(
+            image_rgba, provided_mask is not None, bool(key_background), _log)
 
+        progress(0.05, desc="Loading model...")
+        pipeline = _get_pipeline(model_name)
+
+        head_px = int(resolution) if head_resolution == HEAD_RES_MATCH else int(head_resolution)
+        _log(f"Diffusing: body {int(resolution)}px, head {head_px}px")
         progress(0.15, desc="Running diffusion + Silhouette Guard (this is the slow part)...")
         result = run_portrait_pipeline(
             pipeline,
             image_rgba,
             seed=int(seed),
             resolution=int(resolution),
+            head_resolution=None if head_resolution == HEAD_RES_MATCH else int(head_resolution),
             num_inference_steps=int(num_inference_steps),
             enable_head_detail=bool(enable_head_detail),
             auto_fill=bool(auto_fill),
@@ -217,6 +279,19 @@ def run_a001(
             spine_info = manifest["spine"]
             _log(f"Spine project ({spine_info['order']} order): "
                  f"{len(spine_info['slots'])} slots -> {spine_info['json']}")
+        fid = manifest.get("composite") or {}
+        if fid:
+            sem = fid.get("semantic_only") or {}
+            _log(f"Layer composite vs original: mae {fid['mae']:.2f}, "
+                 f"{fid['bad_ratio']:.2%} of subject pixels off by >30 "
+                 f"(semantic layers alone: mae {sem.get('mae', float('nan')):.2f}, "
+                 f"{sem.get('bad_ratio', 0):.2%})")
+            if fid["bad_ratio"] > 0.03:
+                _log("WARNING: the rendered stack does not reproduce the original. "
+                     "A feature layer is probably missing or miscoloured -- check "
+                     "the composite_error diagnostic. Coverage metrics are "
+                     "alpha-only and cannot see this.")
+
         if manifest.get("rig"):
             rig_info = manifest["rig"]
             _log(f"Rig manifest ({rig_info['depth']} depth): {len(rig_info['parts'])} parts, "
@@ -286,6 +361,17 @@ def build_app() -> gr.Blocks:
                     type="numpy",
                     image_mode="RGBA",
                 )
+                key_bg_in = gr.Checkbox(
+                    label="Flat background to alpha",
+                    value=True,
+                    info=(
+                        "For images from a model that cannot emit RGBA: detects a "
+                        "solid background colour and keys it out, estimating "
+                        "fractional alpha on anti-aliased edges so hair does not "
+                        "keep a coloured rim. Skipped when the upload already has "
+                        "a real matte."
+                    ),
+                )
                 subject_mask_in = gr.Image(
                     label="Subject mask (optional, white = subject) -- for opaque backgrounds",
                     type="numpy",
@@ -303,6 +389,20 @@ def build_app() -> gr.Blocks:
                     resolution_in = gr.Slider(
                         label="Resolution", minimum=512, maximum=2048, step=64, value=1280
                     )
+                head_res_in = gr.Dropdown(
+                    label="Head detail resolution",
+                    choices=[HEAD_RES_MATCH, "640", "768", "1024", "1280"],
+                    value=HEAD_RES_MATCH,
+                    info=(
+                        "The v3 head pass re-diffuses a crop of the head on its own "
+                        "square canvas, and its size is what decides whether the fine "
+                        "facial layers resolve: on A-001, 512 returns no eyewhite and "
+                        "the layers composite to mae 15.1, while 768 returns it at "
+                        "11.9. Set this to 768 with a 512 body to keep the detail "
+                        "without paying for a full-resolution body pass. Peak VRAM "
+                        "follows the larger of the two."
+                    ),
+                )
                 steps_in = gr.Slider(
                     label="Inference steps", minimum=1, maximum=100, step=1, value=30
                 )
@@ -374,7 +474,8 @@ def build_app() -> gr.Blocks:
             inputs=[
                 image_in, model_in, seed_in, resolution_in, steps_in,
                 head_detail_in, guard_in, autofill_in, subject_mask_in,
-                spine_in, spine_depth_in, rig_in, rig_hair_in,
+                spine_in, spine_depth_in, rig_in, rig_hair_in, key_bg_in,
+                head_res_in,
             ],
             outputs=[
                 verdict_out, coverage_out, reasons_out,

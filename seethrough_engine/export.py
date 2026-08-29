@@ -84,7 +84,46 @@ def save_portrait_run(output_dir: str, base_name: str, result: PortraitPipelineR
         Image.fromarray(guard.body_remainder).save(os.path.join(output_dir, remainder_filename))
         diagnostics["body_remainder"] = remainder_filename
 
+    # Every coverage metric in the report is computed on alpha, so a layer that
+    # is present and correctly shaped but the wrong colour scores as well as a
+    # right one -- and `reconstruction` above cannot show it either, since it
+    # copies the original's RGB. Compositing the layers and diffing against the
+    # original is what makes a dropped feature (a missing `eyewhite` leaving
+    # skin where the sclera was) visible at all. Numpy-only, no GPU, no model.
+    #
+    # Composite the *rendered* stack, semantic layers plus the recovered
+    # remainder, because that is what the exporters and the rig preview draw.
+    # Scoring the semantic layers alone makes every remainder-heavy run look
+    # catastrophic for a reason nobody will ever see: on run
+    # 20260829_134652 -- 18.6% remainder -- semantic-only reads mae 112.9 while
+    # what actually renders is 18.7. The semantic-only figure is still worth
+    # keeping alongside, as the measure of how much the remainder is propping
+    # the picture up.
+    subject_mask = guard.subject_mask
+    stack = dict(result.layer_dict)
+    stack.update(rig_export.split_remainder(guard.body_remainder, result.layer_dict))
+
+    composite = rig_export.composite_layers(stack, result.fullpage.shape[:2])
+    composite_filename = f"{base_name}_layer_composite.png"
+    Image.fromarray(composite).save(os.path.join(output_dir, composite_filename))
+    diagnostics["layer_composite"] = composite_filename
+
+    fidelity = rig_export.composite_fidelity(result.fullpage, composite, subject_mask)
+    fidelity["semantic_only"] = rig_export.composite_fidelity(
+        result.fullpage,
+        rig_export.composite_layers(result.layer_dict, result.fullpage.shape[:2]),
+        subject_mask,
+    )
+
+    error = np.abs(result.fullpage[..., :3].astype(np.int32)
+                   - composite[..., :3].astype(np.int32)).sum(axis=2)
+    error_filename = f"{base_name}_composite_error.png"
+    Image.fromarray(np.clip(error, 0, 255).astype(np.uint8), mode="L").save(
+        os.path.join(output_dir, error_filename))
+    diagnostics["composite_error"] = error_filename
+
     report = dict(result.report)
+    report["composite"] = fidelity
     report["source"] = {**report.get("source", {}), "filename": source_filename}
     report["artifacts"] = {"original": original_filename, "layers": dict(layer_files), **diagnostics}
     report_filename = f"{base_name}_portrait_report.json"
@@ -95,7 +134,8 @@ def save_portrait_run(output_dir: str, base_name: str, result: PortraitPipelineR
     if export_spine:
         parts = spine_export.rename_parts(
             spine_export.layers_to_parts(
-                result.layer_dict, body_remainder=result.guard.body_remainder,
+                result.layer_dict, original_rgba=result.fullpage,
+            body_remainder=result.guard.body_remainder,
                 depth_dict=depth_dict,
             )
         )
@@ -114,7 +154,8 @@ def save_portrait_run(output_dir: str, base_name: str, result: PortraitPipelineR
     rig_manifest: dict[str, Any] = {}
     if export_rig:
         rig_dict, rig_images = rig_export.build_rig(
-            result.layer_dict, body_remainder=result.guard.body_remainder,
+            result.layer_dict, original_rgba=result.fullpage,
+            body_remainder=result.guard.body_remainder,
             depth_dict=depth_dict, frame_size=result.fullpage.shape[:2],
             gradient_tags=rig_gradient_tags, run_id=os.path.basename(output_dir),
             tag_version=str(report.get("source", {}).get("tag_version", "")),
@@ -126,6 +167,7 @@ def save_portrait_run(output_dir: str, base_name: str, result: PortraitPipelineR
             "parts": [part["name"] for part in rig_dict["parts"]],
             "anchors": sorted(rig_dict["anchors"]),
             "depth": rig_dict["source"]["depth"],
+            "reclaimed": rig_dict["source"]["reclaimed"],
         }
 
     manifest = {
@@ -137,6 +179,7 @@ def save_portrait_run(output_dir: str, base_name: str, result: PortraitPipelineR
         "layers": layer_files,
         "diagnostics": diagnostics,
         "report": report_filename,
+        "composite": fidelity,
         "verdict": report["verdict"],
         "recovery_verdict": report["recovery_verdict"],
         "reasons": report["reasons"],

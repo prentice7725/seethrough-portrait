@@ -4,6 +4,7 @@
     "presence_threshold": 0.04,
     "binary_threshold": 0.062745,
     "informative_transparency_min": 0.005,
+    "informative_bbox_fill_max": 0.97,
     "subject_area_min": 0.02,
     "subject_area_max": 0.98,
     "layer_presence_ratio_min": 0.001
