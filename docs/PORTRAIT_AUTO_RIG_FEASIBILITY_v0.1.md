@@ -227,7 +227,11 @@ Exactly four, matching the fork plan's M4 wording:
    between the rotated and the rest projection, so at slider 0 -- and at any
    slider value with the head at rest -- the render is bit-identical to the
    parallax rig, and the slider isolates the turn's shape from its amount.
-2. **Head tilt (Z), +/-2 degrees**, rotating about `neck_pivot`.
+2. **Head tilt (Z), +/-2 degrees**, rotating about `neck_pivot`. Unlike the
+   turn it cannot open a seam: it rotates about the pivot scaled by the same
+   weight field the rig is built on, so parts sharing a weight turn rigidly
+   together and the single gradient stays continuous. That asymmetry is why
+   idle caps the turn and not the tilt.
 3. **Breathing.** One continuous vertical displacement field, not a per-group
    transform: full lift above the chest line, falling linearly to zero at
    `body_pivot`, plus a slight ribcage widening. Giving the head a translation
@@ -453,9 +457,11 @@ region where hair-dark pixels turn skin-light:
 
 Up to 0.8 the reveal stays scattered along edges; between 0.8 and 1.0 it merges
 into one coherent gash down the temple. `DEFAULT_MOTION.head_turn.max_x` is now
-0.8, and the preview's idle animation scales by the manifest's limits rather
-than by constants of its own, so idle motion can never be what discovers the
-edge. The manual sliders still reach +/-1.5, which is what found it.
+0.8. Scaling idle by that limit was the first answer and not enough of one: the
+reveal does not *begin* at 0.8, it merges there, and idle plays unattended. So
+idle is capped at 0.3 -- below where 1027 px of scattered edge become one 3275
+px gash -- whatever the manifest allows. The manual sliders still reach +/-1.5,
+which is what found the edge.
 
 The nature of the failure is worth recording, because it revises H1 rather than
 confirming it. Our layers **are** occlusion-complete -- the `face` layer is
@@ -561,6 +567,121 @@ geometrically continuous and still read as a mask deforming. The blend is
 therefore a slider defaulting to 0, and `DEFAULT_MOTION.head_turn.max_x` stays
 at the parallax rig's 0.8 until someone has watched the shell turn on a GPU.
 
+**2026-08-29 -- the lines were edge alpha, and it can be solved rather than
+voted on.** Watching the rig move turned up strokes the portrait does not have:
+a heavy one under the jaw, a faint one where the neck meets the garment, and --
+after the first attempt at fixing them -- a second contour below the chin that
+read as a double chin.
+
+All three are the same quantity. A layer's edge alpha decides how much of it
+shows against what is behind, and it is the one number the decomposition has no
+way to check. Where `face` ends at the chin its last rows composite to luma 80
+and 162 against an original of 223 and 225: too much of a rim the picture does
+not have. Where the neck meets the garment the two alphas sum to 1.64 and one
+row darkens by 4: too much of both. Where `head` fades out over two rows while
+the original's chin contour fills both, the composite renders 77 and 141 for a
+line that should be 109 and 109: too little.
+
+The first attempt only ever removed alpha -- a margin-qualified handover to
+whatever was behind, `reclaim_occluded` generalized to every boundary. It fixed
+the jaw's rim and could not fix the other two, because they need alpha *raised*.
+`rig.fit_edge_alpha` solves for it instead: the front layer over what is behind
+has to equal the original, which is one linear equation per pixel in the
+coverage, so `a = ((O - B) . (F - B)) / |F - B|^2`, clamped, and taken only
+where the two colours differ enough for the answer to mean anything.
+
+| | composite mae | bad ratio |
+| --- | --- | --- |
+| raw layers | 18.30 | 8.57% |
+| after `reclaim_occluded` | 17.02 | 7.48% |
+| ... and `fit_edge_alpha` | **15.87** | **6.44%** |
+
+The second run moves the same way, 15.07 to 13.63 and 6.84% to 5.59%. Across
+the whole jaw-and-neck window the worst step the composite has and the original
+does not falls from 10.8 luma to 1.7, which is the noise floor. What remains is
+a colour error rather than a coverage one: the garment's flat 230 against the
+original's 227 below the collar, which no alpha can fix.
+
+**A layer that is all edge is exempt, and finding that out cost a regression.**
+Applied to every layer the refit also ate the nose and the mouth, which faded
+visibly: a stroke has no interior, so the whole of it falls in the band, and an
+antialiased dark line over skin reads as coverage that should be lower. The
+share of a layer deeper than the band tells the two kinds apart -- `mouth` 0%,
+`eyebrow` 2%, `eyelash` 13%, `nose` 15%, against `face` 94%, `head` 94%,
+`topwear` 97% -- and the bar is three quarters, the conservative reading, since
+an open mouth is a surface in one run and a stroke in the next.
+
+The lesson is the one the composite metric cannot teach on its own: mae fell
+while the picture got worse, because a fading nose is a small number of pixels
+and a wrong jaw stroke is a small number of pixels, and only one of them is the
+thing anyone looks at. The metric guards the change; it does not choose it.
+
+Old runs pick all of this up without the GPU pass that made them, since stages
+A-D read `{tag: full-canvas RGBA}` and nothing else:
+`python -m seethrough_engine.rig <run dir>`.
+
+**2026-08-29 -- the line across the neck was colour, not coverage.** After the
+edge alpha was solved, one line survived: a step where `neck` hands over to
+`topwear`, running across the neck exactly along their boundary.
+
+It was not a seam in the usual sense. Every generated layer carries a small
+constant colour bias against the original, and each one a different bias --
+`topwear` 8/4/5 bright, `ears` 6/7/6, `back hair` 3/4/3, `face` 1/3/2 dark.
+Alone that is invisible; nobody sees a garment three levels too bright. Where
+two layers meet, the difference between their biases is a step, and a step
+along a boundary is a line.
+
+`body_remainder` measures exactly 0, which is the check that the measurement
+means what it says: it is the original's own pixels, and the only layer in the
+stack that was not generated.
+
+`rig.fit_layer_tone` takes one constant out of each layer, measured where that
+layer is the topmost thing visible so it is judged on pixels it is responsible
+for, and capped, since a layer with little showing has little to fit against.
+It is the one place the pipeline changes a layer's colour rather than its alpha.
+
+| | composite mae | bad ratio |
+| --- | --- | --- |
+| raw layers | 18.30 | 8.57% |
+| after `reclaim_occluded` | 17.02 | 7.48% |
+| ... and `fit_edge_alpha` | 15.87 | 6.44% |
+| ... and `fit_layer_tone` | **9.47** | **5.20%** |
+
+The bias was the largest single error in the composite, and nothing in the rig
+had been looking for it. The second run lands in the same place, 9.23 and 5.17%.
+
+One constant per layer was not enough, because a layer covers more than one
+material: `topwear` is a white shirt beside the neck and a beige cardigan
+everywhere else, and fitting both at once leaves its residual at 0 overall and
++6 red at the seam -- which is the line, still there.
+
+**The correction has to be a function of colour**, and two other families were
+tried first to find that out. A low-frequency field over *position* fixes the
+seam and absorbs real shading elsewhere (mae 9.99 against 9.47). A gain and
+offset over *brightness* is worse still: a straight line fitted across a layer
+holding both a dark outline and bright cloth moves the outline, and `bad_ratio`
+goes from 5.2% to 20%. A constant per colour cluster moves neither, and cannot
+introduce a new step by construction -- two pixels of similar colour get similar
+corrections. Measured across the whole subject, the worst row-step the composite
+has and the original does not is unchanged by clustering (10.6 luma at the brow,
+which is a different problem), while mae falls again:
+
+| | composite mae | bad ratio |
+| --- | --- | --- |
+| one constant per layer | 9.47 | 5.20% |
+| one per material, k up to 8 | **8.84** | **5.14%** |
+
+Materials found per layer on A-001: 8 for `topwear`, `face`, `neck` and the
+hair, 6 for `ears`, 3 for `eyewhite` and `irides` -- a cluster smaller than 150
+px falls back to the layer's own constant, which is what keeps a small layer
+from being fitted to noise. The shift is applied to hidden pixels too: it is the
+same cloth, and a turn may bring it into view.
+
+The line is now 1 to 2 luma with a worst step of 1.8, against 4.4 and a
+persistent 3 before. What is left is the limit of a per-material constant, and
+going further means changing what the decomposition is allowed to do rather than
+how its output is corrected.
+
 ## Out of scope
 
 Deferred deliberately, not forgotten:
@@ -589,6 +710,60 @@ Deferred deliberately, not forgotten:
    appears past it is named.
 5. The milestone ends with a written verdict -- viable, conditionally viable,
    or not viable -- per the fork plan's Phase 2 wording.
+
+## Verdict
+
+**Conditionally viable.** Portrait Mode's layers drive a pseudo-2.5D talking
+portrait well enough to build on, and the conditions are known and measurable
+rather than vague.
+
+Against the acceptance list:
+
+1. **Met.** `rig_manifest.json` comes out of an A-001 run with no manual layer
+   editing, and `python -m seethrough_engine.rig <run dir>` rebuilds it for a
+   run made before any of this existed.
+2. **Met, four of four.** Head turn, tilt, breathing and blink all run in the
+   preview, plus a mouth that opens and an ellipsoid shell turn.
+3. **Answered by construction.** The remainder is split by nearest owner, so
+   `head_remainder` travels with the head; the preview keeps the fault as a
+   toggle rather than a memory. It was confirmed by eye in the preview, not by
+   a number, which is the weakest of the five answers here.
+4. **Met.** 0.8 on the parallax path, and the artifact is named: not a hole but
+   correctly-painted content wrongly exposed, merging into one gash down the
+   temple between 0.4 and 0.6. Idle is capped at 0.3, below where it merges.
+5. This section.
+
+Hypothesis by hypothesis:
+
+| # | Answer |
+| --- | --- |
+| H1 | **Revised, not confirmed.** The layers *are* occlusion-complete -- `face` is eyeless skin, `head` a full skull -- so a turn never opens a hole. It exposes correctly-painted content that should still be covered, and the limit is how far one layer overhangs the next. |
+| H2 | **Yes, by construction**, and reproducible on demand through the toggle. |
+| H3 | **Not decidable from a still.** The three neck modes differ by up to 11 px at maximum turn, but the weight multiplies a head transform, so at rest they are identical. The gradient's justification is continuity at its two seams, which is verified by construction: its endpoints *are* the head and body weights. |
+| H4 | **Yes** on A-001. Connected-component splitting gave a working left and right eye, and each winks independently. |
+| H5 | **Unanswered.** Both runs used the fixed depth table; Marigold was never exercised against it. The table was never the limiting factor, which is weak evidence for its sufficiency and not a test of it. |
+| H6 | **Yes.** At equal apparent turn the largest revealed region falls from 4866 px to 1090 at turnX 1.0, and the merge event between 0.4 and 0.6 does not happen at all. The cost is that hair layers sharing a shell no longer parallax against each other. |
+
+**The conditions.** A run has to pass the Silhouette Guard cleanly -- wherever
+`body_remainder` carries the picture, H1's premise is false by construction --
+and it has to contain the feature layers a blink needs, which the verdict does
+not currently check (the PASS run with no `eyewhite` at all). A real closed eye
+and open mouth need a donor image; the rig can only squash what it was given.
+
+**What was not asked for and turned out to matter most.** The rig is the first
+thing in this fork that made decomposition faults *visible*. Every seam it
+showed was already in the composite metric, unnoticed: a layer's edge alpha
+fitted against nothing, a per-layer colour bias nobody was looking for. Chasing
+them took the composite from mae 18.30 to 9.21 and `bad_ratio` from 8.57% to
+5.42% -- on layers the model had already produced, with no GPU pass. A rig that
+animates is the deliverable; a rig that *renders* turned out to be the better
+diagnostic, and `python -m seethrough_engine.rig` exists so old runs get the
+benefit.
+
+**Where it stops being feasibility.** Hair strand physics, a mouth synthesized
+rather than donated, per-region colour fitting beyond one constant per material,
+and Spine bone emission are all real work with known shapes, and all of them are
+Phase 3 questions rather than Phase 2 ones.
 
 ## Algorithm references
 

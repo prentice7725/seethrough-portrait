@@ -316,7 +316,76 @@ Mode의 고정 태그 순서를 쓰고, depth 순서를 켜면 Marigold를 돌�
 [`webui/README.md`](webui/README.md)와
 [`docs/M2_IMPLEMENTATION_SPEC.md`](docs/M2_IMPLEMENTATION_SPEC.md)에 있습니다.
 
+## 2.5D 리그 프리뷰 (M4)
+
+Portrait Mode의 레이어로 **자동 리그**를 만들어 브라우저에서 움직여봅니다.
+Spine도 Live2D도 본 계층도 없습니다 -- 정점 가중치와 매니페스트 한 장뿐입니다.
+목처럼 위는 머리를, 아래는 몸을 따라가야 하는 부위는 본 두 개로 표현하기
+어렵지만, 가중치 그래디언트로는 두 줄입니다.
+
+- 실행하면 `{base}_rig_manifest.json`과 `rig/images/`가 나옵니다 (webui 체크박스,
+  기본 켜짐).
+- [`webui/rig_preview/index.html`](webui/rig_preview/index.html)을 열고 run 폴더를
+  고르면 애니메이션됩니다 -- 고개 돌리기·기울이기, 호흡, 눈깜빡임, 그리고
+  타원체 셸 회전. 서버가 필요 없고 `file://`에서 그대로 돌아갑니다.
+- 예전에 만든 런도 GPU 없이 다시 리깅할 수 있습니다:
+  `python -m seethrough_engine.rig <run 디렉터리>`. 스테이지 A~D는
+  `{태그: 풀캔버스 RGBA}` 말고는 읽는 게 없고, 그 레이어들은 리포트 옆에 이미
+  있으니까요.
+
+### 표정 팩
+
+**감은 눈과 벌린 입은 분해가 만들어낼 수 없는 그림입니다.** A-001의 `mouth`는
+다문 입이고 감은 눈은 아예 없습니다. 이미지 모델이 그린 것을 쓰되, **초상이
+아니라 도너로** 씁니다 -- 바뀐 영역만 가져오고 나머지는 전부 원본 픽셀입니다.
+그게 예전 모듈러 시도가 실패한 지점(생성물이 얼굴선까지 바꿔버림)과의 차이입니다.
+
+```bash
+# 도너 이미지에서 바뀐 영역만 회수 (GPU 불필요)
+python -m seethrough_engine.expression <run> eye_closed=<png> mouth_open=<png>
+
+# 또는 도너를 따로 분해해서 그 레이어를 이식 -- 매트가 모델이 그린 것이라 더 깨끗
+python -m seethrough_engine.expression <run> --from-run <도너 run> eye_closed mouth_open
+```
+
+도너의 크롭이 달라도 됩니다(실루엣으로 정합). 무엇을 다시 칠해도 되는지는
+**레이어가 정합니다** -- 최상단이 얼굴의 피부나 피처인 픽셀만 가져오므로, 다르게
+그려진 머리카락이 딸려오지 않습니다. 프리뷰에서 `Use expression art`를 끄면
+예전 방식(속눈썹 압축 블링크)으로 돌아가 나란히 비교할 수 있습니다.
+
+### 합성 충실도
+
+리그를 그려보니 **분해의 결함이 처음으로 눈에 보였습니다.** 셋 다 이미 합성
+지표에 있었지만 아무도 보고 있지 않았습니다:
+
+| | 무엇 | 왜 보이나 |
+| --- | --- | --- |
+| `reclaim_occluded` | 옷과 목이 다투는 픽셀 | 옷이 제 여밈 사이 피부를 들고 있어 목이 거의 안 보임 |
+| `fit_edge_alpha` | 레이어 경계 알파를 원본에 맞춰 풂 | 턱 밑에 없던 검은 획, 이중턱 |
+| `fit_layer_tone` | 레이어별·재질별 색 치우침 | 두 레이어가 만나는 곳의 계단 = 목을 가로지르는 선 |
+
+composite mae **18.30 → 9.21**, bad ratio **8.57% → 5.42%**. 전부 모델이 이미
+내놓은 레이어에서, GPU 패스 없이.
+
+설계와 측정 기록은
+[`docs/PORTRAIT_AUTO_RIG_FEASIBILITY_v0.1.md`](docs/PORTRAIT_AUTO_RIG_FEASIBILITY_v0.1.md)에
+있습니다. M4의 결론은 **조건부 가능**입니다.
+
 ## 이 Fork의 변경 이력
+
+### v1.4.0.dev4 — Portrait Mode M4: 2.5D 리그와 표정 팩
+
+- **자동 2.5D 리그** — `seethrough_engine/rig.py`가 Portrait Mode 레이어에서
+  `rig_manifest.json`을 만듭니다. 본 계층 대신 정점 가중치(목은 위가 머리를,
+  아래가 몸을 따라가는 그래디언트), remainder의 영역별 분할, 좌우 눈 분리,
+  알파에서 뽑은 앵커.
+- **브라우저 프리뷰** — `webui/rig_preview/index.html`. 고개 돌리기·기울이기,
+  호흡, 눈깜빡임, 타원체 셸 회전. 서버 없이 `file://`에서 동작.
+- **표정 팩** — `seethrough_engine/expression.py`. 생성 이미지를 초상이 아니라
+  도너로 써서 눈·입만 회수하거나, 도너를 따로 분해해 그 레이어를 이식.
+- **합성 충실도** — 리그를 그려보니 드러난 결함들: 경합 픽셀 반환, 경계 알파
+  풀이, 재질별 색 치우침 보정. mae 18.30 → 9.21, bad 8.57% → 5.42%.
+- **`python -m seethrough_engine.rig <run>`** — 예전 런도 GPU 없이 다시 리깅.
 
 ### v1.4.0.dev3 — 독립 실행 웹UI Spine 내보내기
 
@@ -419,6 +488,7 @@ Portrait Mode의 전체 설계/구현 기록:
 - [`docs/M1_IMPLEMENTATION_SPEC.md`](docs/M1_IMPLEMENTATION_SPEC.md) — Portrait Mode 핵심 계약과 verdict 규칙
 - [`docs/TEST_PROTOCOL_A001.md`](docs/TEST_PROTOCOL_A001.md) — 두 진입점 모두가 검증받는 A-001 검증 절차
 - [`docs/M2_IMPLEMENTATION_SPEC.md`](docs/M2_IMPLEMENTATION_SPEC.md) — 독립 실행 웹UI 계약, `nodes.py`와 무엇을 왜 공유하는지, 8GB 카드에서의 VRAM 측정치와 재현 방법
+- [`docs/PORTRAIT_AUTO_RIG_FEASIBILITY_v0.1.md`](docs/PORTRAIT_AUTO_RIG_FEASIBILITY_v0.1.md) — M4: 자동 2.5D 리그, 브라우저 프리뷰, 표정 팩, 그리고 그 과정에서 드러난 합성 충실도 문제들의 측정 기록
 
 ## 감사의 말
 

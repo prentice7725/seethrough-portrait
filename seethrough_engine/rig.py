@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from collections.abc import Collection
 from typing import Any
 
@@ -47,10 +48,13 @@ __all__ = [
     "detect_anchors",
     "RECLAIM_PAIRS",
     "reclaim_occluded",
+    "fit_layer_tone",
+    "fit_edge_alpha",
     "composite_layers",
     "composite_fidelity",
     "build_rig",
     "write_rig_project",
+    "rebuild_run_rig",
 ]
 
 GROUP_HEAD = "head"
@@ -144,6 +148,65 @@ RECLAIM_MIN_AREA_AT_768 = 200
 # rather than stopping at a hard edge. Sub-pixel motion across a hard, jagged
 # alpha cut is what made the seam glitter once per breath.
 RECLAIM_FEATHER_PX = 1.0
+
+# The same question at every layer's own boundary rather than between one named
+# pair, and answered by solving rather than by voting. A layer's edge alpha is
+# the one number the decomposition has no way to check: it decides how much of
+# the layer shows against what is behind, and the original says exactly what
+# that mixture should be. Where `face` ends at the chin its last rows composite
+# to luma 80 and 162 against an original of 223 and 225 -- too much of a rim
+# that should barely show. Where the neck meets the garment the two alphas sum
+# to 1.64 and one row darkens -- too much of both. Where `head` fades out over
+# two rows while the original's chin contour fills both, there is too little.
+#
+# So: a = ((O - B) . (F - B)) / |F - B|^2, the least-squares coverage that makes
+# the front layer over what is behind equal the original. Clamped to [0, 1], and
+# taken only where the two differ enough for the answer to mean anything.
+EDGE_BAND_PX = 3          # how far inside the boundary to refit
+EDGE_OUTSIDE_PX = 1       # ... and how far outside, since an edge can be short
+EDGE_MIN_CONTRAST = 25    # per channel, below which the solve is noise
+
+# A layer that is all edge is an outline, and an outline is *meant* to be dark.
+# The share of a layer lying deeper than the band separates the two kinds: on
+# A-001 `mouth` is 0% interior, `eyebrow` 2%, `eyelash` 13%, `nose` 15%, against
+# `face` 94%, `head` 94%, `topwear` 97%. Refitting the first kind thins the
+# stroke until the feature fades, which is the opposite of the fix.
+#
+# Three quarters rather than a half is the conservative reading of the same
+# rule: an open mouth is a surface in one run and a stroke in the next.
+EDGE_MIN_INTERIOR = 0.75
+
+# Every generated layer carries a small constant colour bias against the
+# original, and each one a different bias: on A-001 `topwear` is 8/4/5 bright,
+# `ears` 6/7/6, `back hair` 3/4/3, while `face` is 1/3/2 dark. Where two of them
+# meet, the difference between their biases is a step, which is what draws a
+# line across the neck exactly where `neck` hands over to `topwear`.
+#
+# `body_remainder` measures 0, which is the check on this: it is the original's
+# own pixels, and it is the only layer that is not generated.
+#
+# One constant per layer, fitted where the layer is the topmost thing visible,
+# and capped -- a layer with little showing has little to fit against.
+# ... and one constant is not enough, because a layer covers more than one
+# material: `topwear` is a white shirt beside the neck and a beige cardigan
+# everywhere else, and fitting both at once leaves its residual at 0 overall and
+# +6 red at the seam -- which is the line, still there. So the bias is fitted per
+# *material*, found by clustering the layer's own colours, which is exactly what
+# flat anime shading gives up easily.
+#
+# Two families were tried and rejected first, and both failed for the same
+# reason: the correction has to be a function of colour, not of position or
+# brightness. A low-frequency field over position fixes the seam and absorbs
+# real shading elsewhere (mae 9.99 against 9.47). A gain-and-offset over
+# brightness is worse still -- a straight line fitted across a layer that holds
+# both a dark outline and bright cloth moves the outline, and bad_ratio goes
+# from 5.2% to 20%. A constant per colour cluster moves neither: two pixels of
+# similar colour get similar corrections, so no new step can appear between
+# them, and measurably none does.
+TONE_MIN_SAMPLE = 300
+TONE_MAX_SHIFT = 16
+TONE_CLUSTERS = 8       # at most; a layer with fewer materials uses fewer
+TONE_MIN_CLUSTER = 150  # ... and a cluster this small falls back to the layer's
 
 MANIFEST_VERSION = "0.1"
 RIG_SUBDIR = "rig"
@@ -574,6 +637,168 @@ def reclaim_occluded(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarra
     return out, moved
 
 
+def fit_layer_tone(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarray, *,
+                   order: tuple[str, ...] = RIG_Z_ORDER,
+                   alpha_threshold: int = 200,
+                   min_sample: int = TONE_MIN_SAMPLE,
+                   max_shift: int = TONE_MAX_SHIFT,
+                   clusters: int = TONE_CLUSTERS,
+                   min_cluster: int = TONE_MIN_CLUSTER,
+                   ) -> tuple[dict[str, np.ndarray], dict[str, list[list[int]]]]:
+    """Take each layer's constant colour bias out of it.
+
+    A generated layer is a little off from the picture it was decomposed from,
+    and every layer is off by a different amount. Alone that is invisible --
+    nobody can see a garment three levels too bright. Together it is a seam:
+    where two layers meet, the difference between their biases is a step, and a
+    step along a boundary is a line. On A-001 that is the line across the neck,
+    where `neck` at +1 hands over to `topwear` at -8.
+
+    The bias is measured where a layer is the topmost thing visible, so it is
+    compared against pixels it is actually responsible for, and it is capped,
+    because a layer with little showing has little to fit against.
+
+    This is the one place the pipeline changes a layer's colour rather than its
+    alpha. `body_remainder` measures 0 and stays untouched, which is the check
+    that the measurement means what it says: it is the original's own pixels,
+    and the only layer here that was not generated.
+    """
+    original = np.asarray(original_rgba)[..., :3].astype(np.int16)
+    canvas_h, canvas_w = original.shape[:2]
+
+    def rank(tag: str) -> int:
+        return order.index(tag) if tag in order else -1
+
+    tags = sorted(layer_dict, key=rank)
+    owner = np.full((canvas_h, canvas_w), -1, np.int16)
+    for index, tag in enumerate(tags):
+        owner[np.asarray(layer_dict[tag])[..., 3] > alpha_threshold] = index
+
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
+    out: dict[str, np.ndarray] = {}
+    shifts: dict[str, list[list[int]]] = {}
+    for index, tag in enumerate(tags):
+        layer = np.asarray(layer_dict[tag])
+        visible = owner == index
+        sample = int(visible.sum())
+        if sample < min_sample:
+            out[tag] = layer
+            continue
+
+        source = layer[..., :3][visible].astype(np.float32)
+        target = original[visible].astype(np.float32)
+        whole = np.clip(np.median(target - source, axis=0), -max_shift, max_shift)
+
+        # One constant per material, and the materials are found by clustering
+        # the layer's own colours -- flat anime shading separates them easily.
+        count = max(1, min(clusters, sample // min_cluster))
+        if count > 1:
+            _, labels, centres = cv2.kmeans(source, count, None, criteria, 3,
+                                            cv2.KMEANS_PP_CENTERS)
+            labels = labels.ravel()
+        else:
+            labels = np.zeros(sample, np.int32)
+            centres = source.mean(axis=0, keepdims=True)
+        fitted = np.stack([
+            np.clip(np.median(target[labels == c] - source[labels == c], axis=0),
+                    -max_shift, max_shift)
+            if int((labels == c).sum()) >= min_cluster else whole
+            for c in range(count)]).astype(np.float32)
+
+        if not np.any(np.abs(fitted) >= 1):
+            out[tag] = layer
+            continue
+
+        # Every pixel of the layer takes the shift of the material it belongs
+        # to, including the ones currently hidden: they are the same cloth, and
+        # a turn may bring them into view.
+        flat = layer[..., :3].reshape(-1, 3).astype(np.float32)
+        nearest = ((flat[:, None, :] - centres[None, :, :]) ** 2).sum(axis=2).argmin(axis=1)
+        patched = np.array(layer, copy=True)
+        patched[..., :3] = np.clip(flat + fitted[nearest], 0, 255
+                                   ).reshape(layer.shape[0], layer.shape[1], 3).astype(np.uint8)
+        out[tag] = patched
+        shifts[tag] = [[int(v) for v in row] for row in fitted]
+
+    return out, shifts
+
+
+def fit_edge_alpha(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarray, *,
+                   order: tuple[str, ...] = RIG_Z_ORDER,
+                   alpha_threshold: int = 10, band: int = EDGE_BAND_PX,
+                   outside: int = EDGE_OUTSIDE_PX,
+                   min_contrast: int = EDGE_MIN_CONTRAST,
+                   min_interior: float = EDGE_MIN_INTERIOR,
+                   ) -> tuple[dict[str, np.ndarray], dict[str, int]]:
+    """Refit each layer's edge alpha so the stack matches the original there.
+
+    `reclaim_occluded` asks which of two layers owns a contested pixel. This
+    asks a narrower question of every layer at its own boundary -- *how much* of
+    it shows -- and the original answers it: the front layer composited over
+    what is behind has to equal the picture, which is one linear equation per
+    pixel in the coverage.
+
+    The solve runs in both directions, which is why it replaces trimming. Where
+    a layer's outermost rows are painted toward an outline the picture does not
+    have, the coverage comes back near zero and the rim goes. Where a layer's
+    alpha ramp is narrower than the line it draws -- the chin, where `head`
+    fades over two rows while the original's contour fills both -- it comes back
+    higher and the line is whole. Where two layers overlap and their alphas sum
+    past one, both are pulled down.
+
+    Only alpha changes, only within a few pixels of a boundary, and only where
+    the front and what is behind differ enough for the answer to mean anything.
+    A layer that is mostly boundary is skipped: it is an outline, and an outline
+    is meant to be dark.
+    """
+    original = np.asarray(original_rgba)[..., :3].astype(np.float32)
+    canvas_h, canvas_w = original.shape[:2]
+    out = dict(layer_dict)
+    moved: dict[str, int] = {}
+
+    def rank(tag: str) -> int:
+        return order.index(tag) if tag in order else -1
+
+    beneath_rgb = np.zeros((canvas_h, canvas_w, 3), np.float32)
+    beneath_a = np.zeros((canvas_h, canvas_w, 1), np.float32)
+
+    for tag in sorted(out, key=rank):
+        layer = np.asarray(out[tag])
+        alpha = layer[..., 3].astype(np.float32) / 255.0
+        solid = (layer[..., 3] > alpha_threshold).astype(np.uint8)
+        if solid.any() and beneath_a.any():
+            distance = cv2.distanceTransform(solid, cv2.DIST_L2, 3)
+            interior = float((distance > band).sum()) / max(float(solid.sum()), 1.0)
+            if interior >= min_interior:
+                edge = (solid > 0) & (distance <= band)
+                if outside > 0:
+                    grown = cv2.dilate(solid, np.ones((2 * outside + 1,) * 2, np.uint8))
+                    edge |= (grown > 0) & (solid == 0)
+                edge &= beneath_a[..., 0] > 0.5
+
+                delta = layer[..., :3].astype(np.float32) - beneath_rgb
+                denominator = (delta * delta).sum(axis=2)
+                # Two layers the same colour: the coverage cannot be recovered
+                # and does not matter, since either answer draws the same pixel.
+                solvable = edge & (denominator > 3.0 * float(min_contrast) ** 2)
+                if solvable.any():
+                    fitted = np.clip(((original - beneath_rgb) * delta).sum(axis=2)
+                                     / np.maximum(denominator, 1e-6), 0.0, 1.0)
+                    updated = np.where(solvable, fitted, alpha)
+                    changed = int((np.abs(updated - alpha) > 0.05).sum())
+                    if changed:
+                        moved[tag] = changed
+                    layer = np.array(layer, copy=True)
+                    layer[..., 3] = np.rint(updated * 255.0).astype(np.uint8)
+                    out[tag] = layer
+
+        a = np.clip(layer[..., 3:4].astype(np.float32) / 255.0, 0.0, 1.0)
+        beneath_rgb = beneath_rgb * (1.0 - a) + layer[..., :3].astype(np.float32) * a
+        beneath_a = np.clip(beneath_a + a, 0.0, 1.0)
+
+    return out, moved
+
+
 def composite_layers(layer_dict: dict[str, np.ndarray], frame_size: tuple[int, int], *,
                      order: tuple[str, ...] = RIG_Z_ORDER,
                      alpha_threshold: int = 10) -> np.ndarray:
@@ -721,9 +946,14 @@ def build_rig(layer_dict: dict[str, np.ndarray], *,
     # hides the neck almost completely, and the remainder split below reads the
     # group unions this changes.
     reclaimed: dict[str, int] = {}
+    tone_fit: dict[str, list[int]] = {}
+    edge_fit: dict[str, int] = {}
     if original_rgba is not None:
         working, reclaimed = reclaim_occluded(working, original_rgba,
                                               alpha_threshold=alpha_threshold)
+        working, tone_fit = fit_layer_tone(working, original_rgba)
+        working, edge_fit = fit_edge_alpha(working, original_rgba,
+                                           alpha_threshold=alpha_threshold)
 
     # Stage B: remainder next, so the eye split and the anchors below see the
     # same layer set the manifest will describe.
@@ -802,6 +1032,8 @@ def build_rig(layer_dict: dict[str, np.ndarray], *,
             "tag_version": tag_version,
             "depth": "marigold" if depth_dict else "table",
             "reclaimed": reclaimed,
+            "tone_fit": tone_fit,
+            "edge_fit": edge_fit,
         },
         "anchors": anchors,
         "parts": parts,
@@ -829,3 +1061,70 @@ def write_rig_project(output_dir: str, base_name: str, manifest: dict[str, Any],
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
     return manifest_path
+
+
+def rebuild_run_rig(run_dir: str, *, gradient_tags: Collection[str] = ()) -> str:
+    """Rebuild a finished run's rig from the layers it already wrote.
+
+    Stages A-D read `{tag: full-canvas RGBA}` and nothing else, and every one of
+    those layers is on disk beside the report. So a run made before a fix to the
+    remainder split, the weights or `reclaim_occluded` can pick that fix up
+    without the GPU pass that produced it -- which matters because the visible
+    faults in a rig are usually found long after the run that made it.
+
+    Overwrites `{base}_rig_manifest.json` and the part PNGs under `rig/images/`.
+    An expression pack attached to the old manifest does not survive and has to
+    be attached again; `expression.attach_to_run` and `transplant_to_run` both
+    take a run directory, so that is one command.
+    """
+    names = [f for f in os.listdir(run_dir) if f.endswith("_manifest.json")
+             and not f.endswith("_rig_manifest.json")]
+    if not names:
+        raise FileNotFoundError(f"no run manifest in {run_dir}")
+    with open(os.path.join(run_dir, names[0]), encoding="utf-8") as f:
+        run = json.load(f)
+    base_name = run["base"]
+
+    def read(filename):
+        path = os.path.join(run_dir, filename)
+        return np.array(Image.open(path).convert("RGBA")) if os.path.isfile(path) else None
+
+    layer_dict = {tag: read(name) for tag, name in run["layers"].items()}
+    layer_dict = {tag: img for tag, img in layer_dict.items() if img is not None}
+    if not layer_dict:
+        raise FileNotFoundError(f"none of the run's layer PNGs are in {run_dir}")
+    original = read(run.get("original", f"{base_name}_original.png"))
+    remainder = read(f"{base_name}_body_remainder.png")
+
+    # `report` in the run manifest is the report's *filename*, not its contents.
+    report = {}
+    report_name = run.get("report")
+    if isinstance(report_name, str) and os.path.isfile(os.path.join(run_dir, report_name)):
+        with open(os.path.join(run_dir, report_name), encoding="utf-8") as f:
+            report = json.load(f)
+    elif isinstance(report_name, dict):
+        report = report_name
+
+    manifest, images = build_rig(
+        layer_dict, original_rgba=original, body_remainder=remainder,
+        frame_size=(run["height"], run["width"]),
+        gradient_tags=gradient_tags,
+        run_id=os.path.basename(os.path.normpath(run_dir)),
+        tag_version=str(report.get("source", {}).get("tag_version", "")),
+    )
+    return write_rig_project(run_dir, base_name, manifest, images)
+
+
+def main(argv=None) -> int:
+    """`python -m seethrough_engine.rig <run dir>` -- rebuild a run's rig from
+    its own layers, with the current code."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if len(argv) != 1:
+        print(main.__doc__, file=sys.stderr)
+        return 2
+    print(rebuild_run_rig(argv[0]))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -6,6 +6,8 @@ import unittest
 import numpy as np
 
 from seethrough_engine.rig import (
+    fit_edge_alpha,
+    fit_layer_tone,
     BODY_REMAINDER,
     BODY_WEIGHT,
     EYE_SPLIT_TAGS,
@@ -53,6 +55,165 @@ def portrait_layers():
         "neck": rgba([(58, 56, 70, 72)]),
         "topwear": rgba([(36, 72, 92, 124)]),
     }
+
+
+class ToneFitTests(unittest.TestCase):
+    """Every generated layer is a little off from the picture, and each by a
+    different amount. Alone that is invisible; where two meet it is a line."""
+
+    def scene(self, garment_bias=8, neck_bias=-2, base=200):
+        """A neck above a garment, meeting at y=60: the two layers each carry
+        their own bias and their boundary is where it shows."""
+        original = np.zeros((CANVAS, CANVAS, 4), dtype=np.uint8)
+        original[20:110, 20:110, :3] = base
+        original[20:110, 20:110, 3] = 255
+        garment = np.zeros_like(original)
+        garment[60:110, 20:110, :3] = base + garment_bias
+        garment[60:110, 20:110, 3] = 255
+        neck = np.zeros_like(original)
+        neck[20:60, 20:110, :3] = base + neck_bias
+        neck[20:60, 20:110, 3] = 255
+        return original, {"topwear": garment, "neck": neck}
+
+    def test_each_layer_s_bias_is_measured_and_removed(self):
+        original, layers = self.scene()
+        out, shifts = fit_layer_tone(layers, original)
+        self.assertTrue(all(row == [-8, -8, -8] for row in shifts["topwear"]))
+        self.assertTrue(all(row == [2, 2, 2] for row in shifts["neck"]))
+        self.assertEqual(int(out["topwear"][80, 60, 0]), 200)
+        self.assertEqual(int(out["neck"][30, 60, 0]), 200)
+
+    def test_the_step_where_they_meet_goes_with_it(self):
+        original, layers = self.scene()
+        before = abs(int(layers["neck"][59, 60, 0]) - int(layers["topwear"][61, 60, 0]))
+        out, _ = fit_layer_tone(layers, original)
+        after = abs(int(out["neck"][59, 60, 0]) - int(out["topwear"][61, 60, 0]))
+        self.assertEqual(before, 10)
+        self.assertLessEqual(after, 1)
+
+    def test_a_layer_that_already_matches_is_left_alone(self):
+        original, layers = self.scene(garment_bias=0, neck_bias=0)
+        _, shifts = fit_layer_tone(layers, original)
+        self.assertEqual(shifts, {})
+
+    def test_a_layer_with_almost_nothing_showing_is_not_fitted(self):
+        original, layers = self.scene()
+        speck = np.zeros_like(layers["neck"])
+        speck[30:32, 30:32, :3] = 10
+        speck[30:32, 30:32, 3] = 255
+        layers["mouth"] = speck
+        _, shifts = fit_layer_tone(layers, original)
+        self.assertNotIn("mouth", shifts)
+
+    def test_the_shift_is_capped(self):
+        original, layers = self.scene(garment_bias=40, base=120)
+        _, shifts = fit_layer_tone(layers, original)
+        self.assertTrue(all(row == [-16, -16, -16] for row in shifts["topwear"]))
+
+    def test_one_layer_covering_two_materials_gets_a_constant_for_each(self):
+        """`topwear` is a white shirt beside the neck and a cardigan everywhere
+        else. One constant fits neither, and the misfit is a line at the seam."""
+        original = np.zeros((CANVAS, CANVAS, 4), dtype=np.uint8)
+        original[20:110, 20:110, :3] = 120          # cardigan
+        original[20:50, 20:110, :3] = 230           # shirt
+        original[20:110, 20:110, 3] = 255
+        garment = np.zeros_like(original)
+        garment[20:110, 20:110, :3] = 120 + 2       # each material off by its own
+        garment[20:50, 20:110, :3] = 230 - 9
+        garment[20:110, 20:110, 3] = 255
+        out, shifts = fit_layer_tone({"topwear": garment}, original)
+        self.assertGreaterEqual(len(shifts["topwear"]), 2)
+        self.assertAlmostEqual(int(out["topwear"][80, 60, 0]), 120, delta=1)
+        self.assertAlmostEqual(int(out["topwear"][30, 60, 0]), 230, delta=1)
+
+    def test_a_hidden_part_of_a_material_is_corrected_with_the_rest_of_it(self):
+        """It is the same cloth, and a turn may bring it into view."""
+        original, layers = self.scene()
+        hidden = np.zeros_like(layers["topwear"])
+        hidden[60:110, 20:110] = layers["topwear"][60:110, 20:110]
+        hidden[115:120, 20:110, :3] = 208           # off-canvas-subject, same cloth
+        hidden[115:120, 20:110, 3] = 255
+        out, _ = fit_layer_tone({"topwear": hidden, "neck": layers["neck"]}, original)
+        self.assertLess(int(out["topwear"][117, 60, 0]), 208)
+
+    def test_only_colour_moves_and_alpha_does_not(self):
+        original, layers = self.scene()
+        out, _ = fit_layer_tone(layers, original)
+        for tag in layers:
+            self.assertTrue(np.array_equal(out[tag][..., 3], layers[tag][..., 3]))
+
+
+class EdgeFitTests(unittest.TestCase):
+    """A layer's edge alpha decides how much of it shows against what is behind,
+    and the original says what that mixture should be."""
+
+    def scene(self, rim=(20, 20, 20)):
+        original = np.zeros((CANVAS, CANVAS, 4), dtype=np.uint8)
+        original[20:100, 20:100, :3] = 220
+        original[20:100, 20:100, 3] = 255
+        back = np.zeros_like(original)
+        back[20:100, 20:100, :3] = 220          # the layer behind is right
+        back[20:100, 20:100, 3] = 255
+        front = np.zeros_like(original)
+        # Big enough to be a surface rather than a stroke: 60x60 is 81% interior.
+        front[25:85, 25:85, :3] = 218
+        front[25:85, 25:85, 3] = 255
+        for d in range(3):                      # ... and dark at its own edge
+            front[25 + d, 25:85, :3] = rim
+            front[84 - d, 25:85, :3] = rim
+            front[25:85, 25 + d, :3] = rim
+            front[25:85, 84 - d, :3] = rim
+        return original, {"neck": back, "face": front}
+
+    def test_a_rim_the_picture_does_not_have_is_faded_out(self):
+        original, layers = self.scene()
+        out, moved = fit_edge_alpha(layers, original)
+        self.assertGreater(moved.get("face", 0), 100)
+        self.assertLess(int(out["face"][26, 50, 3]), 128)
+
+    def test_the_layer_s_interior_is_untouched(self):
+        original, layers = self.scene()
+        out, _ = fit_edge_alpha(layers, original)
+        self.assertEqual(int(out["face"][50, 50, 3]), 255)
+
+    def test_an_edge_that_matches_the_original_is_left_alone(self):
+        original, layers = self.scene(rim=(218, 218, 218))
+        out, moved = fit_edge_alpha(layers, original)
+        self.assertEqual(moved, {})
+        self.assertEqual(int(out["face"][26, 50, 3]), 255)
+
+    def test_an_edge_that_shows_too_little_is_raised(self):
+        """The other direction, which is why this replaces trimming: the chin,
+        where the layer fades over two rows and the original's contour fills
+        both."""
+        original, layers = self.scene()
+        original[26, 25:85, :3] = 20            # the picture's line is solid here
+        layers["face"][26, 25:85, 3] = 100      # ... but the layer only half shows
+        out, _ = fit_edge_alpha(layers, original)
+        self.assertGreater(int(out["face"][26, 50, 3]), 200)
+
+    def test_a_layer_that_is_all_edge_is_left_alone(self):
+        """A stroke -- a mouth line, a lash, a nose -- is an outline, and an
+        outline is meant to be dark. Refitting one thins it until it fades."""
+        original, layers = self.scene()
+        stroke = np.zeros_like(layers["face"])
+        stroke[48:52, 30:70, :3] = (20, 20, 20)     # four pixels tall: no interior
+        stroke[48:52, 30:70, 3] = 255
+        layers["mouth"] = stroke
+        out, moved = fit_edge_alpha(layers, original)
+        self.assertNotIn("mouth", moved)
+        self.assertEqual(int(out["mouth"][49, 50, 3]), 255)
+
+    def test_nothing_changes_where_there_is_nothing_behind(self):
+        original, layers = self.scene()
+        _, moved = fit_edge_alpha({"face": layers["face"]}, original)
+        self.assertEqual(moved, {})
+
+    def test_no_layer_s_colour_is_altered(self):
+        original, layers = self.scene()
+        out, _ = fit_edge_alpha(layers, original)
+        for tag in layers:
+            self.assertTrue(np.array_equal(out[tag][..., :3], layers[tag][..., :3]))
 
 
 class GroupTests(unittest.TestCase):

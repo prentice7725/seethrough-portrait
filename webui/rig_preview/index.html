@@ -85,7 +85,9 @@
   <h2>Idle</h2>
   <label class="row"><input type="checkbox" id="autoIdle"> Auto idle motion</label>
   <p class="hint">Off by default: the page opens on the rest pose, so what you
-     see first is the decomposition rather than the animation.</p>
+     see first is the decomposition rather than the animation. Idle turns no
+     further than &plusmn;0.3, which is below where the reveal along an edge
+     merges into one tear; the sliders reach 1.5 for finding that.</p>
   <label class="row"><input type="checkbox" id="doBlink" checked> Blink</label>
   <label class="row"><input type="checkbox" id="doBreathe" checked> Breathing</label>
   <label>Breath <span class="val" id="breathAmpv">3.0px</span>
@@ -103,6 +105,16 @@
     <button id="blinkNow">Blink</button>
   </div>
   <p class="hint">Wink buttons exercise the left/right eye split (H4).</p>
+
+  <h2>Expression pack</h2>
+  <div class="meta" id="packmeta">no pack in this run</div>
+  <label class="row"><input type="checkbox" id="useArt" checked> Use expression art</label>
+  <p class="hint">Off falls back to the v0.1 blink: the lash squashed onto the
+     lid line. On, a recovered closed eye owns the eye while it is shut. This
+     is the comparison M4.1 exists to make.</p>
+  <label class="row"><input type="checkbox" id="doTalk"> Talk</label>
+  <label>Mouth open <span class="val" id="mouthOpenv">0.00</span>
+    <input type="range" id="mouthOpen" min="0" max="1" step="0.01" value="0"></label>
 
   <h2>Head</h2>
   <label>Turn X <span class="val" id="turnXv">0.00</span>
@@ -149,6 +161,18 @@
 const TURN_BASE = 0.015;   // every head part moves at least this much
 const TURN_SPAN = 0.045;   // ... plus this much more the nearer it is
 const TURN_Y_SCALE = 0.7;  // vertical parallax reads stronger, so damp it
+
+// How far the idle loop may turn, whatever the manifest allows.
+//
+// The manifest's `max_x` is the point past which the rig visibly tears, and
+// scaling idle by it was the first answer and not enough of one: the reveal
+// does not begin there, it merges there. Counted on A-001, the largest
+// contiguous region a turn exposes is 584 px of scattered edge at 0.2 and
+// 1027 at 0.4, and somewhere between 0.4 and 0.6 those merge into one gash
+// down the temple -- 3275 px at 0.6. Idle plays unattended and must not be
+// what discovers that, so it stays below where the merge begins. The sliders
+// reach 1.5, which is what found it.
+const IDLE_TURN = 0.3;
 const CHEST_WIDEN = 0.004; // ribcage expansion, as a fraction of chest width
 
 // Ellipsoid shell (H6), read from Anime2.5DRig's 3D-shell mode. Depth parallax
@@ -216,6 +240,26 @@ const LID_LINE_RATIO = 0.85;
 // Which layer defines the eye opening the lid closes onto, best first.
 const EYE_OPENING_TAGS = ["eyewhite", "irides", "eyes"];
 
+// An expression pack (M4.1) carries drawings the decomposition cannot produce:
+// a shut eye, an open mouth. Where one exists it *owns* the feature while it is
+// showing, and the parts it stands in for fade out under it.
+//
+// The crossfade is short and centred on the half-closed pose. A long dissolve
+// shows an open eye and a shut one at the same time, which reads as a ghost; an
+// instant swap pops. The open eye keeps squashing until the art has taken over,
+// so the lid is still seen coming down rather than the eye simply changing.
+const SWAP_LO = 0.35;
+const SWAP_HI = 0.65;
+
+/** Who draws a feature at a given amount of closing, and how far the layers
+ *  being replaced are still squashed. With no art this is the v0.1 rig exactly:
+ *  the lash squash is the blink. */
+function expressionSwap(amount, hasArt) {
+  if (!hasArt) return { art: 0, base: 1, squash: amount };
+  const art = smoothstep(SWAP_LO, SWAP_HI, amount);
+  return { art, base: 1 - art, squash: Math.min(amount, SWAP_HI) };
+}
+
 const VERT_SRC = `
 attribute vec2 a_pos;
 attribute vec2 a_uv;
@@ -232,10 +276,11 @@ const FRAG_SRC = `
 precision mediump float;
 uniform sampler2D u_tex;
 uniform float u_wire;
+uniform float u_alpha;
 varying vec2 v_uv;
 void main() {
   if (u_wire > 0.5) { gl_FragColor = vec4(0.43, 0.66, 1.0, 0.5); return; }
-  gl_FragColor = texture2D(u_tex, v_uv);
+  gl_FragColor = texture2D(u_tex, v_uv) * vec4(1.0, 1.0, 1.0, u_alpha);
 }`;
 
 const state = {
@@ -245,6 +290,8 @@ const state = {
   canvasW: 0, canvasH: 0,
   turnX: 0, turnY: 0, tiltDeg: 0, shell: 0,
   blink: { l: 0, r: 0 },
+  mouthOpen: 0, talkUntil: 0, talkTarget: 0,
+  art: { l: null, r: null, mouth: null },
   blinkTimer: 0, blinkPhase: null,
   canMipmap: false,
   collarOverride: null,   // null = use whatever the manifest baked in
@@ -290,6 +337,16 @@ document.addEventListener("drop", async (e) => {
   loadFromFiles(files);
 });
 
+/** Every image the manifest names, as [name, spec]: the rig's parts plus the
+ *  expression pack's, which live in their own block so a run without one loads
+ *  exactly as it did before. */
+function allParts(manifest) {
+  const out = manifest.parts.map((p) => [p.name, p]);
+  const pack = (manifest.expressions || {}).parts || {};
+  for (const [name, entry] of Object.entries(pack)) out.push([name, entry]);
+  return out;
+}
+
 function pathOf(file) {
   return (file._path || file.webkitRelativePath || file.name).replace(/\\/g, "/");
 }
@@ -319,10 +376,10 @@ async function loadFromFiles(files) {
   };
   const missing = [];
   const images = new Map();
-  for (const part of manifest.parts) {
+  for (const [name, part] of allParts(manifest)) {
     const file = find(part.image);
     if (!file) { missing.push(part.image); continue; }
-    images.set(part.name, await createImageBitmap(file));
+    images.set(name, await createImageBitmap(file));
   }
   if (missing.length) {
     errEl.textContent = "Missing part images:\n" + missing.join("\n");
@@ -337,12 +394,16 @@ const fromQuery = new URLSearchParams(location.search).get("manifest");
 if (fromQuery) {
   (async () => {
     try {
-      const manifest = await (await fetch(fromQuery)).json();
+      // `no-store` throughout: a run directory is rewritten in place, and a
+      // cached layer beside a fresh manifest renders an artifact that was
+      // fixed hours ago -- which is worse than no preview at all, because it
+      // looks like a finding.
+      const manifest = await (await fetch(fromQuery, { cache: "no-store" })).json();
       const base = fromQuery.slice(0, fromQuery.lastIndexOf("/") + 1);
       const images = new Map();
-      for (const part of manifest.parts) {
-        const blob = await (await fetch(base + part.image)).blob();
-        images.set(part.name, await createImageBitmap(blob));
+      for (const [name, part] of allParts(manifest)) {
+        const blob = await (await fetch(base + part.image, { cache: "no-store" })).blob();
+        images.set(name, await createImageBitmap(blob));
       }
       build(manifest, images);
       dropEl.classList.add("hidden");
@@ -510,6 +571,7 @@ function initGL(canvas) {
       canvas: gl.getUniformLocation(prog, "u_canvas"),
       tex: gl.getUniformLocation(prog, "u_tex"),
       wire: gl.getUniformLocation(prog, "u_wire"),
+      alpha: gl.getUniformLocation(prog, "u_alpha"),
     },
   };
 }
@@ -560,7 +622,28 @@ function build(manifest, images) {
 
   state.shells = fitShells(manifest.parts);
 
-  state.parts = manifest.parts.slice().sort((a, b) => a.z - b.z).map((part) => {
+  // An expression sprite is placed by the parts it stands in for: their front
+  // z, their nearest depth, and -- the point -- *their* weight, so it moves
+  // exactly as the feature it is covering rather than as a new tag that
+  // happened to land in the head group.
+  const byName = new Map(manifest.parts.map((p) => [p.name, p]));
+  const packEntries = Object.entries((manifest.expressions || {}).parts || {});
+  const expressionSpecs = packEntries.map(([name, entry]) => {
+    const replaced = (entry.replaces || []).map((n) => byName.get(n)).filter(Boolean);
+    const front = replaced.length
+      ? replaced.reduce((a, b) => (a.z > b.z ? a : b)) : null;
+    return {
+      name, tag: name, image: entry.image, xyxy: entry.xyxy, group: "head",
+      depth: entry.depth != null ? entry.depth : front ? front.depth : 0.5,
+      z: entry.z != null ? entry.z : front ? front.z + 0.5 : 99,
+      weight: front ? front.weight : { mode: "constant", value: 1.0 },
+      mesh: { cell: 42 },
+      expression: { kind: entry.kind, side: entry.side, replaces: entry.replaces || [] },
+    };
+  });
+
+  state.parts = manifest.parts.concat(expressionSpecs)
+      .sort((a, b) => a.z - b.z).map((part) => {
     const mesh = buildMesh(part);
     const isEye = EYE_TAGS.has(part.tag);
     // Only eye parts get a side: plenty of other tags end in 'l' or 'r'
@@ -578,6 +661,8 @@ function build(manifest, images) {
       // strength is the one weight in the manifest that is a taste call.
       isCollar: part.group === "body" && part.weight.mode === "gradient_y",
       isLid: LID_TAGS.has(part.tag),
+      expression: part.expression || null,
+      replacedBy: null,
       // The shell is a model of a head, so the torso does not ride it: a
       // vertex below the ellipse would only be squeezed toward the head's axis.
       // Anime2.5DRig gives the body its own cylinder; that is a separate
@@ -590,6 +675,21 @@ function build(manifest, images) {
       openBottom: box[3],
     };
   });
+
+  // Who owns which feature. A pack part answers to one key; the parts it
+  // stands in for answer to the same one, so a single number drives both sides
+  // of the fade and they cannot disagree about how far it has got.
+  state.art = { l: null, r: null, mouth: null };
+  for (const p of state.parts) {
+    if (!p.expression) continue;
+    const key = p.expression.kind === "mouth" ? "mouth" : p.expression.side;
+    if (!key || !(key in state.art)) continue;
+    state.art[key] = p;
+    for (const name of p.expression.replaces) {
+      const target = state.parts.find((q) => q.spec.name === name);
+      if (target) target.replacedBy = key;
+    }
+  }
 
   // The chest band the breathing field is measured against. `topwear` is the
   // torso proper; body_remainder can reach far up the canvas and would drag the
@@ -643,6 +743,11 @@ function renderPanel() {
     (anchors.includes("neck_pivot") ? "" :
       "<div class='warn'>no neck_pivot: tilt disabled</div>");
 
+  const pack = state.parts.filter((p) => p.expression);
+  document.getElementById("packmeta").innerHTML = pack.length
+    ? pack.map((p) => `<div>${p.spec.name} &rarr; ${p.expression.replaces.join(", ") || "(unplaced)"}</div>`).join("")
+    : "no pack in this run";
+
   const host = document.getElementById("parts");
   host.innerHTML = "";
   for (const p of state.parts) {
@@ -687,6 +792,18 @@ function blinkAmount(now) {
   return { l: ph.sides.includes("l") ? a : 0, r: ph.sides.includes("r") ? a : 0 };
 }
 
+/** How opaque a part is this frame. Only the expression pack moves this: with
+ *  no pack every part draws at 1, which is the v0.1 rig. */
+function opacityOf(part, motion) {
+  if (!motion.swap) return 1;
+  if (part.expression) {
+    const key = part.expression.kind === "mouth" ? "mouth" : part.expression.side;
+    return motion.swap[key] ? motion.swap[key].art : 0;
+  }
+  if (part.replacedBy) return motion.swap[part.replacedBy].base;
+  return 1;
+}
+
 /** Weight overrides for the H2/H3 experiments. `motion.overrides` is read once
  *  per frame -- doing a DOM lookup per vertex costs more than the deformation. */
 function effectiveWeight(part, i, overrides) {
@@ -709,9 +826,13 @@ function deform(part, now, motion) {
   const span = Math.max(state.canvasW, state.canvasH);
   const parallax = span * (TURN_BASE + TURN_SPAN * (1 - part.spec.depth));
   const tilt = pivot ? motion.tiltRad : 0;
-  const blink = part.eyeSide === "l" ? motion.blink.l
-              : part.eyeSide === "r" ? motion.blink.r
-              : Math.max(motion.blink.l, motion.blink.r);
+  // How far the *drawn* eye closes. With an expression pack this is held at
+  // the swap point instead of going to 1: past there the art owns the eye, and
+  // squashing a layer that is fading out only adds a second motion under it.
+  const squash = motion.squash || motion.blink;
+  const blink = part.eyeSide === "l" ? squash.l
+              : part.eyeSide === "r" ? squash.r
+              : Math.max(squash.l, squash.r);
 
   for (let i = 0, v = 0; v < rest.length; i++, v += 2) {
     let x = rest[v], y = rest[v + 1];
@@ -771,15 +892,16 @@ function deform(part, now, motion) {
 function frame(now) {
   const gl = state.gl, loc = state.loc;
   const t = (now - state.t0) / 1000;
+  const dt = Math.min(0.1, (now - (state.lastFrame || now)) / 1000);
+  state.lastFrame = now;
 
   if (document.getElementById("autoIdle").checked) {
-    // Two incommensurable periods so the loop never visibly repeats, scaled by
-    // the manifest's declared limits rather than by constants of its own: past
-    // `max_x` the parallax slides the hair off the head it was covering, and
-    // idle motion must never be what discovers that.
+    // Two incommensurable periods so the loop never visibly repeats, and the
+    // turn held well inside where it starts to cost something.
     const turn = state.manifest.motion.head_turn;
-    setSlider("turnX", (Math.sin(t * 0.37) * 0.73 + Math.sin(t * 0.13) * 0.27) * turn.max_x);
-    setSlider("turnY", Math.sin(t * 0.29 + 1.1) * 0.45 * turn.max_y);
+    const limit = Math.min(turn.max_x, IDLE_TURN);
+    setSlider("turnX", (Math.sin(t * 0.37) * 0.73 + Math.sin(t * 0.13) * 0.27) * limit);
+    setSlider("turnY", Math.sin(t * 0.29 + 1.1) * 0.45 * Math.min(turn.max_y, IDLE_TURN));
     setSlider("tilt", Math.sin(t * 0.23 + 0.6) * state.manifest.motion.head_tilt.max_deg);
   }
 
@@ -793,6 +915,27 @@ function frame(now) {
     }
   }
 
+  // Talk: a mouth that opens and closes on its own, only when the pack brought
+  // a mouth to open. Irregular on purpose -- an even cycle reads as chewing.
+  if (state.art.mouth && document.getElementById("doTalk").checked) {
+    if (now >= state.talkUntil) {
+      state.talkTarget = state.talkTarget > 0.5 ? 0 : 0.55 + Math.random() * 0.45;
+      state.talkUntil = now + (state.talkTarget > 0.5 ? 90 + Math.random() * 110
+                                                      : 70 + Math.random() * 160);
+    }
+    state.mouthOpen += (state.talkTarget - state.mouthOpen) * Math.min(1, dt * 18);
+  } else {
+    state.mouthOpen = parseFloat(document.getElementById("mouthOpen").value);
+  }
+
+  const useArt = document.getElementById("useArt").checked;
+  const blink = blinkAmount(now);
+  const swap = {
+    l: expressionSwap(blink.l, useArt && !!state.art.l),
+    r: expressionSwap(blink.r, useArt && !!state.art.r),
+    mouth: expressionSwap(state.mouthOpen, useArt && !!state.art.mouth),
+  };
+
   const motion = {
     turnX: state.turnX, turnY: state.turnY,
     tiltRad: state.tiltDeg * Math.PI / 180,
@@ -801,7 +944,9 @@ function frame(now) {
     // Negated: a positive turnY drops the face in the parallax path, and the
     // two paths have to agree on which way "down" is or the blend fights itself.
     pitch: -state.turnY * SHELL_MAX_PITCH,
-    blink: blinkAmount(now),
+    blink,
+    squash: { l: swap.l.squash, r: swap.r.squash },
+    swap,
     breath: document.getElementById("doBreathe").checked
       ? Math.sin(t * 2 * Math.PI / state.manifest.motion.breathing.period_s) : 0,
     breathAmp: parseFloat(document.getElementById("breathAmp").value),
@@ -822,6 +967,8 @@ function frame(now) {
   const wire = document.getElementById("wire").checked;
   for (const p of state.parts) {
     if (!p.visible) continue;
+    const opacity = opacityOf(p, motion);
+    if (opacity <= 0.002) continue;
     deform(p, now, motion);
 
     gl.bindBuffer(gl.ARRAY_BUFFER, p.buf.pos);
@@ -838,6 +985,7 @@ function frame(now) {
     gl.uniform1i(loc.tex, 0);
 
     gl.uniform1f(loc.wire, 0);
+    gl.uniform1f(loc.alpha, opacity);
     gl.bindBuffer(gl.ELEMENT_ARRAY_BUFFER, p.buf.idx);
     gl.drawElements(gl.TRIANGLES, p.mesh.count, gl.UNSIGNED_SHORT, 0);
 
@@ -864,6 +1012,12 @@ function syncSlider(id) {
   if (id === "turnY") { state.turnY = value; document.getElementById("turnYv").textContent = value.toFixed(2); }
   if (id === "tilt") { state.tiltDeg = value; document.getElementById("tiltv").textContent = value.toFixed(1) + "°"; }
 }
+
+document.getElementById("mouthOpen").addEventListener("input", () => {
+  document.getElementById("doTalk").checked = false;
+  state.mouthOpen = parseFloat(document.getElementById("mouthOpen").value);
+  document.getElementById("mouthOpenv").textContent = state.mouthOpen.toFixed(2);
+});
 
 document.getElementById("shell").addEventListener("input", () => {
   state.shell = parseFloat(document.getElementById("shell").value);
