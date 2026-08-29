@@ -6,7 +6,7 @@ import unittest
 import numpy as np
 
 from seethrough_engine.rig import (
-    trim_layer_edges,
+    fit_edge_alpha,
     BODY_REMAINDER,
     BODY_WEIGHT,
     EYE_SPLIT_TAGS,
@@ -56,10 +56,9 @@ def portrait_layers():
     }
 
 
-class EdgeTrimTests(unittest.TestCase):
-    """A layer's outermost pixels are darkened where its alpha ends, and drawn
-    over a lighter layer behind, that rim is a stroke the picture does not
-    have."""
+class EdgeFitTests(unittest.TestCase):
+    """A layer's edge alpha decides how much of it shows against what is behind,
+    and the original says what that mixture should be."""
 
     def scene(self, rim=(20, 20, 20)):
         original = np.zeros((CANVAS, CANVAS, 4), dtype=np.uint8)
@@ -70,7 +69,7 @@ class EdgeTrimTests(unittest.TestCase):
         back[20:100, 20:100, 3] = 255
         front = np.zeros_like(original)
         # Big enough to be a surface rather than a stroke: 60x60 is 81% interior.
-        front[25:85, 25:85, :3] = 218           # the front is right inside
+        front[25:85, 25:85, :3] = 218
         front[25:85, 25:85, 3] = 255
         for d in range(3):                      # ... and dark at its own edge
             front[25 + d, 25:85, :3] = rim
@@ -79,43 +78,53 @@ class EdgeTrimTests(unittest.TestCase):
             front[25:85, 84 - d, :3] = rim
         return original, {"neck": back, "face": front}
 
-    def test_a_dark_rim_over_a_layer_that_is_right_is_handed_back(self):
+    def test_a_rim_the_picture_does_not_have_is_faded_out(self):
         original, layers = self.scene()
-        out, moved = trim_layer_edges(layers, original)
+        out, moved = fit_edge_alpha(layers, original)
         self.assertGreater(moved.get("face", 0), 100)
         self.assertLess(int(out["face"][26, 50, 3]), 128)
 
     def test_the_layer_s_interior_is_untouched(self):
         original, layers = self.scene()
-        out, _ = trim_layer_edges(layers, original)
+        out, _ = fit_edge_alpha(layers, original)
         self.assertEqual(int(out["face"][50, 50, 3]), 255)
 
     def test_an_edge_that_matches_the_original_is_left_alone(self):
         original, layers = self.scene(rim=(218, 218, 218))
-        out, moved = trim_layer_edges(layers, original)
+        out, moved = fit_edge_alpha(layers, original)
         self.assertEqual(moved, {})
         self.assertEqual(int(out["face"][26, 50, 3]), 255)
 
-    def test_nothing_is_handed_over_where_there_is_nothing_behind(self):
+    def test_an_edge_that_shows_too_little_is_raised(self):
+        """The other direction, which is why this replaces trimming: the chin,
+        where the layer fades over two rows and the original's contour fills
+        both."""
         original, layers = self.scene()
-        _, moved = trim_layer_edges({"face": layers["face"]}, original)
-        self.assertEqual(moved, {})
+        original[26, 25:85, :3] = 20            # the picture's line is solid here
+        layers["face"][26, 25:85, 3] = 100      # ... but the layer only half shows
+        out, _ = fit_edge_alpha(layers, original)
+        self.assertGreater(int(out["face"][26, 50, 3]), 200)
 
     def test_a_layer_that_is_all_edge_is_left_alone(self):
         """A stroke -- a mouth line, a lash, a nose -- is an outline, and an
-        outline is meant to be dark. Trimming one thins it until it fades."""
+        outline is meant to be dark. Refitting one thins it until it fades."""
         original, layers = self.scene()
         stroke = np.zeros_like(layers["face"])
         stroke[48:52, 30:70, :3] = (20, 20, 20)     # four pixels tall: no interior
         stroke[48:52, 30:70, 3] = 255
         layers["mouth"] = stroke
-        out, moved = trim_layer_edges(layers, original)
+        out, moved = fit_edge_alpha(layers, original)
         self.assertNotIn("mouth", moved)
         self.assertEqual(int(out["mouth"][49, 50, 3]), 255)
 
+    def test_nothing_changes_where_there_is_nothing_behind(self):
+        original, layers = self.scene()
+        _, moved = fit_edge_alpha({"face": layers["face"]}, original)
+        self.assertEqual(moved, {})
+
     def test_no_layer_s_colour_is_altered(self):
         original, layers = self.scene()
-        out, _ = trim_layer_edges(layers, original)
+        out, _ = fit_edge_alpha(layers, original)
         for tag in layers:
             self.assertTrue(np.array_equal(out[tag][..., :3], layers[tag][..., :3]))
 

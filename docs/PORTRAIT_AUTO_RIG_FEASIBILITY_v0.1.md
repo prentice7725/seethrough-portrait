@@ -567,57 +567,58 @@ geometrically continuous and still read as a mask deforming. The blend is
 therefore a slider defaulting to 0, and `DEFAULT_MOTION.head_turn.max_x` stays
 at the parallax rig's 0.8 until someone has watched the shell turn on a GPU.
 
-**2026-08-29 -- the line across the jaw was a layer's own edge.** Watching the
-rig move turned up two strokes the portrait does not have: a heavy one under
-the jaw and a faint one where the neck meets the garment.
+**2026-08-29 -- the lines were edge alpha, and it can be solved rather than
+voted on.** Watching the rig move turned up strokes the portrait does not have:
+a heavy one under the jaw, a faint one where the neck meets the garment, and --
+after the first attempt at fixing them -- a second contour below the chin that
+read as a double chin.
 
-The heavy one is a decomposition artifact, not a rig one, and it is the same
-fault as the ring the expression pack's donor `mouth` layer drew. A layer's
-outermost pixels are painted toward its outline, so where `face` ends at the
-chin its last two rows composite to luma 80 and 162 against an original of 223
-and 225 -- a black stroke on light skin, two pixels above the chin line the
-picture actually has. The layer behind it, `head`, has 215 and 236 there: the
-right answer was already in the stack.
+All three are the same quantity. A layer's edge alpha decides how much of it
+shows against what is behind, and it is the one number the decomposition has no
+way to check. Where `face` ends at the chin its last rows composite to luma 80
+and 162 against an original of 223 and 225: too much of a rim the picture does
+not have. Where the neck meets the garment the two alphas sum to 1.64 and one
+row darkens by 4: too much of both. Where `head` fades out over two rows while
+the original's chin contour fills both, the composite renders 77 and 141 for a
+line that should be 109 and 109: too little.
 
-`rig.trim_layer_edges` asks `reclaim_occluded`'s question at every layer's own
-boundary rather than between one named pair -- where the edge is decisively
-wrong and what is behind is right, the edge hands over. Same core-seeded region
-and clamped feather, two differences forced by the shape: no morphological
-opening, because a 3 px band does not survive a 3x3 open, and a feather of 0.4
-rather than 1.0, because here the handover *is* a boundary and a sigma of 1
-leaves half the rim behind (the jaw stroke came back at -56 instead of -13).
+The first attempt only ever removed alpha -- a margin-qualified handover to
+whatever was behind, `reclaim_occluded` generalized to every boundary. It fixed
+the jaw's rim and could not fix the other two, because they need alpha *raised*.
+`rig.fit_edge_alpha` solves for it instead: the front layer over what is behind
+has to equal the original, which is one linear equation per pixel in the
+coverage, so `a = ((O - B) . (F - B)) / |F - B|^2`, clamped, and taken only
+where the two colours differ enough for the answer to mean anything.
 
 | | composite mae | bad ratio |
 | --- | --- | --- |
 | raw layers | 18.30 | 8.57% |
 | after `reclaim_occluded` | 17.02 | 7.48% |
-| ... and `trim_layer_edges` | **16.42** | **7.20%** |
+| ... and `fit_edge_alpha` | **15.87** | **6.44%** |
 
-The second run moves the same way, 15.07 to 14.41 and 6.84% to 6.44%, which is
-the only reason to believe the band and margin are not fitted to one picture.
-At the jaw the two bad rows go from -63 and -143 to +8 and -13.
+The second run moves the same way, 15.07 to 13.63 and 6.84% to 5.59%. Across
+the whole jaw-and-neck window the worst step the composite has and the original
+does not falls from 10.8 luma to 1.7, which is the noise floor. What remains is
+a colour error rather than a coverage one: the garment's flat 230 against the
+original's 227 below the collar, which no alpha can fix.
 
 **A layer that is all edge is exempt, and finding that out cost a regression.**
-Applied to every layer the trim also ate the nose and the mouth, which faded
-visibly: a stroke has no interior, so the whole of it falls in the band, and
-every pixel where an antialiased dark line sits over skin reads as "the layer
-behind is better". The share of a layer deeper than the band tells the two
-kinds apart -- `mouth` 0%, `eyebrow` 2%, `eyelash` 13%, `nose` 15%, against
-`face` 94%, `head` 94%, `topwear` 97% -- and the bar is three quarters, which
-is the conservative reading: an open mouth is a surface in one run and a stroke
-in the next. It costs 0.5 of mae against trimming everything and leaves the
-trim touching only `face`, `head`, `topwear` and `front hair`.
+Applied to every layer the refit also ate the nose and the mouth, which faded
+visibly: a stroke has no interior, so the whole of it falls in the band, and an
+antialiased dark line over skin reads as coverage that should be lower. The
+share of a layer deeper than the band tells the two kinds apart -- `mouth` 0%,
+`eyebrow` 2%, `eyelash` 13%, `nose` 15%, against `face` 94%, `head` 94%,
+`topwear` 97% -- and the bar is three quarters, the conservative reading, since
+an open mouth is a surface in one run and a stroke in the next.
 
 The lesson is the one the composite metric cannot teach on its own: mae fell
 while the picture got worse, because a fading nose is a small number of pixels
 and a wrong jaw stroke is a small number of pixels, and only one of them is the
-thing anyone looks at.
+thing anyone looks at. The metric guards the change; it does not choose it.
 
-The faint line remains: where the neck's bottom meets the garment the two
-alphas sum to 1.64 and the overlap darkens one row by 4 luma, with the garment's
-flat 230 sitting 3 above the original below it. That is an overlap to normalize
-rather than an edge to hand over, and 4 luma over two rows is where this stopped
-being worth another pass.
+Old runs pick all of this up without the GPU pass that made them, since stages
+A-D read `{tag: full-canvas RGBA}` and nothing else:
+`python -m seethrough_engine.rig <run dir>`.
 
 ## Out of scope
 

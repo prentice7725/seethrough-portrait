@@ -48,7 +48,7 @@ __all__ = [
     "detect_anchors",
     "RECLAIM_PAIRS",
     "reclaim_occluded",
-    "trim_layer_edges",
+    "fit_edge_alpha",
     "composite_layers",
     "composite_fidelity",
     "build_rig",
@@ -149,40 +149,30 @@ RECLAIM_MIN_AREA_AT_768 = 200
 RECLAIM_FEATHER_PX = 1.0
 
 # The same question at every layer's own boundary rather than between one named
-# pair. A layer's outermost pixels are darkened where its alpha ends -- on
-# A-001's `face` the two rows nearest the jaw edge composite to luma 80 and 162
-# where the original is 223 and 225, drawing a black stroke across light skin
-# two pixels above the chin line the original actually has. The same shape of
-# fault, smaller, sits where the neck's bottom meets the garment: the two
-# alphas sum to 1.64 and the overlap darkens one row by 4.
+# pair, and answered by solving rather than by voting. A layer's edge alpha is
+# the one number the decomposition has no way to check: it decides how much of
+# the layer shows against what is behind, and the original says exactly what
+# that mixture should be. Where `face` ends at the chin its last rows composite
+# to luma 80 and 162 against an original of 223 and 225 -- too much of a rim
+# that should barely show. Where the neck meets the garment the two alphas sum
+# to 1.64 and one row darkens -- too much of both. Where `head` fades out over
+# two rows while the original's chin contour fills both, there is too little.
 #
-# It is only ever the boundary, so only the boundary is contested, and only
-# where something behind is there to take over. The bars are higher than
-# `reclaim_occluded`'s because a rim is thin and a thin mistake is cheap to
-# leave alone: a layer edge has to be decisively wrong, not merely worse.
-EDGE_BAND_PX = 3
-EDGE_MARGIN = 24
-EDGE_FLOOR = 30
-EDGE_MIN_AREA_AT_768 = 40
-
-# Barely feathered, unlike the pair version. There the handover is a region and
-# the feather smooths its boundary; here the handover *is* a boundary three
-# pixels deep, and a sigma of 1 leaves half the rim behind -- the jaw stroke
-# came back at -56 luma instead of -13. Measured across the two A-001 runs,
-# 0.4 beats both 0 and 1 on composite mae.
-EDGE_FEATHER_PX = 0.4
+# So: a = ((O - B) . (F - B)) / |F - B|^2, the least-squares coverage that makes
+# the front layer over what is behind equal the original. Clamped to [0, 1], and
+# taken only where the two differ enough for the answer to mean anything.
+EDGE_BAND_PX = 3          # how far inside the boundary to refit
+EDGE_OUTSIDE_PX = 1       # ... and how far outside, since an edge can be short
+EDGE_MIN_CONTRAST = 25    # per channel, below which the solve is noise
 
 # A layer that is all edge is an outline, and an outline is *meant* to be dark.
 # The share of a layer lying deeper than the band separates the two kinds: on
 # A-001 `mouth` is 0% interior, `eyebrow` 2%, `eyelash` 13%, `nose` 15%, against
-# `face` 94%, `head` 94%, `topwear` 97%. Trimming the first kind thins the
+# `face` 94%, `head` 94%, `topwear` 97%. Refitting the first kind thins the
 # stroke until the feature fades, which is the opposite of the fix.
 #
-# Set at three quarters rather than a half, which is the conservative reading of
-# the same rule: an open mouth is a surface in one run and a stroke in the next,
-# so anything more than a quarter boundary is not clearly a surface. It costs
-# 0.13 of composite mae against a half and leaves no thin feature touched in
-# either run.
+# Three quarters rather than a half is the conservative reading of the same
+# rule: an open mouth is a surface in one run and a stroke in the next.
 EDGE_MIN_INTERIOR = 0.75
 
 MANIFEST_VERSION = "0.1"
@@ -614,38 +604,36 @@ def reclaim_occluded(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarra
     return out, moved
 
 
-def trim_layer_edges(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarray, *,
-                     order: tuple[str, ...] = RIG_Z_ORDER,
-                     alpha_threshold: int = 10, band: int = EDGE_BAND_PX,
-                     margin: int = EDGE_MARGIN, floor: int = EDGE_FLOOR,
-                     min_interior: float = EDGE_MIN_INTERIOR,
-                     min_area: int | None = None, feather: float | None = None,
-                     ) -> tuple[dict[str, np.ndarray], dict[str, int]]:
-    """Hand a layer's own boundary back to what is behind it, where the boundary
-    is decisively wrong and what is behind is right.
+def fit_edge_alpha(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarray, *,
+                   order: tuple[str, ...] = RIG_Z_ORDER,
+                   alpha_threshold: int = 10, band: int = EDGE_BAND_PX,
+                   outside: int = EDGE_OUTSIDE_PX,
+                   min_contrast: int = EDGE_MIN_CONTRAST,
+                   min_interior: float = EDGE_MIN_INTERIOR,
+                   ) -> tuple[dict[str, np.ndarray], dict[str, int]]:
+    """Refit each layer's edge alpha so the stack matches the original there.
 
-    `reclaim_occluded` asks this of one named pair over their whole overlap.
-    This asks it of every layer at its own edge, which is where the
-    decomposition leaves a darkened rim: the model paints a layer's last pixels
-    toward its outline, and drawn over a lighter layer behind, that rim is a
-    stroke the picture does not have.
+    `reclaim_occluded` asks which of two layers owns a contested pixel. This
+    asks a narrower question of every layer at its own boundary -- *how much* of
+    it shows -- and the original answers it: the front layer composited over
+    what is behind has to equal the picture, which is one linear equation per
+    pixel in the coverage.
 
-    Same machinery as the pair version, and for the same reasons: a
-    margin-qualified core seeds each region so the threshold does not decide
-    where a region ends, and the handover is feathered and clamped by what is
-    behind so it can never open a gap. Only the front layer's alpha changes.
+    The solve runs in both directions, which is why it replaces trimming. Where
+    a layer's outermost rows are painted toward an outline the picture does not
+    have, the coverage comes back near zero and the rim goes. Where a layer's
+    alpha ramp is narrower than the line it draws -- the chin, where `head`
+    fades over two rows while the original's contour fills both -- it comes back
+    higher and the line is whole. Where two layers overlap and their alphas sum
+    past one, both are pulled down.
 
-    A layer that is mostly boundary is skipped: `mouth` has no interior at all
-    and `nose` 15%, because they *are* outlines, and trimming an outline thins
-    it until the feature fades.
+    Only alpha changes, only within a few pixels of a boundary, and only where
+    the front and what is behind differ enough for the answer to mean anything.
+    A layer that is mostly boundary is skipped: it is an outline, and an outline
+    is meant to be dark.
     """
-    original = np.asarray(original_rgba)[..., :3].astype(np.int32)
+    original = np.asarray(original_rgba)[..., :3].astype(np.float32)
     canvas_h, canvas_w = original.shape[:2]
-    feather = EDGE_FEATHER_PX if feather is None else feather
-    if min_area is None:
-        scale = canvas_h * canvas_w / (768.0 * 768.0)
-        min_area = max(12, int(round(EDGE_MIN_AREA_AT_768 * scale)))
-
     out = dict(layer_dict)
     moved: dict[str, int] = {}
 
@@ -657,46 +645,33 @@ def trim_layer_edges(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarra
 
     for tag in sorted(out, key=rank):
         layer = np.asarray(out[tag])
-        alpha = layer[..., 3]
-        solid = (alpha > alpha_threshold).astype(np.uint8)
+        alpha = layer[..., 3].astype(np.float32) / 255.0
+        solid = (layer[..., 3] > alpha_threshold).astype(np.uint8)
         if solid.any() and beneath_a.any():
-            # The band, and only where there is something behind to show.
             distance = cv2.distanceTransform(solid, cv2.DIST_L2, 3)
-            area = float(solid.sum())
-            interior = float((distance > band).sum()) / max(area, 1.0)
-            edge = ((solid > 0) & (distance <= band) & (beneath_a[..., 0] > 0.5)
-                    if interior >= min_interior else np.zeros(solid.shape, bool))
-            if edge.any():
-                front_err = np.abs(original - layer[..., :3].astype(np.int32)).sum(axis=2)
-                behind_err = np.abs(original - beneath_rgb.astype(np.int32)).sum(axis=2)
-                # No opening here, unlike the pair version: the band is two
-                # pixels wide and a 3x3 open deletes it outright. The area bar
-                # below is what rejects noise instead.
-                core = (edge & (behind_err + margin < front_err)
-                        & (front_err > floor))
-                if core.any():
-                    count, labels, stats, _ = cv2.connectedComponentsWithStats(
-                        core.astype(np.uint8), 8)
-                    core = np.isin(labels, [i for i in range(1, count)
-                                            if stats[i, cv2.CC_STAT_AREA] >= min_area])
-                if core.any():
-                    region = edge & (behind_err < front_err)
-                    count, labels, _, _ = cv2.connectedComponentsWithStats(
-                        region.astype(np.uint8), 8)
-                    seeded = set(np.unique(labels[core]).tolist()) - {0}
-                    take = np.isin(labels, list(seeded)) if seeded else None
-                    if take is not None and take.any():
-                        handover = take.astype(np.float32)
-                        if feather > 0:
-                            handover = cv2.GaussianBlur(handover, (0, 0), float(feather))
-                            handover = np.clip(handover, 0.0, 1.0) * np.clip(
-                                beneath_a[..., 0], 0.0, 1.0)
-                        patched = np.array(layer, copy=True)
-                        patched[..., 3] = np.rint(
-                            alpha.astype(np.float32) * (1.0 - handover)).astype(np.uint8)
-                        out[tag] = patched
-                        layer = patched
-                        moved[tag] = int(take.sum())
+            interior = float((distance > band).sum()) / max(float(solid.sum()), 1.0)
+            if interior >= min_interior:
+                edge = (solid > 0) & (distance <= band)
+                if outside > 0:
+                    grown = cv2.dilate(solid, np.ones((2 * outside + 1,) * 2, np.uint8))
+                    edge |= (grown > 0) & (solid == 0)
+                edge &= beneath_a[..., 0] > 0.5
+
+                delta = layer[..., :3].astype(np.float32) - beneath_rgb
+                denominator = (delta * delta).sum(axis=2)
+                # Two layers the same colour: the coverage cannot be recovered
+                # and does not matter, since either answer draws the same pixel.
+                solvable = edge & (denominator > 3.0 * float(min_contrast) ** 2)
+                if solvable.any():
+                    fitted = np.clip(((original - beneath_rgb) * delta).sum(axis=2)
+                                     / np.maximum(denominator, 1e-6), 0.0, 1.0)
+                    updated = np.where(solvable, fitted, alpha)
+                    changed = int((np.abs(updated - alpha) > 0.05).sum())
+                    if changed:
+                        moved[tag] = changed
+                    layer = np.array(layer, copy=True)
+                    layer[..., 3] = np.rint(updated * 255.0).astype(np.uint8)
+                    out[tag] = layer
 
         a = np.clip(layer[..., 3:4].astype(np.float32) / 255.0, 0.0, 1.0)
         beneath_rgb = beneath_rgb * (1.0 - a) + layer[..., :3].astype(np.float32) * a
@@ -852,12 +827,12 @@ def build_rig(layer_dict: dict[str, np.ndarray], *,
     # hides the neck almost completely, and the remainder split below reads the
     # group unions this changes.
     reclaimed: dict[str, int] = {}
-    edge_trimmed: dict[str, int] = {}
+    edge_fit: dict[str, int] = {}
     if original_rgba is not None:
         working, reclaimed = reclaim_occluded(working, original_rgba,
                                               alpha_threshold=alpha_threshold)
-        working, edge_trimmed = trim_layer_edges(working, original_rgba,
-                                                 alpha_threshold=alpha_threshold)
+        working, edge_fit = fit_edge_alpha(working, original_rgba,
+                                           alpha_threshold=alpha_threshold)
 
     # Stage B: remainder next, so the eye split and the anchors below see the
     # same layer set the manifest will describe.
@@ -936,7 +911,7 @@ def build_rig(layer_dict: dict[str, np.ndarray], *,
             "tag_version": tag_version,
             "depth": "marigold" if depth_dict else "table",
             "reclaimed": reclaimed,
-            "edge_trimmed": edge_trimmed,
+            "edge_fit": edge_fit,
         },
         "anchors": anchors,
         "parts": parts,
