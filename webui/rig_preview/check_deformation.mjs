@@ -40,10 +40,11 @@ const createImageBitmap = async () => ({});
 const api = new Function(
   "document", "performance", "requestAnimationFrame", "location", "fetch",
   "createImageBitmap", "URLSearchParams",
-  src + "\nreturn { weightAt, smoothstep, buildMesh, deform, state, startBlink, blinkAmount, EYE_TAGS, breathRamp };",
+  src + "\nreturn { weightAt, smoothstep, buildMesh, deform, state, startBlink, blinkAmount, EYE_TAGS, breathRamp, fitShells, shellDelta, SHELL_MAX_YAW, SHELL_MAX_PITCH };",
 )(document, performance, requestAnimationFrame, location, fetch, createImageBitmap, URLSearchParams);
 
-const { weightAt, buildMesh, deform, state, startBlink, blinkAmount, breathRamp } = api;
+const { weightAt, buildMesh, deform, state, startBlink, blinkAmount, breathRamp,
+        fitShells, shellDelta, SHELL_MAX_YAW, SHELL_MAX_PITCH } = api;
 
 let failures = 0;
 function check(name, cond, detail = "") {
@@ -290,6 +291,105 @@ check("the slider leaves the hem alone",
 deform(collar, 0, { ...turn, overrides: { ...NO_OVERRIDE, collar: 0.16 } });
 check("flattening the slider makes the garment rigid again",
       near(shiftAt(collar, 430).dx, shiftAt(collar, 950).dx, 1e-6));
+
+console.log("\nellipsoid shell (H6)");
+const shells = fitShells([
+  { tag: "face", xyxy: [400, 200, 600, 400] },
+  { tag: "back hair", xyxy: [380, 180, 620, 430] },
+]);
+check("shells fit to the face box", shells && Math.abs(shells.head.cx - 500) < 1e-9);
+check("the hair shell is the larger of the two",
+      shells.hair.rx > shells.head.rx && shells.hair.cy < shells.head.cy);
+check("no face and no head layer disables the shell rather than guessing",
+      fitShells([{ tag: "topwear", xyxy: [0, 0, 10, 10] }]) === null);
+
+// Difference-only: the projection has to vanish at rest, or raising the slider
+// would move the picture before the head turns at all.
+check("the shell is the identity at rest",
+      [[500, 290], [420, 250], [610, 500]].every(([x, y]) => {
+        const d = shellDelta(shells.head, x, y, 0, 0, [0, 0]);
+        return d[0] === 0 && d[1] === 0;
+      }));
+
+const yaw = SHELL_MAX_YAW;
+const nose = shellDelta(shells.head, 500, 290, yaw, 0, [0, 0])[0];
+const rim = shellDelta(shells.head, 500 + shells.head.rx * 0.98, 290, yaw, 0, [0, 0])[0];
+check("the front of the shell leads the turn", nose > 10, `dx=${nose.toFixed(2)}`);
+check("the rim travels far less than the front, which is the wraparound",
+      rim < nose * 0.35, `rim=${rim.toFixed(2)} nose=${nose.toFixed(2)}`);
+check("a point past the ellipse rides the rim rather than being clamped inward",
+      (() => {
+        const outside = shellDelta(shells.head, 500 + shells.head.rx * 1.4, 290, yaw, 0, [0, 0])[0];
+        const edge = shellDelta(shells.head, 500 + shells.head.rx, 290, yaw, 0, [0, 0])[0];
+        return Math.sign(outside) === Math.sign(edge) && Math.abs(outside) < Math.abs(nose);
+      })());
+check("pitch drops the face when turnY is positive, as the parallax path does",
+      shellDelta(shells.head, 500, 290, 0, -SHELL_MAX_PITCH, [0, 0])[1] > 1);
+
+// The H6 claim in miniature: under parallax two layers slide apart by their
+// depth difference wherever they overlap; on one shell they travel together.
+state.shells = shells;
+const shellTurn = { ...still, turnX: 1, shell: 1, yaw, pitch: 0 };
+const nearOnShell = part({ tag: "face", group: "head", depth: 0.05, xyxy: [400, 200, 600, 400],
+                           mesh: { cell: 50 }, weight: { mode: "constant", value: 1 } },
+                         { shell: shells.head });
+const farOnShell = part({ tag: "head", group: "head", depth: 0.95, xyxy: [400, 200, 600, 400],
+                          mesh: { cell: 50 }, weight: { mode: "constant", value: 1 } },
+                        { shell: shells.head });
+deform(nearOnShell, 0, shellTurn);
+deform(farOnShell, 0, shellTurn);
+check("two layers on one shell do not slide apart by their depth difference",
+      near(shiftAt(nearOnShell, 300).dx, shiftAt(farOnShell, 300).dx, 1e-9));
+deform(nearOnShell, 0, { ...still, turnX: 1 });
+deform(farOnShell, 0, { ...still, turnX: 1 });
+const parallaxSlide = shiftAt(nearOnShell, 300).dx - shiftAt(farOnShell, 300).dx;
+check("...whereas the parallax path slides them apart", parallaxSlide > 20,
+      `slide=${parallaxSlide.toFixed(2)}`);
+
+const hairOnShell = part({ tag: "back hair", group: "head", depth: 0.95, xyxy: [400, 200, 600, 400],
+                           mesh: { cell: 50 }, weight: { mode: "constant", value: 1 } },
+                         { shell: shells.hair });
+deform(nearOnShell, 0, shellTurn);
+deform(hairOnShell, 0, shellTurn);
+const shellSlide = Math.abs(shiftAt(hairOnShell, 300).dx - shiftAt(nearOnShell, 300).dx);
+check("hair and face part only by their shells' difference, not by their depths",
+      shellSlide < parallaxSlide * 0.5,
+      `shell=${shellSlide.toFixed(2)} parallax=${parallaxSlide.toFixed(2)}`);
+
+check("shell 0 is the parallax rig, unchanged",
+      (() => {
+        deform(faceNear, 0, { ...still, turnX: 1 });
+        const plain = shiftAt(faceNear, 300);
+        deform(faceNear, 0, { ...still, turnX: 1, shell: 0, yaw, pitch: 0 });
+        const blended = shiftAt(faceNear, 300);
+        return near(plain.dx, blended.dx, 1e-12) && near(plain.dy, blended.dy, 1e-12);
+      })());
+check("the torso does not ride the head's shell",
+      (() => {
+        const body = part({ tag: "topwear", group: "body", depth: 0.74, xyxy: [300, 450, 700, 950],
+                            mesh: { cell: 50 }, weight: { mode: "constant", value: 0.16 } },
+                          { shell: null });
+        deform(body, 0, { ...still, turnX: 1 });
+        const plain = shiftAt(body, 500).dx;
+        deform(body, 0, shellTurn);
+        return near(plain, shiftAt(body, 500).dx, 1e-12);
+      })());
+check("the neck's seam with the head survives the shell",
+      (() => {
+        // Both weights are 1.0 at the seam, as build_rig emits them, so a vertex
+        // of each in the same place has to move by the same amount.
+        const neckSeam = part({ tag: "neck", group: "neck", depth: 0.76, xyxy: [470, 380, 530, 430],
+                                mesh: { cell: 25 },
+                                weight: { mode: "gradient_y", top: 1.0, bottom: 0.16,
+                                          y_top: 380, y_bottom: 430 } },
+                              { shell: shells.head });
+        const jaw = part({ tag: "face", group: "head", depth: 0.5, xyxy: [470, 360, 530, 380],
+                           mesh: { cell: 25 }, weight: { mode: "constant", value: 1 } },
+                         { shell: shells.head });
+        deform(neckSeam, 0, shellTurn);
+        deform(jaw, 0, shellTurn);
+        return near(shiftAt(neckSeam, 380).dx, shiftAt(jaw, 380).dx, 1e-9);
+      })());
 
 console.log("\ntilt about the neck pivot");
 state.blinkPhase = null;
