@@ -113,6 +113,11 @@
     <input type="range" id="tilt" min="-15" max="15" step="0.1" value="0"></label>
   <p class="hint">Push past the manifest's &plusmn;2&deg; to find where
      disocclusion shows (H1). Turn off auto idle first.</p>
+  <label>3D shell <span class="val" id="shellv">0.00</span>
+    <input type="range" id="shell" min="0" max="1" step="0.01" value="0"></label>
+  <p class="hint">Blends the depth parallax into an ellipsoid shell rotation
+     (H6). At 0 the render is identical to the parallax rig, so the slider
+     isolates the turn's shape from its amount.</p>
 
   <h2>Experiments</h2>
   <label class="row"><input type="checkbox" id="ghost"> head_remainder &rarr; body group</label>
@@ -145,6 +150,38 @@ const TURN_BASE = 0.015;   // every head part moves at least this much
 const TURN_SPAN = 0.045;   // ... plus this much more the nearer it is
 const TURN_Y_SCALE = 0.7;  // vertical parallax reads stronger, so damp it
 const CHEST_WIDEN = 0.004; // ribcage expansion, as a fraction of chest width
+
+// Ellipsoid shell (H6), read from Anime2.5DRig's 3D-shell mode. Depth parallax
+// slides each layer rigidly, so `front hair` and `head` drift apart by their
+// depth difference no matter how far apart they are on the picture -- which is
+// what opened the temple gash at turnX 1.0. A shell instead lifts every vertex
+// onto a head-shaped surface and rotates *that*, so two layers on the same
+// shell travel together at the rim and part only by their shells' difference.
+//
+// Fitted to the `face` part's box, in units of its width and height. The
+// numbers are Anime2.5DRig's empirical defaults, kept as starting values.
+const SHELL_CY = 0.45;     // shell centre, down from the top of the face box
+const SHELL_RX = 0.62;     // ... as a fraction of face width
+const SHELL_RY = 0.72;     // ... of face height
+const SHELL_RZ = 0.45;     // how far the nose plane sits in front of the axis
+const HAIR_SCALE = 1.10;   // the hair rides a slightly larger shell, so bangs
+const HAIR_RZ = 1.05;      // ... float above the forehead instead of on it
+const HAIR_LIFT = 0.06;    // ... and sit a little higher on the skull
+
+// Perspective for the reprojection: a short focal length exaggerates the
+// foreshortening that makes the turn read as depth rather than as a slide.
+const SHELL_FOCAL = 5.0;   // in units of the shell's own rz
+const SHELL_PERSP = 0.5;
+
+// turn 1.0 in shell radians. Chosen so the nose travels about as far as the
+// parallax path moves the face at the same turn value: the blend slider then
+// changes *how* the head turns without also changing how much, which is the
+// only way the two can be compared on one picture.
+const SHELL_MAX_YAW = 0.52;
+const SHELL_MAX_PITCH = 0.52 * 0.7;   // damped like TURN_Y_SCALE
+
+// Layers that ride the hair shell rather than the head shell.
+const HAIR_SHELL_TAGS = new Set(["front hair", "back hair", "headwear", "hair"]);
 
 const EYE_TAGS = new Set([
   "eyewhite", "eyewhitel", "eyewhiter",
@@ -206,11 +243,12 @@ const state = {
   parts: [],
   gl: null, prog: null, loc: null,
   canvasW: 0, canvasH: 0,
-  turnX: 0, turnY: 0, tiltDeg: 0,
+  turnX: 0, turnY: 0, tiltDeg: 0, shell: 0,
   blink: { l: 0, r: 0 },
   blinkTimer: 0, blinkPhase: null,
   canMipmap: false,
   collarOverride: null,   // null = use whatever the manifest baked in
+  shells: null,           // fitted in build(); null disables the shell path
   t0: performance.now(),
 };
 
@@ -343,6 +381,58 @@ function breathRamp(y) {
   return (bottom - y) / (bottom - top);
 }
 
+/** Fit the head and hair ellipsoids to the `face` part's box. Everything the
+ *  shell needs is one box: the manifest has no head model and is not going to
+ *  grow one for a feasibility rig. Returns null when there is no face layer,
+ *  which disables the shell path rather than guessing. */
+function fitShells(parts) {
+  const face = parts.find((p) => p.tag === "face") || parts.find((p) => p.tag === "head");
+  if (!face) return null;
+  const [x1, y1, x2, y2] = face.xyxy;
+  const w = x2 - x1, h = y2 - y1;
+  if (!(w > 0 && h > 0)) return null;
+  const head = {
+    cx: (x1 + x2) / 2, cy: y1 + h * SHELL_CY,
+    rx: w * SHELL_RX, ry: h * SHELL_RY, rz: w * SHELL_RZ,
+  };
+  return {
+    head,
+    hair: {
+      cx: head.cx, cy: head.cy - head.ry * HAIR_LIFT,
+      rx: head.rx * HAIR_SCALE, ry: head.ry * HAIR_SCALE, rz: head.rz * HAIR_RZ,
+    },
+  };
+}
+
+// Scratch, so the per-vertex path allocates nothing.
+const SHELL_OUT = [0, 0];
+
+/** Where a vertex goes when it is lifted onto `shell`, rotated by yaw/pitch and
+ *  reprojected -- as a *difference* from where the same lift and reprojection
+ *  put it at rest. Difference-only is what lets the shell blend with parallax:
+ *  at yaw = pitch = 0 it returns (0, 0) exactly, so a shell weight of 1 with no
+ *  turn is still the rest pose, and the projection's own distortion never
+ *  reaches the picture.
+ *
+ *  Vertices outside the ellipse sit on its rim (z = 0) rather than being
+ *  clamped inward, so a layer that overhangs the head -- back hair, the jaw of
+ *  the `head` layer -- stays continuous with the part of it that is on the
+ *  shell. */
+function shellDelta(shell, x, y, yaw, pitch, out = SHELL_OUT) {
+  const u = (x - shell.cx) / shell.rx, v = (y - shell.cy) / shell.ry;
+  const z = Math.sqrt(Math.max(0, 1 - Math.min(1, u * u + v * v)));
+  const X = u * shell.rx, Y = v * shell.ry, Z = z * shell.rz;
+  const cy = Math.cos(yaw), sy = Math.sin(yaw);
+  const cp = Math.cos(pitch), sp = Math.sin(pitch);
+  const X2 = X * cy + Z * sy, Z2 = -X * sy + Z * cy;
+  const Y2 = Y * cp - Z2 * sp, Z3 = Y * sp + Z2 * cp;
+  const f = shell.rz * SHELL_FOCAL;
+  const sc = f / (f - Z3 * SHELL_PERSP), sc0 = f / (f - Z * SHELL_PERSP);
+  out[0] = X2 * sc - X * sc0;
+  out[1] = Y2 * sc - Y * sc0;
+  return out;
+}
+
 function buildMesh(part) {
   const [x1, y1, x2, y2] = part.xyxy;
   const cell = Math.max(4, part.mesh.cell);
@@ -468,6 +558,8 @@ function build(manifest, images) {
     }
   }
 
+  state.shells = fitShells(manifest.parts);
+
   state.parts = manifest.parts.slice().sort((a, b) => a.z - b.z).map((part) => {
     const mesh = buildMesh(part);
     const isEye = EYE_TAGS.has(part.tag);
@@ -486,6 +578,12 @@ function build(manifest, images) {
       // strength is the one weight in the manifest that is a taste call.
       isCollar: part.group === "body" && part.weight.mode === "gradient_y",
       isLid: LID_TAGS.has(part.tag),
+      // The shell is a model of a head, so the torso does not ride it: a
+      // vertex below the ellipse would only be squeezed toward the head's axis.
+      // Anime2.5DRig gives the body its own cylinder; that is a separate
+      // experiment and this one is about the head's turn.
+      shell: !state.shells || part.group === "body" ? null
+           : HAIR_SHELL_TAGS.has(part.tag) ? state.shells.hair : state.shells.head,
       eyeSide: side,
       eyeCenterY: eyeAnchor ? eyeAnchor[1] : (part.xyxy[1] + part.xyxy[3]) / 2,
       openTop: box[1],
@@ -628,8 +726,18 @@ function deform(part, now, motion) {
     }
 
     // Depth-differential parallax: near parts travel further than far ones.
-    x += motion.turnX * parallax * w;
-    y += motion.turnY * parallax * TURN_Y_SCALE * w;
+    let dx = motion.turnX * parallax;
+    let dy = motion.turnY * parallax * TURN_Y_SCALE;
+    // ... blended toward the shell rotation (H6). The head-follow weight scales
+    // the blended result, not just the parallax, so the neck's gradient still
+    // governs both paths and the two seams stay continuous either way.
+    if (motion.shell > 0 && part.shell) {
+      const d = shellDelta(part.shell, x, y, motion.yaw, motion.pitch);
+      dx += motion.shell * (d[0] - dx);
+      dy += motion.shell * (d[1] - dy);
+    }
+    x += dx * w;
+    y += dy * w;
 
     // Tilt about the neck pivot, scaled by the same weight, which is what
     // keeps the bottom of the neck attached to the torso.
@@ -688,6 +796,11 @@ function frame(now) {
   const motion = {
     turnX: state.turnX, turnY: state.turnY,
     tiltRad: state.tiltDeg * Math.PI / 180,
+    shell: state.shell,
+    yaw: state.turnX * SHELL_MAX_YAW,
+    // Negated: a positive turnY drops the face in the parallax path, and the
+    // two paths have to agree on which way "down" is or the blend fights itself.
+    pitch: -state.turnY * SHELL_MAX_PITCH,
     blink: blinkAmount(now),
     breath: document.getElementById("doBreathe").checked
       ? Math.sin(t * 2 * Math.PI / state.manifest.motion.breathing.period_s) : 0,
@@ -751,6 +864,11 @@ function syncSlider(id) {
   if (id === "turnY") { state.turnY = value; document.getElementById("turnYv").textContent = value.toFixed(2); }
   if (id === "tilt") { state.tiltDeg = value; document.getElementById("tiltv").textContent = value.toFixed(1) + "°"; }
 }
+
+document.getElementById("shell").addEventListener("input", () => {
+  state.shell = parseFloat(document.getElementById("shell").value);
+  document.getElementById("shellv").textContent = state.shell.toFixed(2);
+});
 
 for (const id of ["turnX", "turnY", "tilt"]) {
   document.getElementById(id).addEventListener("input", () => {

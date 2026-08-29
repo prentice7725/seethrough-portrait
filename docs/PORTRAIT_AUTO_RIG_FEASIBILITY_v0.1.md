@@ -44,9 +44,20 @@ pipelines is more work than reimplementing the parts we want.
 | --- | --- | --- |
 | Anime2.5DRig (MIT) | neck vertex-weight gradient; depth-differential pseudo-turn; connected-component eye L/R split; anchor detection from `face`/`neck` alpha; grid mesh; blink by Y-compression | name-guessed head/body classification (we have real tags); fixed name-based depth as the *only* source; generic eyelid synthesis (deferred); `mouth` to `mouth_open` remapping (wrong for us, see Stage A) |
 | PNGAL (Apache-2.0) | rig config stored as a separate JSON beside the layers, so motion can be re-tuned without re-running decomposition; sprite-sheet + JSON bake as a game-delivery Plan B | RIFE in-betweening; ComfyUI/Qwen/portable-Python stack (45-90 GiB, 12 GB+ VRAM -- this fork deliberately targets 8 GB) |
+| Anime2.5DRig, izumix77 fork (MIT) | ellipsoid head/hair shell projection, blended difference-only against the parallax path (Stage E, H6); a pinned region as a *shape* rather than a number, for a weight that has to hold a seam | its input assumption (a hand-separated PSD, layers guessed by name); the profile and chest curves, which are per-character tuning rather than feasibility; the body cylinder |
+| PachiPakuGen (see "Candidates" in the fork plan) | nothing yet: its answers are workflow, not algorithm | RIFE in-betweening, for the same reason as PNGAL |
 
-Constants and coefficients quoted from either project are starting values
-only, expected to be re-tuned against A-001. See "Algorithm references".
+Constants and coefficients quoted from any of them are starting values only,
+expected to be re-tuned against A-001. See "Algorithm references".
+
+Worth recording what the prior art does **not** contain, since it is where most
+of this milestone's work went: none of these projects has a contested-pixel
+problem (`reclaim_occluded`), a recovered-remainder layer to place, or a
+continuous neck weight. Their input is a PSD an artist already separated, so
+those questions cannot arise. Anime2.5DRig still carries the neck constant this
+rig started from -- 0.55 against a head at 1.00, the 0.45 jaw step -- which is
+the clearest evidence that the seam problems belong to *automatic*
+decomposition rather than to 2.5D rigging.
 
 ## Input contract
 
@@ -187,7 +198,11 @@ is back to 0.161.
 
 **Open risk:** `back hair` frequently extends below the shoulder line, and a
 flat 1.00 will tear it away from the body there. If the preview shows that,
-`back hair` gets the same `gradient_y` treatment as the neck. This is the one
+`back hair` gets the same `gradient_y` treatment as the neck -- or, if a
+horizontal ramp turns out to cut across the strands rather than along them, the
+izumix77 fork's pinned *region*, which is the same idea given a shape instead of
+a scalar: an area that follows one owner exactly, feathered only on its outside
+so the boundary cannot move when the region is retuned. This is the one
 weight most likely to need a shape change rather than a number change, so it
 is already wired as a toggle rather than a code edit: `build_rig`'s
 `gradient_tags` argument, surfaced in the webui as "Rig: soften back hair".
@@ -205,6 +220,13 @@ Exactly four, matching the fork plan's M4 wording:
 
 1. **Head pseudo-turn (X/Y).** Per-layer offset scaled by that layer's depth,
    producing parallax between `back hair`, `face`, `nose`, `front hair`.
+   Blended, by a slider that is 0 by default, against an **ellipsoid shell**
+   (H6): every vertex is lifted onto a head-shaped surface fitted to the `face`
+   box, rotated in yaw/pitch, and reprojected. Hair rides a shell 10% larger so
+   bangs float above the forehead. The shell contributes only the *difference*
+   between the rotated and the rest projection, so at slider 0 -- and at any
+   slider value with the head at rest -- the render is bit-identical to the
+   parallax rig, and the slider isolates the turn's shape from its amount.
 2. **Head tilt (Z), +/-2 degrees**, rotating about `neck_pivot`.
 3. **Breathing.** One continuous vertical displacement field, not a per-group
    transform: full lift above the chest line, falling linearly to zero at
@@ -290,7 +312,11 @@ exposes it as a checkbox, on by default.
 Stage E is implemented in `webui/rig_preview/index.html`. Its deformation math
 has headless checks in `webui/rig_preview/check_deformation.mjs`
 (`node webui/rig_preview/check_deformation.mjs`), which cover the weight
-gradient, depth parallax, the H2 and H3 toggles, and the blink envelope. What
+gradient, depth parallax, the shell projection, the H2 and H3 toggles, and the
+blink envelope. `webui/rig_preview/measure_disocclusion.mjs <run dir>` answers
+H1 and H6 numerically: it loads the page's own `deform`, rasterizes each part's
+alpha in z order on the CPU, and counts what a turn exposes. Both run on plain
+`node`, with no dependencies and no GPU. What
 is *not* verified without a GPU run is the only thing that matters: whether a
 real A-001 decomposition looks right when it moves. That is what the
 hypotheses below are for.
@@ -317,7 +343,8 @@ Controls map onto the hypotheses rather than onto a character sheet: manual
 turn and tilt sliders that reach well past the manifest's limits (H1), a
 `head_remainder -> body` toggle that reproduces the Spine ghost (H2), a neck
 weight selector with `rigid` and `detached` as the degenerate comparisons
-(H3), and per-eye wink buttons (H4).
+(H3), per-eye wink buttons (H4), and a blend from the parallax rig to the
+ellipsoid shell (H6).
 
 ## Hypotheses this milestone tests
 
@@ -330,6 +357,7 @@ The point of building it is to answer these:
 | H3 | A neck weight gradient beats any two-bone arrangement | Compare the gradient against `top = bottom = 1.0` (rigid) and `= 0.0` (detached) |
 | H4 | Connected-component eye splitting is reliable on A-001 | Blink and wink each side independently |
 | H5 | The fixed depth table is sufficient and Marigold is only a refinement | Run both, compare parallax quality |
+| H6 | The rotation limit H1 found belongs to *rigid depth offsets*, not to the layer set: rotating a shell instead should raise it | Sweep the turn with the shell blend at 0 and 1 and count the revealed region at equal apparent turn |
 
 H1 matters most and is the one we are least sure of: `body_remainder` exists
 precisely because generated coverage is imperfect. Its answer sets the
@@ -491,6 +519,48 @@ after, against the original's 182-194.
 
 Composite over the whole subject: mae 18.74 -> 17.46, bad 8.83% -> 7.75%.
 
+**2026-08-29 -- H6: the limit was the rigid offset, not the layers.** H1 found
+that past turnX 0.8 the scattered edge reveals merge into one gash down the
+temple, and concluded the limit is how far one layer overhangs the next. That
+is true of a rig that moves each layer *rigidly* by its depth. An ellipsoid
+shell moves the same layers by where they sit on a head instead, and
+`webui/rig_preview/measure_disocclusion.mjs` counts the difference. A reveal is
+a pixel hair covered at rest and skin covers after the turn -- alpha coverage
+and the manifest's z order only, no colour heuristic -- and `nose px` is the
+control column: the shell's max yaw is tuned so the nose travels the same
+distance at the same slider value, so the two columns compare equal turns.
+
+| turnX | nose px | largest revealed region, parallax | ... with the shell |
+| --- | --- | --- | --- |
+| 0.20 | 8.5 | 584 | 437 |
+| 0.40 | 16.9 | 1027 | 636 |
+| 0.60 | 25.4 | **3275** | 767 |
+| 0.80 | 33.9 | 4157 | 805 |
+| 1.00 | 42.3 | 4866 | 1090 |
+| 1.50 | 63.5 | 6162 | 634 |
+
+The parallax column has a merge event between 0.4 and 0.6 -- 1027 px to 3275 --
+and grows monotonically after it. The shell column has none: across the whole
+sweep, including turns half again past the manifest's limit, the reveal stays
+scattered along edges (110-140 separate regions, largest under 1100 px) and
+never coalesces. Total revealed area only halves (5941 to 2815 at turnX 1.0),
+which is the honest reading: the shell does not remove disocclusion, it stops
+disocclusion from becoming one coherent tear, and a tear is what the eye finds.
+
+The mechanism is visible in the `slide` column, which drops to exactly 0: on one
+shell, two layers no longer part by their depth difference at all. That is also
+the cost. `front hair` and `back hair` share the hair shell, so the parallax
+between them is gone and their depth is expressed only by draw order. The fork
+this was read from pushes back hair deeper with a separate term; giving
+`back hair` its own shell is the obvious refinement and is not needed to answer
+H6.
+
+What this does **not** establish is that it looks right. Every number here is
+computed from alpha, and a shell that foreshortens a flat painted face can be
+geometrically continuous and still read as a mask deforming. The blend is
+therefore a slider defaulting to 0, and `DEFAULT_MOTION.head_turn.max_x` stays
+at the parallax rig's 0.8 until someone has watched the shell turn on a GPU.
+
 ## Out of scope
 
 Deferred deliberately, not forgotten:
@@ -527,6 +597,9 @@ Implemented from published behaviour, not copied source:
 - **Anime2.5DRig** (MIT) -- neck vertex weight gradient, depth-differential
   pseudo head turn, connected-component eye separation, alpha-derived face
   and neck anchors, uniform grid meshing, blink by Y-compression.
+- **Anime2.5DRig, izumix77 fork** (MIT) -- ellipsoid head and hair shells fitted
+  to the face box, their empirical radii, the short-focal reprojection, and the
+  difference-only blend that keeps the rest pose exact.
 - **PNGAL** (Apache-2.0) -- animation configuration persisted separately from
   layer data; sprite-sheet + JSON as a game-delivery format.
 

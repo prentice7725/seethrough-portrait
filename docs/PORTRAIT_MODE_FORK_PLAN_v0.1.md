@@ -63,3 +63,35 @@ feasibility question. See `PORTRAIT_AUTO_RIG_FEASIBILITY_v0.1.md`, which
 answers M4 with an automatic rig plus a browser preview rather than a bone
 hierarchy, and stays inside Phase 2's "feasibility only" limit.
 
+## Candidates
+
+Recorded so they are not rediscovered, and deliberately not scheduled: each one
+is outside M4, and M4 is a decision rather than a product.
+
+**Expression sheets as decomposition input.** PachiPakuGen (kazuya-bros), which
+runs the upstream See-Through implementation as a fixed-commit runtime, asks the
+user for seven extra images -- `eyes-closed`, `mouth-closed`, and the five vowel
+mouths -- drawn from the same character, and decomposes all eight together. This
+is the practical answer to the two layers this fork cannot synthesize: A-001's
+`mouth` is a closed mouth and there is no closed eye at all, which is why the
+rig currently closes an eye by keeping a fraction of the lash. The cost is a new
+problem this fork does not have today -- registering several generations of one
+character against each other -- which that tool solves with a manual alignment
+step. Belongs to Phase 1 scope, if anywhere.
+
+**Seed selection before the batch.** The same tool decomposes a single image
+with the depth pass and PSD assembly skipped, purely so the user can look at
+which parts came out and re-roll the seed. Portrait Mode's `auto_fill` already
+reruns up to five times and keeps the best combination, but it scores alpha, and
+the run that reached PASS with no `eyewhite` at all is exactly the failure a
+person would have caught by looking. A fast layers-only preview in the webui
+would cost little and would shorten every A-001 experiment.
+
+**Seamless loop export.** For the sprite-bake Plan B: align every driver's
+period to the export length and record after several warm-up cycles, so the
+first frame and the last one agree.
+
+**8 GB profile.** Their low-VRAM path is CPU offload plus quantized weights plus
+freeing VRAM between inference stages -- the third of those is the one this fork
+has not tried.
+
