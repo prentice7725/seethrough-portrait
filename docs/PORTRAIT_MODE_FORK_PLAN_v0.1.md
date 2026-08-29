@@ -102,9 +102,27 @@ Two departures from their algorithm, both forced by that ordering:
   measured on the part of the picture nothing is taken from.
 
 Scope is three images -- `base`, `eyes-closed`, `mouth-open` -- and the vowels
-are a later promotion. Remaining: wiring the pack into `rig_manifest.json` and
-giving the runtime an ownership rule, so a real closed eye replaces the lash
-squash when one exists and the squash stays as the fallback when it does not.
+are a later promotion.
+
+The pack is attached to a finished run rather than produced inside it
+(`python -m seethrough_engine.expression <run dir> eye_closed=<png> ...`):
+the donors are drawn *after* looking at the decomposition, and re-running the
+model to attach them would be absurd. It writes an `expressions` block into the
+run's existing `rig_manifest.json`, placing each sprite over the parts it stands
+in for -- their front z, their nearest depth, and their own weight, so it moves
+as the feature it covers rather than as a new tag.
+
+The runtime gives each feature one owner. A short crossfade centred on the
+half-closed pose hands the eye from the layers to the art and back: a long
+dissolve shows an open eye and a shut one at once, an instant swap pops. The
+open eye keeps squashing until the art has taken over, so the lid is still seen
+coming down. With no pack -- or with "Use expression art" off, which is the
+comparison the toggle exists for -- every part draws at full and the blink is
+the v0.1 lash squash exactly.
+
+Remaining: the webui does not collect donors yet, so the pack is attached from
+the command line. Eyebrow transform and iris gaze need no new drawings at all
+and are the cheapest thing left.
 
 **Seed selection before the batch.** The same tool decomposes a single image
 with the depth pass and PSD assembly skipped, purely so the user can look at

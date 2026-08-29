@@ -256,6 +256,54 @@ class BoundaryTests(unittest.TestCase):
         self.assertEqual(int(part.image[:, :, 3][outside].sum()), 0)
 
 
+RIG_PARTS = [
+    {"name": "face", "tag": "face", "z": 8, "depth": 0.50},
+    {"name": "eyewhitel", "tag": "eyewhitel", "z": 11, "depth": 0.348},
+    {"name": "iridesl", "tag": "iridesl", "z": 13, "depth": 0.283},
+    {"name": "eyelashl", "tag": "eyelashl", "z": 15, "depth": 0.217},
+    {"name": "eyewhiter", "tag": "eyewhiter", "z": 12, "depth": 0.326},
+    {"name": "mouth", "tag": "mouth", "z": 18, "depth": 0.087},
+]
+
+
+class PlacementTests(unittest.TestCase):
+    """A recovered sprite has to be drawn over what it stands in for, at that
+    feature's own depth -- not at whatever a new tag would inherit."""
+
+    def setUp(self):
+        base = base_portrait()
+        self.pack = build_expression_pack(
+            base, {"eye_closed": with_closed_eyes(base), "mouth_open": with_open_mouth(base)},
+            ANCHORS, PART_BOXES)
+        with tempfile.TemporaryDirectory() as out:
+            self.block = write_expression_pack(out, self.pack, RIG_PARTS)
+
+    def test_a_closed_eye_stands_in_for_that_side_s_eye_layers(self):
+        entry = self.block["parts"]["eye_closed_l"]
+        self.assertEqual(sorted(entry["replaces"]), ["eyelashl", "eyewhitel", "iridesl"])
+
+    def test_it_does_not_stand_in_for_the_other_side(self):
+        self.assertNotIn("eyewhiter", self.block["parts"]["eye_closed_l"]["replaces"])
+
+    def test_it_draws_in_front_of_everything_it_replaces(self):
+        entry = self.block["parts"]["eye_closed_l"]
+        self.assertGreater(entry["z"], 15)
+
+    def test_it_takes_the_nearest_replaced_depth_so_it_parallaxes_with_them(self):
+        self.assertAlmostEqual(self.block["parts"]["eye_closed_l"]["depth"], 0.217, places=3)
+
+    def test_the_mouth_stands_in_for_the_mouth(self):
+        entry = self.block["parts"]["mouth_open"]
+        self.assertEqual(entry["replaces"], ["mouth"])
+        self.assertGreater(entry["z"], 18)
+
+    def test_without_a_rig_the_block_is_still_valid(self):
+        with tempfile.TemporaryDirectory() as out:
+            block = write_expression_pack(out, self.pack)
+        self.assertEqual(block["parts"]["eye_closed_l"]["replaces"], [])
+        self.assertIsNone(block["parts"]["eye_closed_l"]["z"])
+
+
 class WriteTests(unittest.TestCase):
     def test_the_pack_writes_its_images_and_names_them_relatively(self):
         base = base_portrait()

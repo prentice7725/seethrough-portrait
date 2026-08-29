@@ -27,7 +27,9 @@ donors without a model.
 
 from __future__ import annotations
 
+import json
 import os
+import sys
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -48,6 +50,7 @@ __all__ = [
     "extract_part",
     "build_expression_pack",
     "write_expression_pack",
+    "attach_to_run",
 ]
 
 # Which layer boxes define each region's extent. A closed eye is drawn where
@@ -391,8 +394,38 @@ def build_expression_pack(base, donors, anchors, part_boxes) -> dict[str, Any]:
     return {"parts": parts, "report": report}
 
 
-def write_expression_pack(out_dir, pack, subdir="rig/images") -> dict[str, Any]:
-    """Write each part's PNG and return the manifest block naming them."""
+# Which rig parts a recovered sprite stands in for while it is showing. The
+# runtime fades these out rather than deleting them: without an expression pack
+# they are still the whole eye, and the lash squash is still the blink.
+REPLACED_TAGS = {
+    ("eye", "l"): ("eyewhitel", "iridesl", "eyelashl", "eyel"),
+    ("eye", "r"): ("eyewhiter", "iridesr", "eyelashr", "eyer"),
+    ("mouth", None): ("mouth",),
+}
+
+
+def _placement(part, rig_parts):
+    """Where a recovered sprite is drawn: over the parts it replaces, at the
+    depth of the nearest of them, so it parallaxes with the face it belongs to
+    instead of with whatever the table would have given a new tag."""
+    tags = REPLACED_TAGS.get((part.kind, part.side), ())
+    replaced = [p for p in rig_parts if p.get("tag") in tags]
+    if not replaced:
+        return {"replaces": [], "z": None, "depth": None}
+    return {
+        "replaces": [p["name"] for p in replaced],
+        "z": max(float(p["z"]) for p in replaced) + 0.5,
+        "depth": min(float(p["depth"]) for p in replaced),
+    }
+
+
+def write_expression_pack(out_dir, pack, rig_parts=(), subdir="rig/images") -> dict[str, Any]:
+    """Write each part's PNG and return the manifest block naming them.
+
+    `rig_parts` is the rig manifest's own `parts` list. Given it, each entry
+    also carries where the sprite is drawn and what it stands in for; without
+    it the block is still valid and the runtime has to place the sprite itself.
+    """
     images_dir = os.path.join(out_dir, *subdir.split("/"))
     os.makedirs(images_dir, exist_ok=True)
     entries: dict[str, Any] = {}
@@ -404,5 +437,55 @@ def write_expression_pack(out_dir, pack, subdir="rig/images") -> dict[str, Any]:
             "kind": part.kind,
             "side": part.side,
             "xyxy": list(part.xyxy),
+            **_placement(part, rig_parts),
         }
     return {"version": "0.1", "parts": entries, "report": pack["report"]}
+
+
+def attach_to_run(run_dir, donors) -> dict[str, Any]:
+    """Recover `donors` against a finished run and add them to its rig manifest.
+
+    Deliberately a separate pass over a run directory rather than a step inside
+    `save_portrait_run`: the donors are drawn *after* looking at the
+    decomposition, and re-running the model to attach them would be absurd.
+    """
+    names = [f for f in os.listdir(run_dir) if f.endswith("_rig_manifest.json")]
+    if not names:
+        raise FileNotFoundError(f"no *_rig_manifest.json in {run_dir}")
+    manifest_path = os.path.join(run_dir, names[0])
+    with open(manifest_path, encoding="utf-8") as f:
+        manifest = json.load(f)
+
+    base_name = names[0][: -len("_rig_manifest.json")]
+    base = np.array(Image.open(os.path.join(run_dir, f"{base_name}_original.png")).convert("RGBA"))
+    boxes = {p["tag"]: tuple(p["xyxy"]) for p in manifest["parts"]}
+    anchors = {k: tuple(v) for k, v in manifest.get("anchors", {}).items()}
+
+    pack = build_expression_pack(base, donors, anchors, boxes)
+    manifest["expressions"] = write_expression_pack(run_dir, pack, manifest["parts"])
+    with open(manifest_path, "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=2, ensure_ascii=False)
+    return manifest["expressions"]
+
+
+def main(argv=None) -> int:
+    """`python -m seethrough_engine.expression <run dir> eye_closed=<png> ...`"""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if len(argv) < 2 or any("=" not in a for a in argv[1:]):
+        print(main.__doc__, file=sys.stderr)
+        return 2
+    run_dir, donors = argv[0], {}
+    for arg in argv[1:]:
+        state, path = arg.split("=", 1)
+        donors[state] = np.array(Image.open(path).convert("RGBA"))
+    block = attach_to_run(run_dir, donors)
+    for name, entry in block["parts"].items():
+        print(f"{name:16s} {entry['image']}  replaces {entry['replaces']}")
+    if not block["parts"]:
+        print("nothing recovered; see the report in the rig manifest", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

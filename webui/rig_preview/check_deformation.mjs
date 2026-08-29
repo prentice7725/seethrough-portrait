@@ -40,11 +40,12 @@ const createImageBitmap = async () => ({});
 const api = new Function(
   "document", "performance", "requestAnimationFrame", "location", "fetch",
   "createImageBitmap", "URLSearchParams",
-  src + "\nreturn { weightAt, smoothstep, buildMesh, deform, state, startBlink, blinkAmount, EYE_TAGS, breathRamp, fitShells, shellDelta, SHELL_MAX_YAW, SHELL_MAX_PITCH };",
+  src + "\nreturn { weightAt, smoothstep, buildMesh, deform, state, startBlink, blinkAmount, EYE_TAGS, breathRamp, fitShells, shellDelta, SHELL_MAX_YAW, SHELL_MAX_PITCH, expressionSwap, opacityOf, SWAP_LO, SWAP_HI };",
 )(document, performance, requestAnimationFrame, location, fetch, createImageBitmap, URLSearchParams);
 
 const { weightAt, buildMesh, deform, state, startBlink, blinkAmount, breathRamp,
-        fitShells, shellDelta, SHELL_MAX_YAW, SHELL_MAX_PITCH } = api;
+        fitShells, shellDelta, SHELL_MAX_YAW, SHELL_MAX_PITCH,
+        expressionSwap, opacityOf, SWAP_HI } = api;
 
 let failures = 0;
 function check(name, cond, detail = "") {
@@ -389,6 +390,80 @@ check("the neck's seam with the head survives the shell",
         deform(neckSeam, 0, shellTurn);
         deform(jaw, 0, shellTurn);
         return near(shiftAt(neckSeam, 380).dx, shiftAt(jaw, 380).dx, 1e-9);
+      })());
+
+console.log("\nexpression pack ownership (M4.1)");
+check("with no art this is the v0.1 rig exactly",
+      (() => {
+        for (const a of [0, 0.3, 0.7, 1]) {
+          const s = expressionSwap(a, false);
+          if (s.art !== 0 || s.base !== 1 || !near(s.squash, a)) return false;
+        }
+        return true;
+      })());
+check("an open eye owns itself while the eye is open",
+      (() => { const s = expressionSwap(0, true); return s.art === 0 && s.base === 1; })());
+check("the art owns the eye once it is shut",
+      (() => { const s = expressionSwap(1, true); return near(s.art, 1) && near(s.base, 0); })());
+check("the two never sum to more or less than one eye",
+      (() => {
+        for (let a = 0; a <= 1.0001; a += 0.05) {
+          const s = expressionSwap(a, true);
+          if (!near(s.art + s.base, 1, 1e-9)) return false;
+        }
+        return true;
+      })(),
+      "an eye was drawn twice, or vanished between the two layers");
+check("the swap is a swap, not a long dissolve",
+      (() => {
+        const mid = expressionSwap(0.5, true);
+        return mid.art > 0.3 && mid.art < 0.7
+            && expressionSwap(0.2, true).art === 0
+            && near(expressionSwap(0.8, true).art, 1);
+      })());
+check("the lid is still seen coming down before the art takes over",
+      expressionSwap(SWAP_HI * 0.5, true).squash > 0.1);
+check("...and stops squashing once the art owns the eye",
+      near(expressionSwap(1, true).squash, SWAP_HI));
+check("squash never goes backwards as the eye closes",
+      (() => {
+        let last = -1;
+        for (let a = 0; a <= 1.0001; a += 0.05) {
+          const s = expressionSwap(a, true).squash;
+          if (s < last - 1e-9) return false;
+          last = s;
+        }
+        return true;
+      })());
+
+const swap = { l: expressionSwap(1, true), r: expressionSwap(0, true),
+               mouth: expressionSwap(0, false) };
+const artPart = { expression: { kind: "eye", side: "l", replaces: ["eyewhitel"] }, replacedBy: null };
+const replacedPart = { expression: null, replacedBy: "l" };
+const otherPart = { expression: null, replacedBy: null };
+check("a pack part draws at its own state's strength",
+      near(opacityOf(artPart, { swap }), 1));
+check("what it stands in for fades out under it",
+      near(opacityOf(replacedPart, { swap }), 0));
+check("the other eye is untouched by this one's blink",
+      near(opacityOf({ expression: null, replacedBy: "r" }, { swap }), 1));
+check("everything else draws at full", near(opacityOf(otherPart, { swap }), 1));
+check("a run with no pack draws every part at full",
+      near(opacityOf(replacedPart, {}), 1));
+
+check("the blink geometry falls back to the blink amount when nothing swaps",
+      (() => {
+        deform(eye, 0, { ...still, blink: { l: 1, r: 0 } });
+        const withoutSquash = shiftAt(eye, 280).dy;
+        deform(eye, 0, { ...still, blink: { l: 1, r: 0 }, squash: { l: 1, r: 0 } });
+        return near(withoutSquash, shiftAt(eye, 280).dy, 1e-9) && withoutSquash > 1;
+      })());
+check("with art the replaced eye only closes as far as the swap point",
+      (() => {
+        deform(eye, 0, { ...still, blink: { l: 1, r: 0 }, squash: { l: SWAP_HI, r: 0 } });
+        const held = shiftAt(eye, 280).dy;
+        deform(eye, 0, { ...still, blink: { l: 1, r: 0 } });
+        return held < shiftAt(eye, 280).dy;
       })());
 
 console.log("\ntilt about the neck pivot");
