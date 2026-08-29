@@ -620,6 +620,44 @@ Old runs pick all of this up without the GPU pass that made them, since stages
 A-D read `{tag: full-canvas RGBA}` and nothing else:
 `python -m seethrough_engine.rig <run dir>`.
 
+**2026-08-29 -- the line across the neck was colour, not coverage.** After the
+edge alpha was solved, one line survived: a step where `neck` hands over to
+`topwear`, running across the neck exactly along their boundary.
+
+It was not a seam in the usual sense. Every generated layer carries a small
+constant colour bias against the original, and each one a different bias --
+`topwear` 8/4/5 bright, `ears` 6/7/6, `back hair` 3/4/3, `face` 1/3/2 dark.
+Alone that is invisible; nobody sees a garment three levels too bright. Where
+two layers meet, the difference between their biases is a step, and a step
+along a boundary is a line.
+
+`body_remainder` measures exactly 0, which is the check that the measurement
+means what it says: it is the original's own pixels, and the only layer in the
+stack that was not generated.
+
+`rig.fit_layer_tone` takes one constant out of each layer, measured where that
+layer is the topmost thing visible so it is judged on pixels it is responsible
+for, and capped, since a layer with little showing has little to fit against.
+It is the one place the pipeline changes a layer's colour rather than its alpha.
+
+| | composite mae | bad ratio |
+| --- | --- | --- |
+| raw layers | 18.30 | 8.57% |
+| after `reclaim_occluded` | 17.02 | 7.48% |
+| ... and `fit_edge_alpha` | 15.87 | 6.44% |
+| ... and `fit_layer_tone` | **9.47** | **5.20%** |
+
+The bias was the largest single error in the composite, and nothing in the rig
+had been looking for it. The second run lands in the same place, 9.23 and 5.17%.
+
+**The line is fainter and not gone**, because `topwear` covers two materials --
+the white shirt beside the neck and the beige cardigan everywhere else -- and
+one constant cannot fit both. Its residual is 0 overall and +6 red at the seam.
+A low-frequency field instead of a constant does fix that locally (the neck band
+goes from -2.8 to -0.5) and is worse everywhere else (mae 9.99, bad 6.41%),
+so it is not taken. What the residual asks for is a constant per *material*
+rather than per layer, and that is a different piece of work.
+
 ## Out of scope
 
 Deferred deliberately, not forgotten:

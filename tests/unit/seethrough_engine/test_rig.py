@@ -7,6 +7,7 @@ import numpy as np
 
 from seethrough_engine.rig import (
     fit_edge_alpha,
+    fit_layer_tone,
     BODY_REMAINDER,
     BODY_WEIGHT,
     EYE_SPLIT_TAGS,
@@ -54,6 +55,66 @@ def portrait_layers():
         "neck": rgba([(58, 56, 70, 72)]),
         "topwear": rgba([(36, 72, 92, 124)]),
     }
+
+
+class ToneFitTests(unittest.TestCase):
+    """Every generated layer is a little off from the picture, and each by a
+    different amount. Alone that is invisible; where two meet it is a line."""
+
+    def scene(self, garment_bias=8, neck_bias=-2, base=200):
+        """A neck above a garment, meeting at y=60: the two layers each carry
+        their own bias and their boundary is where it shows."""
+        original = np.zeros((CANVAS, CANVAS, 4), dtype=np.uint8)
+        original[20:110, 20:110, :3] = base
+        original[20:110, 20:110, 3] = 255
+        garment = np.zeros_like(original)
+        garment[60:110, 20:110, :3] = base + garment_bias
+        garment[60:110, 20:110, 3] = 255
+        neck = np.zeros_like(original)
+        neck[20:60, 20:110, :3] = base + neck_bias
+        neck[20:60, 20:110, 3] = 255
+        return original, {"topwear": garment, "neck": neck}
+
+    def test_each_layer_s_bias_is_measured_and_removed(self):
+        original, layers = self.scene()
+        out, shifts = fit_layer_tone(layers, original)
+        self.assertEqual(shifts["topwear"], [-8, -8, -8])
+        self.assertEqual(shifts["neck"], [2, 2, 2])
+        self.assertEqual(int(out["topwear"][80, 60, 0]), 200)
+        self.assertEqual(int(out["neck"][30, 60, 0]), 200)
+
+    def test_the_step_where_they_meet_goes_with_it(self):
+        original, layers = self.scene()
+        before = abs(int(layers["neck"][59, 60, 0]) - int(layers["topwear"][61, 60, 0]))
+        out, _ = fit_layer_tone(layers, original)
+        after = abs(int(out["neck"][59, 60, 0]) - int(out["topwear"][61, 60, 0]))
+        self.assertEqual(before, 10)
+        self.assertLessEqual(after, 1)
+
+    def test_a_layer_that_already_matches_is_left_alone(self):
+        original, layers = self.scene(garment_bias=0, neck_bias=0)
+        _, shifts = fit_layer_tone(layers, original)
+        self.assertEqual(shifts, {})
+
+    def test_a_layer_with_almost_nothing_showing_is_not_fitted(self):
+        original, layers = self.scene()
+        speck = np.zeros_like(layers["neck"])
+        speck[30:32, 30:32, :3] = 10
+        speck[30:32, 30:32, 3] = 255
+        layers["mouth"] = speck
+        _, shifts = fit_layer_tone(layers, original)
+        self.assertNotIn("mouth", shifts)
+
+    def test_the_shift_is_capped(self):
+        original, layers = self.scene(garment_bias=40, base=120)
+        _, shifts = fit_layer_tone(layers, original)
+        self.assertEqual(shifts["topwear"], [-16, -16, -16])
+
+    def test_only_colour_moves_and_alpha_does_not(self):
+        original, layers = self.scene()
+        out, _ = fit_layer_tone(layers, original)
+        for tag in layers:
+            self.assertTrue(np.array_equal(out[tag][..., 3], layers[tag][..., 3]))
 
 
 class EdgeFitTests(unittest.TestCase):

@@ -48,6 +48,7 @@ __all__ = [
     "detect_anchors",
     "RECLAIM_PAIRS",
     "reclaim_occluded",
+    "fit_layer_tone",
     "fit_edge_alpha",
     "composite_layers",
     "composite_fidelity",
@@ -174,6 +175,20 @@ EDGE_MIN_CONTRAST = 25    # per channel, below which the solve is noise
 # Three quarters rather than a half is the conservative reading of the same
 # rule: an open mouth is a surface in one run and a stroke in the next.
 EDGE_MIN_INTERIOR = 0.75
+
+# Every generated layer carries a small constant colour bias against the
+# original, and each one a different bias: on A-001 `topwear` is 8/4/5 bright,
+# `ears` 6/7/6, `back hair` 3/4/3, while `face` is 1/3/2 dark. Where two of them
+# meet, the difference between their biases is a step, which is what draws a
+# line across the neck exactly where `neck` hands over to `topwear`.
+#
+# `body_remainder` measures 0, which is the check on this: it is the original's
+# own pixels, and it is the only layer that is not generated.
+#
+# One constant per layer, fitted where the layer is the topmost thing visible,
+# and capped -- a layer with little showing has little to fit against.
+TONE_MIN_SAMPLE = 300
+TONE_MAX_SHIFT = 16
 
 MANIFEST_VERSION = "0.1"
 RIG_SUBDIR = "rig"
@@ -604,6 +619,64 @@ def reclaim_occluded(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarra
     return out, moved
 
 
+def fit_layer_tone(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarray, *,
+                   order: tuple[str, ...] = RIG_Z_ORDER,
+                   alpha_threshold: int = 200,
+                   min_sample: int = TONE_MIN_SAMPLE,
+                   max_shift: int = TONE_MAX_SHIFT,
+                   ) -> tuple[dict[str, np.ndarray], dict[str, list[int]]]:
+    """Take each layer's constant colour bias out of it.
+
+    A generated layer is a little off from the picture it was decomposed from,
+    and every layer is off by a different amount. Alone that is invisible --
+    nobody can see a garment three levels too bright. Together it is a seam:
+    where two layers meet, the difference between their biases is a step, and a
+    step along a boundary is a line. On A-001 that is the line across the neck,
+    where `neck` at +1 hands over to `topwear` at -8.
+
+    The bias is measured where a layer is the topmost thing visible, so it is
+    compared against pixels it is actually responsible for, and it is capped,
+    because a layer with little showing has little to fit against.
+
+    This is the one place the pipeline changes a layer's colour rather than its
+    alpha. `body_remainder` measures 0 and stays untouched, which is the check
+    that the measurement means what it says: it is the original's own pixels,
+    and the only layer here that was not generated.
+    """
+    original = np.asarray(original_rgba)[..., :3].astype(np.int16)
+    canvas_h, canvas_w = original.shape[:2]
+
+    def rank(tag: str) -> int:
+        return order.index(tag) if tag in order else -1
+
+    tags = sorted(layer_dict, key=rank)
+    owner = np.full((canvas_h, canvas_w), -1, np.int16)
+    for index, tag in enumerate(tags):
+        owner[np.asarray(layer_dict[tag])[..., 3] > alpha_threshold] = index
+
+    out: dict[str, np.ndarray] = {}
+    shifts: dict[str, list[int]] = {}
+    for index, tag in enumerate(tags):
+        layer = np.asarray(layer_dict[tag])
+        visible = owner == index
+        if int(visible.sum()) < min_sample:
+            out[tag] = layer
+            continue
+        shift = np.clip(np.median(original[visible]
+                                  - layer[..., :3][visible].astype(np.int16), axis=0),
+                        -max_shift, max_shift)
+        if not np.any(np.abs(shift) >= 1):
+            out[tag] = layer
+            continue
+        patched = np.array(layer, copy=True)
+        patched[..., :3] = np.clip(layer[..., :3].astype(np.int16) + shift.astype(np.int16),
+                                   0, 255).astype(np.uint8)
+        out[tag] = patched
+        shifts[tag] = [int(v) for v in shift]
+
+    return out, shifts
+
+
 def fit_edge_alpha(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarray, *,
                    order: tuple[str, ...] = RIG_Z_ORDER,
                    alpha_threshold: int = 10, band: int = EDGE_BAND_PX,
@@ -827,10 +900,12 @@ def build_rig(layer_dict: dict[str, np.ndarray], *,
     # hides the neck almost completely, and the remainder split below reads the
     # group unions this changes.
     reclaimed: dict[str, int] = {}
+    tone_fit: dict[str, list[int]] = {}
     edge_fit: dict[str, int] = {}
     if original_rgba is not None:
         working, reclaimed = reclaim_occluded(working, original_rgba,
                                               alpha_threshold=alpha_threshold)
+        working, tone_fit = fit_layer_tone(working, original_rgba)
         working, edge_fit = fit_edge_alpha(working, original_rgba,
                                            alpha_threshold=alpha_threshold)
 
@@ -911,6 +986,7 @@ def build_rig(layer_dict: dict[str, np.ndarray], *,
             "tag_version": tag_version,
             "depth": "marigold" if depth_dict else "table",
             "reclaimed": reclaimed,
+            "tone_fit": tone_fit,
             "edge_fit": edge_fit,
         },
         "anchors": anchors,
