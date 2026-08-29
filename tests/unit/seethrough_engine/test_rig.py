@@ -8,7 +8,6 @@ import numpy as np
 from seethrough_engine.rig import (
     BODY_REMAINDER,
     BODY_WEIGHT,
-    COLLAR_WEIGHT,
     EYE_SPLIT_TAGS,
     GROUP_BODY,
     GROUP_HEAD,
@@ -274,16 +273,18 @@ class BuildRigTests(unittest.TestCase):
         self.assertEqual(weights["neck"]["bottom"], BODY_WEIGHT)
         self.assertEqual(weights["face"], {"mode": "constant", "value": HEAD_WEIGHT})
 
-    def test_a_collar_overlapping_the_neck_gets_a_ramp(self):
+    def test_a_collar_shares_the_neck_gradient_exactly(self):
+        """`reclaim_occluded` cuts a window in the garment for the neck to show
+        through, so the window and its contents are two sides of one seam. Two
+        different weight functions there and the window's edge slices the neck
+        as the head turns -- a 2.05 px crack on the collar line, measured."""
         layers = dict(self.layers)
         layers["topwear"] = rgba([(36, 66, 92, 124)])  # collar rides up over the neck
         manifest, _ = build_rig(layers, frame_size=(CANVAS, CANVAS))
         weights = {part["tag"]: part["weight"] for part in manifest["parts"]}
-        self.assertEqual(weights["topwear"]["mode"], "gradient_y")
-        self.assertEqual(weights["topwear"]["top"], COLLAR_WEIGHT)
+        self.assertEqual(weights["topwear"], weights["neck"])
+        self.assertEqual(weights["topwear"]["top"], HEAD_WEIGHT)
         self.assertEqual(weights["topwear"]["bottom"], BODY_WEIGHT)
-        # The ramp ends where the neck ends inside the torso, not at the hem.
-        self.assertEqual(weights["topwear"]["y_bottom"], 72.0)
 
     def test_a_garment_clear_of_the_neck_stays_rigid(self):
         """A low neckline is not a collar; ramping it would wobble the torso."""

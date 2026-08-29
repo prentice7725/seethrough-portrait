@@ -99,12 +99,20 @@ NECK_TOP_WEIGHT = HEAD_WEIGHT
 NECK_BOTTOM_WEIGHT = BODY_WEIGHT
 
 # A stand collar (a gakuran, a turtleneck) touches the jaw, so leaving it fully
-# rigid while the head tilts reads as the chin cutting into it. These parts get
-# a ramp from the collar line down to where the neck ends inside the torso.
-# Unlike the neck's endpoints this one *is* a free parameter -- it trades a
-# livelier collar against a torso that starts to wobble.
+# rigid while the head tilts reads as the chin cutting into it. A garment whose
+# top edge overlaps the neck therefore takes **the neck's own weight function**
+# over that overlap, rather than a ramp of its own.
+#
+# That is not a stylistic choice. `reclaim_occluded` cuts a window in the
+# garment for the neck to show through, so the window and its contents are two
+# sides of one seam: give them different weights and the window's edge slices
+# the neck as the head turns. An independent collar constant of 0.45 against a
+# neck at 0.571 on the collar line opened a 2.05 px crack there; sharing the
+# function leaves only what the two parts' different depths contribute, 0.43 px.
+#
+# Below the neck the gradient has already reached BODY_WEIGHT, so the rest of
+# the garment is unaffected.
 COLLAR_TAGS = frozenset({"topwear", "neckwear"})
-COLLAR_WEIGHT = 0.45
 
 # The head rotates about a point near the *bottom* of the neck, which is what
 # makes a tilt read as a neck bending rather than a head sliding sideways.
@@ -621,9 +629,11 @@ def _weight_for(tag: str, group: str, box: tuple[int, int, int, int],
         return {"mode": "gradient_y", "top": NECK_TOP_WEIGHT, "bottom": NECK_BOTTOM_WEIGHT,
                 "y_top": float(neck_box[1]), "y_bottom": float(neck_box[3])}
     if tag in COLLAR_TAGS and neck_box is not None and box[1] < neck_box[3]:
-        # The garment overlaps the neck, so its top edge is a collar.
-        return {"mode": "gradient_y", "top": COLLAR_WEIGHT, "bottom": BODY_WEIGHT,
-                "y_top": float(box[1]), "y_bottom": float(neck_box[3])}
+        # The garment overlaps the neck, so its top edge is a collar: it shares
+        # the neck's gradient exactly, which is what keeps the reclaimed window
+        # and the neck showing through it moving together.
+        return {"mode": "gradient_y", "top": NECK_TOP_WEIGHT, "bottom": NECK_BOTTOM_WEIGHT,
+                "y_top": float(neck_box[1]), "y_bottom": float(neck_box[3])}
     if group == GROUP_HEAD:
         return {"mode": "constant", "value": HEAD_WEIGHT}
     if group == GROUP_NECK:

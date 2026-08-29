@@ -168,11 +168,22 @@ The first implementation borrowed 0.55 for the neck top against a head at 1.00
 and put a 0.45 discontinuity right where the two meet -- with a stand collar
 hiding three quarters of the neck, that jaw step was the only part visible.
 
-A garment whose top edge overlaps the neck is a collar, and gets its own ramp
-from `COLLAR_WEIGHT` down to `BODY_WEIGHT` over the collar zone. A stand collar
-touches the jaw, so leaving it rigid reads as the chin cutting into it. Unlike
-the neck's endpoints this one *is* a free parameter -- it trades a livelier
-collar against a wobbling torso -- so the preview exposes it as a slider.
+A garment whose top edge overlaps the neck is a collar, and takes **the neck's
+own weight function** over that overlap. A stand collar touches the jaw, so
+leaving it rigid reads as the chin cutting into it -- but the reason it shares
+the neck's gradient rather than getting one of its own is stronger than that:
+`reclaim_occluded` cuts a window in the garment for the neck to show through,
+so the window and its contents are two sides of one seam. Give them different
+weights and the window's edge slices the neck as the head turns. An independent
+collar constant of 0.45 against a neck at 0.571 on the collar line opened a
+2.05 px crack there; sharing the function leaves 0.43 px, which is only what
+the two parts' differing depths contribute.
+
+The shoulders do not come along, because the neck's gradient reaches
+`BODY_WEIGHT` at the bottom of the neck -- which is anatomically where the
+shoulders start to broaden. Measured on A-001: the garment is 22 px wide at the
+collar line where the weight is 0.571, and 260 px wide by the time the weight
+is back to 0.161.
 
 **Open risk:** `back hair` frequently extends below the shoulder line, and a
 flat 1.00 will tear it away from the body there. If the preview shows that,
