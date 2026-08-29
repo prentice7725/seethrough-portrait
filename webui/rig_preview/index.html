@@ -85,7 +85,10 @@
   <h2>Idle</h2>
   <label class="row"><input type="checkbox" id="autoIdle"> Auto idle motion</label>
   <p class="hint">Off by default: the page opens on the rest pose, so what you
-     see first is the decomposition rather than the animation.</p>
+     see first is the decomposition rather than the animation. Idle tilts and
+     breathes but does not turn &mdash; a turn moves every part by a different
+     amount, so it opens seams, and idle must not be what finds them. Use the
+     turn sliders for that.</p>
   <label class="row"><input type="checkbox" id="doBlink" checked> Blink</label>
   <label class="row"><input type="checkbox" id="doBreathe" checked> Breathing</label>
   <label>Breath <span class="val" id="breathAmpv">3.0px</span>
@@ -380,11 +383,15 @@ const fromQuery = new URLSearchParams(location.search).get("manifest");
 if (fromQuery) {
   (async () => {
     try {
-      const manifest = await (await fetch(fromQuery)).json();
+      // `no-store` throughout: a run directory is rewritten in place, and a
+      // cached layer beside a fresh manifest renders an artifact that was
+      // fixed hours ago -- which is worse than no preview at all, because it
+      // looks like a finding.
+      const manifest = await (await fetch(fromQuery, { cache: "no-store" })).json();
       const base = fromQuery.slice(0, fromQuery.lastIndexOf("/") + 1);
       const images = new Map();
       for (const [name, part] of allParts(manifest)) {
-        const blob = await (await fetch(base + part.image)).blob();
+        const blob = await (await fetch(base + part.image, { cache: "no-store" })).blob();
         images.set(name, await createImageBitmap(blob));
       }
       build(manifest, images);
@@ -878,13 +885,18 @@ function frame(now) {
   state.lastFrame = now;
 
   if (document.getElementById("autoIdle").checked) {
-    // Two incommensurable periods so the loop never visibly repeats, scaled by
-    // the manifest's declared limits rather than by constants of its own: past
-    // `max_x` the parallax slides the hair off the head it was covering, and
-    // idle motion must never be what discovers that.
-    const turn = state.manifest.motion.head_turn;
-    setSlider("turnX", (Math.sin(t * 0.37) * 0.73 + Math.sin(t * 0.13) * 0.27) * turn.max_x);
-    setSlider("turnY", Math.sin(t * 0.29 + 1.1) * 0.45 * turn.max_y);
+    // Tilt only, and only as far as the manifest allows.
+    //
+    // The turn is depth-differential by construction: every part moves by a
+    // different amount, which is the whole illusion and also means it can only
+    // ever open the seams between them -- the temple gash H1 measured, the
+    // reclaimed window sliding against the neck it was cut for. A tilt rotates
+    // about the neck pivot scaled by the same weight field the rig is built
+    // on, so everything sharing a weight turns rigidly together and the one
+    // gradient is continuous by construction. Nothing can come apart.
+    //
+    // Idle is what plays unattended, so it must never be what discovers an
+    // artifact. The sliders reach well past this, which is what they are for.
     setSlider("tilt", Math.sin(t * 0.23 + 0.6) * state.manifest.motion.head_tilt.max_deg);
   }
 
