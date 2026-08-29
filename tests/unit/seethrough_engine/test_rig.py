@@ -78,8 +78,8 @@ class ToneFitTests(unittest.TestCase):
     def test_each_layer_s_bias_is_measured_and_removed(self):
         original, layers = self.scene()
         out, shifts = fit_layer_tone(layers, original)
-        self.assertEqual(shifts["topwear"], [-8, -8, -8])
-        self.assertEqual(shifts["neck"], [2, 2, 2])
+        self.assertTrue(all(row == [-8, -8, -8] for row in shifts["topwear"]))
+        self.assertTrue(all(row == [2, 2, 2] for row in shifts["neck"]))
         self.assertEqual(int(out["topwear"][80, 60, 0]), 200)
         self.assertEqual(int(out["neck"][30, 60, 0]), 200)
 
@@ -108,7 +108,33 @@ class ToneFitTests(unittest.TestCase):
     def test_the_shift_is_capped(self):
         original, layers = self.scene(garment_bias=40, base=120)
         _, shifts = fit_layer_tone(layers, original)
-        self.assertEqual(shifts["topwear"], [-16, -16, -16])
+        self.assertTrue(all(row == [-16, -16, -16] for row in shifts["topwear"]))
+
+    def test_one_layer_covering_two_materials_gets_a_constant_for_each(self):
+        """`topwear` is a white shirt beside the neck and a cardigan everywhere
+        else. One constant fits neither, and the misfit is a line at the seam."""
+        original = np.zeros((CANVAS, CANVAS, 4), dtype=np.uint8)
+        original[20:110, 20:110, :3] = 120          # cardigan
+        original[20:50, 20:110, :3] = 230           # shirt
+        original[20:110, 20:110, 3] = 255
+        garment = np.zeros_like(original)
+        garment[20:110, 20:110, :3] = 120 + 2       # each material off by its own
+        garment[20:50, 20:110, :3] = 230 - 9
+        garment[20:110, 20:110, 3] = 255
+        out, shifts = fit_layer_tone({"topwear": garment}, original)
+        self.assertGreaterEqual(len(shifts["topwear"]), 2)
+        self.assertAlmostEqual(int(out["topwear"][80, 60, 0]), 120, delta=1)
+        self.assertAlmostEqual(int(out["topwear"][30, 60, 0]), 230, delta=1)
+
+    def test_a_hidden_part_of_a_material_is_corrected_with_the_rest_of_it(self):
+        """It is the same cloth, and a turn may bring it into view."""
+        original, layers = self.scene()
+        hidden = np.zeros_like(layers["topwear"])
+        hidden[60:110, 20:110] = layers["topwear"][60:110, 20:110]
+        hidden[115:120, 20:110, :3] = 208           # off-canvas-subject, same cloth
+        hidden[115:120, 20:110, 3] = 255
+        out, _ = fit_layer_tone({"topwear": hidden, "neck": layers["neck"]}, original)
+        self.assertLess(int(out["topwear"][117, 60, 0]), 208)
 
     def test_only_colour_moves_and_alpha_does_not(self):
         original, layers = self.scene()

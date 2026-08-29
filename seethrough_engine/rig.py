@@ -187,8 +187,26 @@ EDGE_MIN_INTERIOR = 0.75
 #
 # One constant per layer, fitted where the layer is the topmost thing visible,
 # and capped -- a layer with little showing has little to fit against.
+# ... and one constant is not enough, because a layer covers more than one
+# material: `topwear` is a white shirt beside the neck and a beige cardigan
+# everywhere else, and fitting both at once leaves its residual at 0 overall and
+# +6 red at the seam -- which is the line, still there. So the bias is fitted per
+# *material*, found by clustering the layer's own colours, which is exactly what
+# flat anime shading gives up easily.
+#
+# Two families were tried and rejected first, and both failed for the same
+# reason: the correction has to be a function of colour, not of position or
+# brightness. A low-frequency field over position fixes the seam and absorbs
+# real shading elsewhere (mae 9.99 against 9.47). A gain-and-offset over
+# brightness is worse still -- a straight line fitted across a layer that holds
+# both a dark outline and bright cloth moves the outline, and bad_ratio goes
+# from 5.2% to 20%. A constant per colour cluster moves neither: two pixels of
+# similar colour get similar corrections, so no new step can appear between
+# them, and measurably none does.
 TONE_MIN_SAMPLE = 300
 TONE_MAX_SHIFT = 16
+TONE_CLUSTERS = 8       # at most; a layer with fewer materials uses fewer
+TONE_MIN_CLUSTER = 150  # ... and a cluster this small falls back to the layer's
 
 MANIFEST_VERSION = "0.1"
 RIG_SUBDIR = "rig"
@@ -624,7 +642,9 @@ def fit_layer_tone(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarray,
                    alpha_threshold: int = 200,
                    min_sample: int = TONE_MIN_SAMPLE,
                    max_shift: int = TONE_MAX_SHIFT,
-                   ) -> tuple[dict[str, np.ndarray], dict[str, list[int]]]:
+                   clusters: int = TONE_CLUSTERS,
+                   min_cluster: int = TONE_MIN_CLUSTER,
+                   ) -> tuple[dict[str, np.ndarray], dict[str, list[list[int]]]]:
     """Take each layer's constant colour bias out of it.
 
     A generated layer is a little off from the picture it was decomposed from,
@@ -654,25 +674,51 @@ def fit_layer_tone(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarray,
     for index, tag in enumerate(tags):
         owner[np.asarray(layer_dict[tag])[..., 3] > alpha_threshold] = index
 
+    criteria = (cv2.TERM_CRITERIA_EPS + cv2.TERM_CRITERIA_MAX_ITER, 20, 1.0)
     out: dict[str, np.ndarray] = {}
-    shifts: dict[str, list[int]] = {}
+    shifts: dict[str, list[list[int]]] = {}
     for index, tag in enumerate(tags):
         layer = np.asarray(layer_dict[tag])
         visible = owner == index
-        if int(visible.sum()) < min_sample:
+        sample = int(visible.sum())
+        if sample < min_sample:
             out[tag] = layer
             continue
-        shift = np.clip(np.median(original[visible]
-                                  - layer[..., :3][visible].astype(np.int16), axis=0),
-                        -max_shift, max_shift)
-        if not np.any(np.abs(shift) >= 1):
+
+        source = layer[..., :3][visible].astype(np.float32)
+        target = original[visible].astype(np.float32)
+        whole = np.clip(np.median(target - source, axis=0), -max_shift, max_shift)
+
+        # One constant per material, and the materials are found by clustering
+        # the layer's own colours -- flat anime shading separates them easily.
+        count = max(1, min(clusters, sample // min_cluster))
+        if count > 1:
+            _, labels, centres = cv2.kmeans(source, count, None, criteria, 3,
+                                            cv2.KMEANS_PP_CENTERS)
+            labels = labels.ravel()
+        else:
+            labels = np.zeros(sample, np.int32)
+            centres = source.mean(axis=0, keepdims=True)
+        fitted = np.stack([
+            np.clip(np.median(target[labels == c] - source[labels == c], axis=0),
+                    -max_shift, max_shift)
+            if int((labels == c).sum()) >= min_cluster else whole
+            for c in range(count)]).astype(np.float32)
+
+        if not np.any(np.abs(fitted) >= 1):
             out[tag] = layer
             continue
+
+        # Every pixel of the layer takes the shift of the material it belongs
+        # to, including the ones currently hidden: they are the same cloth, and
+        # a turn may bring them into view.
+        flat = layer[..., :3].reshape(-1, 3).astype(np.float32)
+        nearest = ((flat[:, None, :] - centres[None, :, :]) ** 2).sum(axis=2).argmin(axis=1)
         patched = np.array(layer, copy=True)
-        patched[..., :3] = np.clip(layer[..., :3].astype(np.int16) + shift.astype(np.int16),
-                                   0, 255).astype(np.uint8)
+        patched[..., :3] = np.clip(flat + fitted[nearest], 0, 255
+                                   ).reshape(layer.shape[0], layer.shape[1], 3).astype(np.uint8)
         out[tag] = patched
-        shifts[tag] = [int(v) for v in shift]
+        shifts[tag] = [[int(v) for v in row] for row in fitted]
 
     return out, shifts
 

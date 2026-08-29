@@ -650,13 +650,37 @@ It is the one place the pipeline changes a layer's colour rather than its alpha.
 The bias was the largest single error in the composite, and nothing in the rig
 had been looking for it. The second run lands in the same place, 9.23 and 5.17%.
 
-**The line is fainter and not gone**, because `topwear` covers two materials --
-the white shirt beside the neck and the beige cardigan everywhere else -- and
-one constant cannot fit both. Its residual is 0 overall and +6 red at the seam.
-A low-frequency field instead of a constant does fix that locally (the neck band
-goes from -2.8 to -0.5) and is worse everywhere else (mae 9.99, bad 6.41%),
-so it is not taken. What the residual asks for is a constant per *material*
-rather than per layer, and that is a different piece of work.
+One constant per layer was not enough, because a layer covers more than one
+material: `topwear` is a white shirt beside the neck and a beige cardigan
+everywhere else, and fitting both at once leaves its residual at 0 overall and
++6 red at the seam -- which is the line, still there.
+
+**The correction has to be a function of colour**, and two other families were
+tried first to find that out. A low-frequency field over *position* fixes the
+seam and absorbs real shading elsewhere (mae 9.99 against 9.47). A gain and
+offset over *brightness* is worse still: a straight line fitted across a layer
+holding both a dark outline and bright cloth moves the outline, and `bad_ratio`
+goes from 5.2% to 20%. A constant per colour cluster moves neither, and cannot
+introduce a new step by construction -- two pixels of similar colour get similar
+corrections. Measured across the whole subject, the worst row-step the composite
+has and the original does not is unchanged by clustering (10.6 luma at the brow,
+which is a different problem), while mae falls again:
+
+| | composite mae | bad ratio |
+| --- | --- | --- |
+| one constant per layer | 9.47 | 5.20% |
+| one per material, k up to 8 | **8.84** | **5.14%** |
+
+Materials found per layer on A-001: 8 for `topwear`, `face`, `neck` and the
+hair, 6 for `ears`, 3 for `eyewhite` and `irides` -- a cluster smaller than 150
+px falls back to the layer's own constant, which is what keeps a small layer
+from being fitted to noise. The shift is applied to hidden pixels too: it is the
+same cloth, and a turn may bring it into view.
+
+The line is now 1 to 2 luma with a worst step of 1.8, against 4.4 and a
+persistent 3 before. What is left is the limit of a per-material constant, and
+going further means changing what the decomposition is allowed to do rather than
+how its output is corrected.
 
 ## Out of scope
 
