@@ -711,6 +711,60 @@ Deferred deliberately, not forgotten:
 5. The milestone ends with a written verdict -- viable, conditionally viable,
    or not viable -- per the fork plan's Phase 2 wording.
 
+## Verdict
+
+**Conditionally viable.** Portrait Mode's layers drive a pseudo-2.5D talking
+portrait well enough to build on, and the conditions are known and measurable
+rather than vague.
+
+Against the acceptance list:
+
+1. **Met.** `rig_manifest.json` comes out of an A-001 run with no manual layer
+   editing, and `python -m seethrough_engine.rig <run dir>` rebuilds it for a
+   run made before any of this existed.
+2. **Met, four of four.** Head turn, tilt, breathing and blink all run in the
+   preview, plus a mouth that opens and an ellipsoid shell turn.
+3. **Answered by construction.** The remainder is split by nearest owner, so
+   `head_remainder` travels with the head; the preview keeps the fault as a
+   toggle rather than a memory. It was confirmed by eye in the preview, not by
+   a number, which is the weakest of the five answers here.
+4. **Met.** 0.8 on the parallax path, and the artifact is named: not a hole but
+   correctly-painted content wrongly exposed, merging into one gash down the
+   temple between 0.4 and 0.6. Idle is capped at 0.3, below where it merges.
+5. This section.
+
+Hypothesis by hypothesis:
+
+| # | Answer |
+| --- | --- |
+| H1 | **Revised, not confirmed.** The layers *are* occlusion-complete -- `face` is eyeless skin, `head` a full skull -- so a turn never opens a hole. It exposes correctly-painted content that should still be covered, and the limit is how far one layer overhangs the next. |
+| H2 | **Yes, by construction**, and reproducible on demand through the toggle. |
+| H3 | **Not decidable from a still.** The three neck modes differ by up to 11 px at maximum turn, but the weight multiplies a head transform, so at rest they are identical. The gradient's justification is continuity at its two seams, which is verified by construction: its endpoints *are* the head and body weights. |
+| H4 | **Yes** on A-001. Connected-component splitting gave a working left and right eye, and each winks independently. |
+| H5 | **Unanswered.** Both runs used the fixed depth table; Marigold was never exercised against it. The table was never the limiting factor, which is weak evidence for its sufficiency and not a test of it. |
+| H6 | **Yes.** At equal apparent turn the largest revealed region falls from 4866 px to 1090 at turnX 1.0, and the merge event between 0.4 and 0.6 does not happen at all. The cost is that hair layers sharing a shell no longer parallax against each other. |
+
+**The conditions.** A run has to pass the Silhouette Guard cleanly -- wherever
+`body_remainder` carries the picture, H1's premise is false by construction --
+and it has to contain the feature layers a blink needs, which the verdict does
+not currently check (the PASS run with no `eyewhite` at all). A real closed eye
+and open mouth need a donor image; the rig can only squash what it was given.
+
+**What was not asked for and turned out to matter most.** The rig is the first
+thing in this fork that made decomposition faults *visible*. Every seam it
+showed was already in the composite metric, unnoticed: a layer's edge alpha
+fitted against nothing, a per-layer colour bias nobody was looking for. Chasing
+them took the composite from mae 18.30 to 9.21 and `bad_ratio` from 8.57% to
+5.42% -- on layers the model had already produced, with no GPU pass. A rig that
+animates is the deliverable; a rig that *renders* turned out to be the better
+diagnostic, and `python -m seethrough_engine.rig` exists so old runs get the
+benefit.
+
+**Where it stops being feasibility.** Hair strand physics, a mouth synthesized
+rather than donated, per-region colour fitting beyond one constant per material,
+and Spine bone emission are all real work with known shapes, and all of them are
+Phase 3 questions rather than Phase 2 ones.
+
 ## Algorithm references
 
 Implemented from published behaviour, not copied source:

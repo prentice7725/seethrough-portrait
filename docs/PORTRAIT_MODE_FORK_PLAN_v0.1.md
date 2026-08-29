@@ -41,7 +41,7 @@ and `missing_mask`.
 | M1 | Portrait core and A-001 validation | silhouette recovered; face/hair/body usable |
 | M2 | single-image WebUI | A-001 can be run and exported from the UI |
 | M3 | batch processing | multiple portraits produce isolated outputs and reports |
-| M4 | 2.5D feasibility | at least two of idle, blink, mouth, or head motion work |
+| M4 | 2.5D feasibility | at least two of idle, blink, mouth, or head motion work -- **met, four of four; verdict: conditionally viable** |
 
 ## Success criteria
 
@@ -57,11 +57,22 @@ M1 and M2 are implemented. See `M1_IMPLEMENTATION_SPEC.md` and
 procedure, and `M2_IMPLEMENTATION_SPEC.md` for the standalone single-image
 webui, including what it could not verify without GPU access.
 
-M4 is being taken before M3: a manual Spine rig test on A-001's exported
-layers was informative enough to justify going straight at the 2.5D
-feasibility question. See `PORTRAIT_AUTO_RIG_FEASIBILITY_v0.1.md`, which
-answers M4 with an automatic rig plus a browser preview rather than a bone
-hierarchy, and stays inside Phase 2's "feasibility only" limit.
+M4 was taken before M3 and is **answered**: a manual Spine rig test on A-001's
+exported layers was informative enough to justify going straight at the 2.5D
+feasibility question. `PORTRAIT_AUTO_RIG_FEASIBILITY_v0.1.md` answers it with an
+automatic rig plus a browser preview rather than a bone hierarchy, inside Phase
+2's "feasibility only" limit, and closes with a verdict of **conditionally
+viable** -- the conditions being a run that passes the Silhouette Guard cleanly,
+a turn held inside its measured limit, and a donor image for the drawings the
+decomposition cannot produce.
+
+Its most useful result was not the one it was built for. The rig is the first
+thing in this fork that made decomposition faults visible, and chasing the seams
+it showed took the composite from mae 18.30 to 9.21 on layers the model had
+already produced -- no GPU pass, and old runs pick it up through
+`python -m seethrough_engine.rig <run dir>`.
+
+M3 (batch processing) is what remains of Phase 1.
 
 ## Candidates
 

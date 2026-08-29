@@ -298,7 +298,82 @@ known limitations, and the implementation contract are in
 [`webui/README.md`](webui/README.md) and
 [`docs/M2_IMPLEMENTATION_SPEC.md`](docs/M2_IMPLEMENTATION_SPEC.md).
 
+## 2.5D rig preview (M4)
+
+An **automatic rig** built from Portrait Mode's layers, animated in the browser.
+No Spine, no Live2D, no bone hierarchy -- vertex weights and one manifest. A
+neck whose top follows the head while its bottom stays with the body is awkward
+to express with two bones and is two lines as a weight gradient.
+
+- A run writes `{base}_rig_manifest.json` and `rig/images/` (a webui checkbox,
+  on by default).
+- Open [`webui/rig_preview/index.html`](webui/rig_preview/index.html), pick the
+  run directory, and it animates: head turn and tilt, breathing, blink, and an
+  ellipsoid shell rotation. No server; it runs from `file://`.
+- A run made before any of this can be re-rigged without the GPU pass that
+  produced it: `python -m seethrough_engine.rig <run dir>`. Stages A-D read
+  `{tag: full-canvas RGBA}` and nothing else, and those layers are already on
+  disk beside the report.
+
+### Expression pack
+
+**A shut eye and an open mouth are drawings the decomposition cannot produce.**
+A-001's `mouth` is a closed mouth and there is no closed eye at all. An image
+model can draw them -- used as a **donor rather than as a portrait**: only the
+region it changed is taken, and every other pixel stays the original's. That is
+the difference from the earlier modular attempt, where the generated image was
+the portrait and the character's identity went with the generator's drift.
+
+```bash
+# recover just the regions a donor image changed (no GPU)
+python -m seethrough_engine.expression <run> eye_closed=<png> mouth_open=<png>
+
+# or decompose the donor in its own right and transplant its layers -- the
+# matte is then the one the model drew, rather than one inferred from a diff
+python -m seethrough_engine.expression <run> --from-run <donor run> eye_closed mouth_open
+```
+
+The donor need not share the base's crop; it is registered by silhouette. What
+an expression may repaint is decided **by the layers**: only pixels whose
+topmost layer is the face's own skin or features, so a differently-drawn lock of
+hair cannot come along. Turning off `Use expression art` in the preview falls
+back to the v0.1 blink (the lash squashed onto the lid line) for comparison.
+
+### Composite fidelity
+
+Rendering the rig is what made **decomposition faults visible** for the first
+time. All three were already in the composite metric; nothing had been looking:
+
+| | what | how it showed |
+| --- | --- | --- |
+| `reclaim_occluded` | pixels a garment and the neck both claim | the garment holding the skin from its own opening, hiding the neck |
+| `fit_edge_alpha` | solves a layer's edge alpha against the original | a black stroke under the jaw; a double chin |
+| `fit_layer_tone` | each layer's colour bias, one constant per material | a step where two layers meet, drawn as a line across the neck |
+
+Composite mae **18.30 → 9.21**, bad ratio **8.57% → 5.42%** -- on layers the
+model had already produced, with no GPU pass.
+
+The design and the measurements are in
+[`docs/PORTRAIT_AUTO_RIG_FEASIBILITY_v0.1.md`](docs/PORTRAIT_AUTO_RIG_FEASIBILITY_v0.1.md).
+M4's verdict is **conditionally viable**.
+
 ## What's New in This Fork
+
+### v1.4.0.dev4 — Portrait Mode M4: the 2.5D rig and the expression pack
+
+- **Automatic 2.5D rig** — `seethrough_engine/rig.py` turns Portrait Mode
+  layers into `rig_manifest.json`: vertex weights instead of bones (the neck a
+  gradient from head to body), a region-aware remainder split, left/right eye
+  separation, and anchors derived from alpha.
+- **Browser preview** — `webui/rig_preview/index.html`: head turn and tilt,
+  breathing, blink, ellipsoid shell rotation. No server, runs from `file://`.
+- **Expression pack** — `seethrough_engine/expression.py`: a generated image
+  used as a donor rather than as a portrait, either by recovering the regions
+  it changed or by transplanting the layers of its own decomposition.
+- **Composite fidelity** — the faults rendering the rig turned up: contested
+  pixels returned, edge alpha solved against the original, per-material colour
+  bias removed. mae 18.30 → 9.21, bad ratio 8.57% → 5.42%.
+- **`python -m seethrough_engine.rig <run>`** — re-rig an old run, no GPU.
 
 ### v1.4.0.dev3 — Spine export from the standalone webui
 
@@ -406,6 +481,7 @@ For the full Portrait Mode design/implementation record:
 - [`docs/M1_IMPLEMENTATION_SPEC.md`](docs/M1_IMPLEMENTATION_SPEC.md) — Portrait Mode core contract and verdict rules
 - [`docs/TEST_PROTOCOL_A001.md`](docs/TEST_PROTOCOL_A001.md) — the A-001 validation procedure both entry points are checked against
 - [`docs/M2_IMPLEMENTATION_SPEC.md`](docs/M2_IMPLEMENTATION_SPEC.md) — standalone webui contract, what's shared with `nodes.py` and why, and the measured VRAM numbers for an 8GB card
+- [`docs/PORTRAIT_AUTO_RIG_FEASIBILITY_v0.1.md`](docs/PORTRAIT_AUTO_RIG_FEASIBILITY_v0.1.md) — M4: the automatic 2.5D rig, the browser preview, the expression pack, and the composite-fidelity faults the rig turned up on the way
 
 ## Acknowledgements
 
