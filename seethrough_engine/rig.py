@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 from collections.abc import Collection
 from typing import Any
 
@@ -51,6 +52,7 @@ __all__ = [
     "composite_fidelity",
     "build_rig",
     "write_rig_project",
+    "rebuild_run_rig",
 ]
 
 GROUP_HEAD = "head"
@@ -829,3 +831,70 @@ def write_rig_project(output_dir: str, base_name: str, manifest: dict[str, Any],
     with open(manifest_path, "w", encoding="utf-8") as f:
         json.dump(manifest, f, indent=2, ensure_ascii=False)
     return manifest_path
+
+
+def rebuild_run_rig(run_dir: str, *, gradient_tags: Collection[str] = ()) -> str:
+    """Rebuild a finished run's rig from the layers it already wrote.
+
+    Stages A-D read `{tag: full-canvas RGBA}` and nothing else, and every one of
+    those layers is on disk beside the report. So a run made before a fix to the
+    remainder split, the weights or `reclaim_occluded` can pick that fix up
+    without the GPU pass that produced it -- which matters because the visible
+    faults in a rig are usually found long after the run that made it.
+
+    Overwrites `{base}_rig_manifest.json` and the part PNGs under `rig/images/`.
+    An expression pack attached to the old manifest does not survive and has to
+    be attached again; `expression.attach_to_run` and `transplant_to_run` both
+    take a run directory, so that is one command.
+    """
+    names = [f for f in os.listdir(run_dir) if f.endswith("_manifest.json")
+             and not f.endswith("_rig_manifest.json")]
+    if not names:
+        raise FileNotFoundError(f"no run manifest in {run_dir}")
+    with open(os.path.join(run_dir, names[0]), encoding="utf-8") as f:
+        run = json.load(f)
+    base_name = run["base"]
+
+    def read(filename):
+        path = os.path.join(run_dir, filename)
+        return np.array(Image.open(path).convert("RGBA")) if os.path.isfile(path) else None
+
+    layer_dict = {tag: read(name) for tag, name in run["layers"].items()}
+    layer_dict = {tag: img for tag, img in layer_dict.items() if img is not None}
+    if not layer_dict:
+        raise FileNotFoundError(f"none of the run's layer PNGs are in {run_dir}")
+    original = read(run.get("original", f"{base_name}_original.png"))
+    remainder = read(f"{base_name}_body_remainder.png")
+
+    # `report` in the run manifest is the report's *filename*, not its contents.
+    report = {}
+    report_name = run.get("report")
+    if isinstance(report_name, str) and os.path.isfile(os.path.join(run_dir, report_name)):
+        with open(os.path.join(run_dir, report_name), encoding="utf-8") as f:
+            report = json.load(f)
+    elif isinstance(report_name, dict):
+        report = report_name
+
+    manifest, images = build_rig(
+        layer_dict, original_rgba=original, body_remainder=remainder,
+        frame_size=(run["height"], run["width"]),
+        gradient_tags=gradient_tags,
+        run_id=os.path.basename(os.path.normpath(run_dir)),
+        tag_version=str(report.get("source", {}).get("tag_version", "")),
+    )
+    return write_rig_project(run_dir, base_name, manifest, images)
+
+
+def main(argv=None) -> int:
+    """`python -m seethrough_engine.rig <run dir>` -- rebuild a run's rig from
+    its own layers, with the current code."""
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if len(argv) != 1:
+        print(main.__doc__, file=sys.stderr)
+        return 2
+    print(rebuild_run_rig(argv[0]))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

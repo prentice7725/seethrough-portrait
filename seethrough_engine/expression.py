@@ -550,6 +550,13 @@ def _run_manifest(run_dir):
         return path, names[0][: -len("_rig_manifest.json")], json.load(f)
 
 
+def _run_original(run_dir, base_name):
+    path = os.path.join(run_dir, f"{base_name}_original.png")
+    if not os.path.isfile(path):
+        return None
+    return np.array(Image.open(path).convert("RGBA"))
+
+
 def _load_layer(run_dir, manifest, tag):
     for part in manifest["parts"]:
         if part["tag"] == tag:
@@ -591,10 +598,20 @@ def transplant_pack(base_dir, donor_dir, states) -> dict[str, Any]:
     `states` maps a state name to nothing but its kind, as elsewhere:
     `("eye_closed", "mouth_open")`.
     """
-    _, _, base_manifest = _run_manifest(base_dir)
-    _, _, donor_manifest = _run_manifest(donor_dir)
+    _, base_name, base_manifest = _run_manifest(base_dir)
+    _, donor_name, donor_manifest = _run_manifest(donor_dir)
     canvas = (base_manifest["canvas"]["width"], base_manifest["canvas"]["height"])
     warp, align_tag, scale = align_runs(donor_manifest, donor_dir, base_manifest, base_dir)
+
+    # The two originals, in one frame, only so the boundary colour can be
+    # matched: a layer carries a margin of its own skin around the feature, and
+    # two generations are never quite the same tone, which draws a faint contour
+    # exactly where the sprite ends.
+    base_original = _run_original(base_dir, base_name)
+    donor_original = _run_original(donor_dir, donor_name)
+    if donor_original is not None:
+        donor_original = cv2.warpAffine(donor_original, warp, canvas, flags=cv2.INTER_AREA,
+                                        borderValue=(0, 0, 0, 0))
 
     base_tags = {p["tag"] for p in base_manifest["parts"]}
     parts: list[ExpressionPart] = []
@@ -609,6 +626,13 @@ def transplant_pack(base_dir, donor_dir, states) -> dict[str, Any]:
                 continue
             # Every layer of the feature, drawn back to front onto one canvas:
             # the runtime hands a feature to one part, not to four.
+            #
+            # In premultiplied colour throughout, and un-premultiplied only at
+            # the end. Compositing straight colour into a buffer that starts at
+            # zero multiplies every edge pixel by its own alpha and leaves it
+            # there, which paints a dark ring one pixel wide around anything
+            # with a soft edge -- and a mouth is nothing but soft edge. The same
+            # reason `matting` un-premultiplies rather than thresholding.
             merged = np.zeros((canvas[1], canvas[0], 4), dtype=np.float32)
             taken = []
             for tag in tags:
@@ -616,25 +640,39 @@ def transplant_pack(base_dir, donor_dir, states) -> dict[str, Any]:
                 if image is None:
                     continue
                 full = np.zeros((donor_manifest["canvas"]["height"],
-                                 donor_manifest["canvas"]["width"], 4), dtype=np.uint8)
+                                 donor_manifest["canvas"]["width"], 4), dtype=np.float32)
                 full[box[1]:box[3], box[0]:box[2]] = image
+                # Premultiply before the resample too: interpolating colour and
+                # alpha independently mixes in whatever is outside the layer.
+                full[:, :, :3] *= full[:, :, 3:4] / 255.0
                 placed = cv2.warpAffine(full, warp, canvas, flags=cv2.INTER_AREA,
-                                        borderValue=(0, 0, 0, 0)).astype(np.float32)
-                a = placed[:, :, 3:4] / 255.0
-                merged[:, :, :3] = merged[:, :, :3] * (1 - a) + placed[:, :, :3] * a
-                merged[:, :, 3:4] = np.clip(merged[:, :, 3:4] + placed[:, :, 3:4], 0, 255)
+                                        borderValue=(0, 0, 0, 0))
+                keep = 1.0 - merged[:, :, 3:4] / 255.0
+                merged[:, :, :3] += placed[:, :, :3] * keep
+                merged[:, :, 3:4] += placed[:, :, 3:4] * keep
                 taken.append(tag)
+            alpha_f = merged[:, :, 3:4] / 255.0
+            merged[:, :, :3] = np.divide(merged[:, :, :3], alpha_f,
+                                         out=np.zeros_like(merged[:, :, :3]),
+                                         where=alpha_f > 1e-4)
             name = f"{state}_{side}" if side else state
             alpha = merged[:, :, 3]
             if not taken or float(alpha.sum()) < MIN_PART_AREA * 255.0:
                 entries[name] = {"recovered": False, "taken": taken}
                 continue
+            delta = [0.0, 0.0, 0.0]
+            if base_original is not None and donor_original is not None:
+                _, delta = match_to_base_boundary(base_original, donor_original,
+                                                  alpha.astype(np.uint8))
+                merged[:, :, :3] = np.clip(
+                    merged[:, :, :3] + np.array(delta) * BOUNDARY_CORRECTION, 0, 255)
             ys, xs = np.nonzero(alpha > 2)
             x1, y1, x2, y2 = int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1
             sprite = np.clip(merged[y1:y2, x1:x2], 0, 255).astype(np.uint8)
             parts.append(ExpressionPart(
                 name=name, kind=kind, side=side, image=sprite, xyxy=(x1, y1, x2, y2),
                 diagnostics={"source": "transplant", "taken": taken,
+                             "boundary_delta": delta,
                              "replaces_tags": [t for t in taken if t in base_tags],
                              "sprite_area": int((sprite[:, :, 3] > 0).sum()),
                              "scale": round(float(scale), 4)}))
