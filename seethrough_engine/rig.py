@@ -172,6 +172,19 @@ EDGE_MIN_AREA_AT_768 = 40
 # 0.4 beats both 0 and 1 on composite mae.
 EDGE_FEATHER_PX = 0.4
 
+# A layer that is all edge is an outline, and an outline is *meant* to be dark.
+# The share of a layer lying deeper than the band separates the two kinds: on
+# A-001 `mouth` is 0% interior, `eyebrow` 2%, `eyelash` 13%, `nose` 15%, against
+# `face` 94%, `head` 94%, `topwear` 97%. Trimming the first kind thins the
+# stroke until the feature fades, which is the opposite of the fix.
+#
+# Set at three quarters rather than a half, which is the conservative reading of
+# the same rule: an open mouth is a surface in one run and a stroke in the next,
+# so anything more than a quarter boundary is not clearly a surface. It costs
+# 0.13 of composite mae against a half and leaves no thin feature touched in
+# either run.
+EDGE_MIN_INTERIOR = 0.75
+
 MANIFEST_VERSION = "0.1"
 RIG_SUBDIR = "rig"
 
@@ -605,6 +618,7 @@ def trim_layer_edges(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarra
                      order: tuple[str, ...] = RIG_Z_ORDER,
                      alpha_threshold: int = 10, band: int = EDGE_BAND_PX,
                      margin: int = EDGE_MARGIN, floor: int = EDGE_FLOOR,
+                     min_interior: float = EDGE_MIN_INTERIOR,
                      min_area: int | None = None, feather: float | None = None,
                      ) -> tuple[dict[str, np.ndarray], dict[str, int]]:
     """Hand a layer's own boundary back to what is behind it, where the boundary
@@ -620,6 +634,10 @@ def trim_layer_edges(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarra
     margin-qualified core seeds each region so the threshold does not decide
     where a region ends, and the handover is feathered and clamped by what is
     behind so it can never open a gap. Only the front layer's alpha changes.
+
+    A layer that is mostly boundary is skipped: `mouth` has no interior at all
+    and `nose` 15%, because they *are* outlines, and trimming an outline thins
+    it until the feature fades.
     """
     original = np.asarray(original_rgba)[..., :3].astype(np.int32)
     canvas_h, canvas_w = original.shape[:2]
@@ -644,7 +662,10 @@ def trim_layer_edges(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarra
         if solid.any() and beneath_a.any():
             # The band, and only where there is something behind to show.
             distance = cv2.distanceTransform(solid, cv2.DIST_L2, 3)
-            edge = (solid > 0) & (distance <= band) & (beneath_a[..., 0] > 0.5)
+            area = float(solid.sum())
+            interior = float((distance > band).sum()) / max(area, 1.0)
+            edge = ((solid > 0) & (distance <= band) & (beneath_a[..., 0] > 0.5)
+                    if interior >= min_interior else np.zeros(solid.shape, bool))
             if edge.any():
                 front_err = np.abs(original - layer[..., :3].astype(np.int32)).sum(axis=2)
                 behind_err = np.abs(original - beneath_rgb.astype(np.int32)).sum(axis=2)

@@ -69,20 +69,21 @@ class EdgeTrimTests(unittest.TestCase):
         back[20:100, 20:100, :3] = 220          # the layer behind is right
         back[20:100, 20:100, 3] = 255
         front = np.zeros_like(original)
-        front[30:70, 30:70, :3] = 218           # the front is right inside
-        front[30:70, 30:70, 3] = 255
+        # Big enough to be a surface rather than a stroke: 60x60 is 81% interior.
+        front[25:85, 25:85, :3] = 218           # the front is right inside
+        front[25:85, 25:85, 3] = 255
         for d in range(3):                      # ... and dark at its own edge
-            front[30 + d, 30:70, :3] = rim
-            front[69 - d, 30:70, :3] = rim
-            front[30:70, 30 + d, :3] = rim
-            front[30:70, 69 - d, :3] = rim
+            front[25 + d, 25:85, :3] = rim
+            front[84 - d, 25:85, :3] = rim
+            front[25:85, 25 + d, :3] = rim
+            front[25:85, 84 - d, :3] = rim
         return original, {"neck": back, "face": front}
 
     def test_a_dark_rim_over_a_layer_that_is_right_is_handed_back(self):
         original, layers = self.scene()
         out, moved = trim_layer_edges(layers, original)
         self.assertGreater(moved.get("face", 0), 100)
-        self.assertLess(int(out["face"][31, 50, 3]), 128)
+        self.assertLess(int(out["face"][26, 50, 3]), 128)
 
     def test_the_layer_s_interior_is_untouched(self):
         original, layers = self.scene()
@@ -93,12 +94,24 @@ class EdgeTrimTests(unittest.TestCase):
         original, layers = self.scene(rim=(218, 218, 218))
         out, moved = trim_layer_edges(layers, original)
         self.assertEqual(moved, {})
-        self.assertEqual(int(out["face"][31, 50, 3]), 255)
+        self.assertEqual(int(out["face"][26, 50, 3]), 255)
 
     def test_nothing_is_handed_over_where_there_is_nothing_behind(self):
         original, layers = self.scene()
         _, moved = trim_layer_edges({"face": layers["face"]}, original)
         self.assertEqual(moved, {})
+
+    def test_a_layer_that_is_all_edge_is_left_alone(self):
+        """A stroke -- a mouth line, a lash, a nose -- is an outline, and an
+        outline is meant to be dark. Trimming one thins it until it fades."""
+        original, layers = self.scene()
+        stroke = np.zeros_like(layers["face"])
+        stroke[48:52, 30:70, :3] = (20, 20, 20)     # four pixels tall: no interior
+        stroke[48:52, 30:70, 3] = 255
+        layers["mouth"] = stroke
+        out, moved = trim_layer_edges(layers, original)
+        self.assertNotIn("mouth", moved)
+        self.assertEqual(int(out["mouth"][49, 50, 3]), 255)
 
     def test_no_layer_s_colour_is_altered(self):
         original, layers = self.scene()

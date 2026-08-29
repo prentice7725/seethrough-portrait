@@ -591,11 +591,27 @@ leaves half the rim behind (the jaw stroke came back at -56 instead of -13).
 | --- | --- | --- |
 | raw layers | 18.30 | 8.57% |
 | after `reclaim_occluded` | 17.02 | 7.48% |
-| ... and `trim_layer_edges` | **15.89** | **6.98%** |
+| ... and `trim_layer_edges` | **16.42** | **7.20%** |
 
-The second run moves the same way, 15.07 to 13.90 and 6.84% to 6.16%, which is
+The second run moves the same way, 15.07 to 14.41 and 6.84% to 6.44%, which is
 the only reason to believe the band and margin are not fitted to one picture.
 At the jaw the two bad rows go from -63 and -143 to +8 and -13.
+
+**A layer that is all edge is exempt, and finding that out cost a regression.**
+Applied to every layer the trim also ate the nose and the mouth, which faded
+visibly: a stroke has no interior, so the whole of it falls in the band, and
+every pixel where an antialiased dark line sits over skin reads as "the layer
+behind is better". The share of a layer deeper than the band tells the two
+kinds apart -- `mouth` 0%, `eyebrow` 2%, `eyelash` 13%, `nose` 15%, against
+`face` 94%, `head` 94%, `topwear` 97% -- and the bar is three quarters, which
+is the conservative reading: an open mouth is a surface in one run and a stroke
+in the next. It costs 0.5 of mae against trimming everything and leaves the
+trim touching only `face`, `head`, `topwear` and `front hair`.
+
+The lesson is the one the composite metric cannot teach on its own: mae fell
+while the picture got worse, because a fading nose is a small number of pixels
+and a wrong jaw stroke is a small number of pixels, and only one of them is the
+thing anyone looks at.
 
 The faint line remains: where the neck's bottom meets the garment the two
 alphas sum to 1.64 and the overlap darkens one row by 4 luma, with the garment's
