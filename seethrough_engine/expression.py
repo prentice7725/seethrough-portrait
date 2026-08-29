@@ -55,6 +55,7 @@ __all__ = [
     "attach_to_run",
     "align_runs",
     "transplant_pack",
+    "SKIN_TRIM",
     "transplant_to_run",
 ]
 
@@ -533,6 +534,23 @@ TRANSPLANT_SOURCES = {
     ("mouth", None): ("mouth",),
 }
 
+# A donor layer carries a margin of the skin it was drawn on -- more than half
+# of A-001's donor `mouth` is within 20 of the `face` layer underneath it, and a
+# third within 8 -- plus a darkened ring two pixels wide where its own alpha
+# ends. Kept, they lay one generation's skin over another's and draw a faint
+# ellipse right around the lips, which no tone matching removes because the two
+# skins are shaded differently. So a layer is faded out where it is
+# indistinguishable from the skin beneath it.
+#
+# The two populations are far apart and the threshold sits in the gap between
+# them: measured outward from A-001's donor mouth, the margin differs by 7, its
+# edge ring by 19, and the lips by 54 to 94. Choosing near the margin instead
+# put the threshold inside the noise, and a per-pixel verdict there is speckle.
+SKIN_TRIM = (25.0, 45.0)
+
+# This is a no-op on the features that are all drawing: no `eyelash` or
+# `eyebrow` pixel in A-001's donor is within 144 of the face beneath it.
+
 # The layer whose shape does not depend on the expression, and so is what the
 # two runs are aligned by. `face` is inpainted skin with no features drawn on
 # it -- the same silhouette whether the eyes are open or shut -- while every
@@ -548,6 +566,53 @@ def _run_manifest(run_dir):
     path = os.path.join(run_dir, names[0])
     with open(path, encoding="utf-8") as f:
         return path, names[0][: -len("_rig_manifest.json")], json.load(f)
+
+
+def _trim_to_drawing(layer, skin):
+    """Fade `layer` out wherever it only repeats the skin it was drawn on.
+
+    Where the skin layer has nothing to compare against, the layer is left
+    alone: an absent judgement is not a judgement that it is skin.
+    """
+    if skin is None:
+        return layer
+    # Weighted by coverage, because the question is how much this layer changes
+    # the picture, not how different its stored colour is. A boundary pixel at
+    # alpha 10 contributes a twenty-fifth of whatever its colour says, and the
+    # colour under a nearly transparent pixel is arbitrary -- comparing it
+    # straight is what kept the layer's own anti-aliased rim alive as a faint
+    # ellipse around the mouth.
+    difference = (np.max(np.abs(layer[:, :, :3] - skin[:, :, :3]), axis=2)
+                  * (layer[:, :, 3] / 255.0))
+    lo, hi = SKIN_TRIM
+    # A region, not a per-pixel verdict. Around the drawing the difference
+    # hovers near the threshold, so deciding pixel by pixel gives speckle, and
+    # softening speckle gives a faint coherent ring -- which is worse than
+    # either answer, because a fifteen per cent wash of another generation's
+    # skin cannot add anything and can only tint. Same rule as
+    # `rig.reclaim_occluded`: a core that is unmistakably drawing seeds the
+    # region, and the weaker rule decides how far it reaches.
+    unjudgeable = skin[:, :, 3] <= 128
+    core = ((difference >= hi) | unjudgeable) & (layer[:, :, 3] > 0)
+    extent = ((difference >= lo) | unjudgeable) & (layer[:, :, 3] > 0)
+    keep = _seeded_regions(extent.astype(np.uint8), core.astype(np.uint8))
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    keep = cv2.morphologyEx(keep, cv2.MORPH_CLOSE, kernel, iterations=2)
+    keep = cv2.GaussianBlur(keep.astype(np.float32), (3, 3), 0)
+    out = layer.copy()
+    out[:, :, 3] *= keep
+    return out
+
+
+def _seeded_regions(extent, core):
+    """Every connected part of `extent` that contains a `core` pixel, as 0/1."""
+    count, labels = cv2.connectedComponents(extent, 8)
+    if count <= 1:
+        return np.zeros(extent.shape, dtype=np.float32)
+    seeded = set(np.unique(labels[core > 0])) - {0}
+    if not seeded:
+        return np.zeros(extent.shape, dtype=np.float32)
+    return np.isin(labels, list(seeded)).astype(np.float32)
 
 
 def _run_original(run_dir, base_name):
@@ -613,6 +678,13 @@ def transplant_pack(base_dir, donor_dir, states) -> dict[str, Any]:
         donor_original = cv2.warpAffine(donor_original, warp, canvas, flags=cv2.INTER_AREA,
                                         borderValue=(0, 0, 0, 0))
 
+    skin_image, skin_box = _load_layer(donor_dir, donor_manifest, "face")
+    skin = None
+    if skin_image is not None:
+        skin = np.zeros((donor_manifest["canvas"]["height"],
+                         donor_manifest["canvas"]["width"], 4), dtype=np.float32)
+        skin[skin_box[1]:skin_box[3], skin_box[0]:skin_box[2]] = skin_image
+
     base_tags = {p["tag"] for p in base_manifest["parts"]}
     parts: list[ExpressionPart] = []
     report: dict[str, Any] = {"canvas": list(canvas), "source": "transplant",
@@ -642,6 +714,7 @@ def transplant_pack(base_dir, donor_dir, states) -> dict[str, Any]:
                 full = np.zeros((donor_manifest["canvas"]["height"],
                                  donor_manifest["canvas"]["width"], 4), dtype=np.float32)
                 full[box[1]:box[3], box[0]:box[2]] = image
+                full = _trim_to_drawing(full, skin)
                 # Premultiply before the resample too: interpolating colour and
                 # alpha independently mixes in whatever is outside the layer.
                 full[:, :, :3] *= full[:, :, 3:4] / 255.0

@@ -498,6 +498,46 @@ class TransplantTests(unittest.TestCase):
             block = write_expression_pack(base, pack, manifest["parts"])
             self.assertIn("eyewhitel", block["parts"]["eye_closed_l"]["replaces"])
 
+    def test_a_layer_s_skin_margin_does_not_come_along(self):
+        """A donor layer carries the skin it was drawn on. Kept, it lays one
+        generation's skin over another's and rings the feature."""
+        with tempfile.TemporaryDirectory() as root:
+            base = self._run(os.path.join(root, "base"))
+            donor = self._run(os.path.join(root, "donor"))
+            # give the donor's mouth layer a wide margin of the face's own skin
+            path = os.path.join(donor, "rig", "images", "mouth.png")
+            box = self.LAYERS["mouth"][0]
+            img = np.zeros((box[3] - box[1], box[2] - box[0], 4), dtype=np.uint8)
+            img[:, :, :3] = self.LAYERS["face"][1]              # skin everywhere
+            img[4:-4, 4:-4, :3] = self.LAYERS["mouth"][1]       # the drawing, inset
+            img[:, :, 3] = 255
+            Image.fromarray(img).save(path)
+            part = next(p for p in transplant_pack(base, donor, ["mouth_open"])["parts"])
+            kept = (part.image[:, :, 3] > 128).sum()
+            self.assertLess(kept, 0.7 * img[:, :, 3].size,
+                            "the skin margin was transplanted along with the mouth")
+
+    def test_a_nearly_transparent_edge_is_judged_by_what_it_contributes(self):
+        """The colour stored under a nearly transparent pixel is arbitrary, and
+        comparing it straight keeps a layer's own anti-aliased rim alive as a
+        ring around the feature."""
+        with tempfile.TemporaryDirectory() as root:
+            base = self._run(os.path.join(root, "base"))
+            donor = self._run(os.path.join(root, "donor"))
+            path = os.path.join(donor, "rig", "images", "mouth.png")
+            box = self.LAYERS["mouth"][0]
+            img = np.zeros((box[3] - box[1], box[2] - box[0], 4), dtype=np.uint8)
+            img[:, :, :3] = self.LAYERS["mouth"][1]
+            img[:, :, 3] = 255
+            img[0, :, :3] = (0, 0, 0)     # a rim whose colour says "very different"
+            img[0, :, 3] = 10             # ... and which covers almost nothing
+            Image.fromarray(img).save(path)
+            part = next(p for p in transplant_pack(base, donor, ["mouth_open"])["parts"])
+            # Not necessarily a hard zero -- the kept region is feathered by
+            # about a pixel -- but nothing that can draw a line.
+            self.assertLess(int(part.image[0, :, 3].max()), 16,
+                            "the layer's own rim survived as a visible edge")
+
     def test_its_matte_is_the_model_s_and_not_a_grown_rectangle(self):
         with tempfile.TemporaryDirectory() as root:
             base = self._run(os.path.join(root, "base"))
