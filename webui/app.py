@@ -36,10 +36,6 @@ if str(REPO_ROOT) not in sys.path:
 HEAD_RES_MATCH = "same as body"
 
 OUTPUT_ROOT = Path(__file__).resolve().parent / "outputs"
-# Opened straight from disk rather than served: the preview reads a run folder
-# through a directory picker, so it needs no server and works on an unzipped
-# run anywhere. See docs/PORTRAIT_AUTO_RIG_FEASIBILITY_v0.1.md.
-PREVIEW_PAGE = Path(__file__).resolve().parent / "rig_preview" / "index.html"
 
 VERDICT_COLORS = {
     "PASS": "#16a34a",
@@ -53,10 +49,6 @@ VERDICT_COLORS = {
 # Cleared whenever a different model is selected, since we only keep one
 # checkpoint's worth of VRAM/RAM resident at a time.
 _pipeline_cache: dict[str, object] = {}
-# Marigold, loaded only if someone asks for depth-ordered Spine output. Kept
-# separately from `_pipeline_cache` because it is not what the model dropdown
-# selects, and because both rest on the CPU between runs anyway.
-_depth_cache: dict[str, object] = {}
 
 
 def _get_pipeline(model_name: str):
@@ -68,19 +60,6 @@ def _get_pipeline(model_name: str):
         _pipeline_cache.clear()
         _pipeline_cache[model_name] = model_loading.load_layerdiff_model(pretrained)
     return _pipeline_cache[model_name]
-
-
-def _get_depth_pipeline():
-    """Marigold, downloading it on first use the same way the layer model is."""
-    from seethrough_engine import model_loading
-    from seethrough_engine import paths as st_paths
-
-    repo = st_paths.DEFAULT_DEPTH_REPO
-    if repo not in _depth_cache:
-        models_dir = model_loading.default_models_dir()
-        _depth_cache[repo] = model_loading.load_depth_model(
-            model_loading.resolve_model_path(repo, models_dir))
-    return _depth_cache[repo]
 
 
 def _seed_everything(seed: int) -> None:
@@ -193,10 +172,6 @@ def run_a001(
     silhouette_guard,
     auto_fill,
     subject_mask,
-    export_spine,
-    spine_depth_order,
-    export_rig,
-    rig_hair_gradient,
     key_background,
     head_resolution,
     progress=gr.Progress(track_tqdm=True),
@@ -205,7 +180,7 @@ def run_a001(
         raise gr.Error("Upload an image first.")
 
     from portrait_core import PortraitConfig
-    from seethrough_engine.export import save_portrait_run
+    from seethrough_engine.export import save_portrait_bundle
     from seethrough_engine.generation import run_portrait_pipeline
 
     log_lines: list[str] = []
@@ -256,30 +231,14 @@ def run_a001(
             log=_log,
         )
 
-        depth_dict = None
-        if export_spine and spine_depth_order:
-            progress(0.88, desc="Estimating depth for Spine draw order...")
-            from seethrough_engine.depth import estimate_layer_depths
-            from seethrough_engine.device import resolve_device, resolve_offload_device
-
-            depth_dict = estimate_layer_depths(
-                _get_depth_pipeline(), result.layer_dict, result.fullpage, result.resolution,
-                device=resolve_device(), offload_device=resolve_offload_device(),
-                seed=int(seed), seed_everything=_seed_everything, log=_log,
-            )
-
         progress(0.9, desc="Saving outputs...")
         run_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
-        out_dir = OUTPUT_ROOT / run_id
-        manifest = save_portrait_run(str(out_dir), "a001", result, source_filename="upload.png",
-                                     export_spine=bool(export_spine), depth_dict=depth_dict,
-                                     export_rig=bool(export_rig),
-                                     rig_gradient_tags=("back hair",) if rig_hair_gradient else ())
-        if manifest.get("spine"):
-            spine_info = manifest["spine"]
-            _log(f"Spine project ({spine_info['order']} order): "
-                 f"{len(spine_info['slots'])} slots -> {spine_info['json']}")
-        fid = manifest.get("composite") or {}
+        out_dir = OUTPUT_ROOT / f"{run_id}.portrait"
+        manifest = save_portrait_bundle(str(out_dir), result, source_filename="upload.png")
+        fid_path = out_dir / manifest["diagnostics"]["fidelity"]
+        import json
+        with open(fid_path, encoding="utf-8") as handle:
+            fid = json.load(handle)
         if fid:
             sem = fid.get("semantic_only") or {}
             _log(f"Layer composite vs original: mae {fid['mae']:.2f}, "
@@ -292,17 +251,14 @@ def run_a001(
                      "the composite_error diagnostic. Coverage metrics are "
                      "alpha-only and cannot see this.")
 
-        if manifest.get("rig"):
-            rig_info = manifest["rig"]
-            _log(f"Rig manifest ({rig_info['depth']} depth): {len(rig_info['parts'])} parts, "
-                 f"anchors {', '.join(rig_info['anchors'])} -> {rig_info['manifest']}")
-            _log(f"Preview it: open {PREVIEW_PAGE} and pick {out_dir}")
-
         layer_gallery = [
-            (str(out_dir / filename), tag) for tag, filename in sorted(manifest["layers"].items())
+            (str(out_dir / info["path"]), tag)
+            for tag, info in sorted(manifest["layers"].items())
         ]
         diagnostics_gallery = [
-            (str(out_dir / filename), name) for name, filename in manifest["diagnostics"].items()
+            (str(out_dir / filename), name)
+            for name, filename in manifest["diagnostics"].items()
+            if filename.lower().endswith(".png")
         ]
 
         zip_path = _zip_run(out_dir)
@@ -349,9 +305,9 @@ def build_app() -> gr.Blocks:
             "REWORK / FAIL verdict -- no ComfyUI required."
         )
         gr.Markdown(
-            f"**2.5D rig preview:** open `{PREVIEW_PAGE}` in a browser and pick a "
-            "run folder from `webui/outputs/` to animate it -- head turn, tilt, "
-            "breathing, and blink, with no Spine and no Live2D."
+            "The download is a **Portrait Bundle v1** containing validated, "
+            "production-repaired canonical layers. Animation tools consume the "
+            "bundle in the separate `portrait-autorig` project."
         )
 
         with gr.Row():
@@ -410,52 +366,13 @@ def build_app() -> gr.Blocks:
                     head_detail_in = gr.Checkbox(label="Enable head detail", value=True)
                     guard_in = gr.Checkbox(label="Silhouette Guard", value=True)
                     autofill_in = gr.Checkbox(label="Auto-fill (up to 5 runs)", value=False)
-                spine_in = gr.Checkbox(
-                    label="Export Spine project",
-                    value=False,
-                    info=(
-                        "Adds a Spine 2D skeleton (JSON + cropped PNGs) to the zip. "
-                        "Draw order is the fixed Portrait Mode tag order unless you "
-                        "also tick depth ordering below."
-                    ),
-                )
-                spine_depth_in = gr.Checkbox(
-                    label="Spine: depth-based draw order",
-                    value=False,
-                    info=(
-                        "Runs Marigold over the layers to sort them by estimated depth, "
-                        "matching the ComfyUI Export Spine node. Downloads a 3 GB model "
-                        "on first use and adds a pass to every run. Ignored unless "
-                        "Export Spine is on."
-                    ),
-                )
-                rig_in = gr.Checkbox(
-                    label="Export 2.5D rig manifest",
-                    value=True,
-                    info=(
-                        "Writes rig_manifest.json plus cropped part PNGs for the "
-                        "browser preview: remainder split into head/neck/body, "
-                        "eyes split left/right, anchors, and head-follow weights. "
-                        "No model and no GPU pass -- see "
-                        "docs/PORTRAIT_AUTO_RIG_FEASIBILITY_v0.1.md."
-                    ),
-                )
-                rig_hair_in = gr.Checkbox(
-                    label="Rig: soften back hair",
-                    value=False,
-                    info=(
-                        "Gives 'back hair' a top-to-bottom falloff instead of "
-                        "letting it follow the head rigidly. Turn on if hair "
-                        "reaching past the shoulders tears in the preview."
-                    ),
-                )
                 run_btn = gr.Button("Run A-001", variant="primary")
 
             with gr.Column(scale=1):
                 verdict_out = gr.HTML(label="Verdict")
                 coverage_out = gr.Markdown(label="Coverage")
                 reasons_out = gr.Markdown(label="Reasons")
-                report_zip_out = gr.File(label="Download layers + report (.zip)")
+                report_zip_out = gr.File(label="Download Portrait Bundle (.zip)")
 
         with gr.Row():
             layer_gallery_out = gr.Gallery(label="Layers", columns=6, height=300)
@@ -474,8 +391,7 @@ def build_app() -> gr.Blocks:
             inputs=[
                 image_in, model_in, seed_in, resolution_in, steps_in,
                 head_detail_in, guard_in, autofill_in, subject_mask_in,
-                spine_in, spine_depth_in, rig_in, rig_hair_in, key_bg_in,
-                head_res_in,
+                key_bg_in, head_res_in,
             ],
             outputs=[
                 verdict_out, coverage_out, reasons_out,

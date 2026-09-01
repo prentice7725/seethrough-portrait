@@ -1,155 +1,87 @@
-import json
-import os
-import tempfile
-import unittest
-
 import numpy as np
-from PIL import Image
 
-from seethrough_engine.seams import check_run, seam_report, write_baseline
+from seethrough_engine.seams import compare_seam_report, seam_report_layers
 
 CANVAS = 128
 
 
-def build_run(directory, *, garment_bias=0, draw_edge=False, busy=False):
-    """A minimal run: skin above, garment below, meeting at y=64.
-
-    `garment_bias` shifts the garment layer off the original, which is the
-    fault this measures. `draw_edge` puts a real line in *both* the original and
-    the composite at the same place, which is not a fault and must not count.
-    """
-    os.makedirs(os.path.join(directory, "rig", "images"), exist_ok=True)
+def build_scene(*, garment_bias=0, draw_edge=False, busy=False):
     original = np.zeros((CANVAS, CANVAS, 4), dtype=np.uint8)
     original[20:110, 20:110, :3] = 200
     original[20:110, 20:110, 3] = 255
     if busy:
-        # Strands: the picture is loud here, and a few levels cannot be seen.
         original[20:110, 20:110:3, :3] = 60
     if draw_edge:
         original[63:65, 20:110, :3] = 40
 
-    layers = {}
-    skin = np.zeros_like(original)
-    skin[20:64, 20:110, :3] = 200
-    skin[20:64, 20:110, 3] = 255
-    garment = np.zeros_like(original)
-    garment[64:110, 20:110, :3] = np.clip(200 + garment_bias, 0, 255)
-    garment[64:110, 20:110, 3] = 255
+    neck = np.zeros_like(original)
+    neck[20:64, 20:110, :3] = 200
+    neck[20:64, 20:110, 3] = 255
+    topwear = np.zeros_like(original)
+    topwear[64:110, 20:110, :3] = np.clip(200 + garment_bias, 0, 255)
+    topwear[64:110, 20:110, 3] = 255
     if busy:
-        skin[20:64, 20:110:3, :3] = 60
-        garment[64:110, 20:110:3, :3] = np.clip(60 + garment_bias, 0, 255)
+        neck[20:64, 20:110:3, :3] = 60
+        topwear[64:110, 20:110:3, :3] = np.clip(60 + garment_bias, 0, 255)
     if draw_edge:
-        skin[63, 20:110, :3] = 40
-        garment[64, 20:110, :3] = 40
-    layers["neck"] = skin
-    layers["topwear"] = garment
-
-    parts = []
-    for z, (tag, image) in enumerate(layers.items()):
-        ys, xs = np.nonzero(image[:, :, 3] > 0)
-        box = [int(xs.min()), int(ys.min()), int(xs.max()) + 1, int(ys.max()) + 1]
-        crop = image[box[1]:box[3], box[0]:box[2]]
-        Image.fromarray(crop).save(os.path.join(directory, "rig", "images", f"{tag}.png"))
-        parts.append({"name": tag, "tag": tag, "image": f"rig/images/{tag}.png",
-                      "xyxy": box, "group": "body", "z": z, "depth": 0.5,
-                      "weight": {"mode": "constant", "value": 1.0},
-                      "mesh": {"cell": 42}})
-    manifest = {"version": "0.1", "canvas": {"width": CANVAS, "height": CANVAS},
-                "source": {}, "anchors": {}, "parts": parts, "motion": {}}
-    with open(os.path.join(directory, "a_rig_manifest.json"), "w", encoding="utf-8") as f:
-        json.dump(manifest, f)
-    Image.fromarray(original).save(os.path.join(directory, "a_original.png"))
-    return directory
+        neck[63, 20:110, :3] = 40
+        topwear[64, 20:110, :3] = 40
+    return original, {"neck": neck, "topwear": topwear}
 
 
-def row_for(report, pair):
-    return next((r for r in report["seams"] if r["pair"] == pair), None)
+def report(**kwargs):
+    original, layers = build_scene(**kwargs)
+    return seam_report_layers(original, layers)
 
 
-class SeamReportTests(unittest.TestCase):
-    def test_layers_that_reproduce_the_picture_have_no_seam(self):
-        with tempfile.TemporaryDirectory() as root:
-            report = seam_report(build_run(os.path.join(root, "clean")))
-            row = row_for(report, "neck | topwear")
-            self.assertIsNotNone(row)
-            self.assertEqual(row["longest_run_px"], 0)
-            self.assertLess(row["mean_excess"], 0.5)
-
-    def test_a_layer_off_by_a_few_levels_draws_a_line(self):
-        with tempfile.TemporaryDirectory() as root:
-            report = seam_report(build_run(os.path.join(root, "biased"), garment_bias=6))
-            row = row_for(report, "neck | topwear")
-            self.assertGreater(row["longest_run_px"], 60)
-            self.assertGreater(row["mean_excess"], 4)
-
-    def test_an_edge_the_picture_has_too_is_not_a_seam(self):
-        """Sharpening an edge that is already an edge changes nothing anyone
-        can see, which is why the brow at 70 luma of excess went unnoticed while
-        the neck at 2 did not."""
-        with tempfile.TemporaryDirectory() as root:
-            report = seam_report(build_run(os.path.join(root, "edged"), draw_edge=True))
-            row = row_for(report, "neck | topwear")
-            self.assertEqual(row["longest_run_px"], 0)
-
-    def test_the_run_survives_a_gap(self):
-        """A seam at one or two luma dips below any threshold every few pixels.
-        One gap does not make two lines."""
-        with tempfile.TemporaryDirectory() as root:
-            directory = build_run(os.path.join(root, "gapped"), garment_bias=6)
-            path = os.path.join(directory, "rig", "images", "topwear.png")
-            image = np.array(Image.open(path))
-            image[0, 30:33, :3] = 200          # three pixels of the seam are right
-            Image.fromarray(image).save(path)
-            row = row_for(seam_report(directory), "neck | topwear")
-            self.assertGreater(row["longest_run_px"], 60)
-
-    def test_the_same_error_inside_a_busy_region_is_not_flagged(self):
-        """A few levels beside a hundred-level strand edge is masked. The first
-        ranking put a hair boundary on top with a 125 px run, and at 3x the two
-        pictures were the same."""
-        with tempfile.TemporaryDirectory() as root:
-            quiet = seam_report(build_run(os.path.join(root, "quiet"), garment_bias=6))
-            busy = seam_report(build_run(os.path.join(root, "busy"),
-                                         garment_bias=6, busy=True))
-            self.assertGreater(row_for(quiet, "neck | topwear")["longest_run_px"], 60)
-            self.assertLess(row_for(busy, "neck | topwear")["longest_run_px"], 10)
+def row_for(value, pair="neck | topwear"):
+    return next((row for row in value["seams"] if row["pair"] == pair), None)
 
 
-class SeamGuardTests(unittest.TestCase):
-    def test_the_same_run_passes_its_own_baseline(self):
-        with tempfile.TemporaryDirectory() as root:
-            directory = build_run(os.path.join(root, "run"), garment_bias=6)
-            baseline = write_baseline(os.path.join(root, "baseline.json"), [directory])
-            passed, complaints = check_run(directory, baseline["run"])
-            self.assertTrue(passed, complaints)
-
-    def test_a_seam_getting_worse_is_a_complaint(self):
-        with tempfile.TemporaryDirectory() as root:
-            good = build_run(os.path.join(root, "good"))
-            baseline = write_baseline(os.path.join(root, "baseline.json"), [good])
-            worse = build_run(os.path.join(root, "worse"), garment_bias=8)
-            passed, complaints = check_run(worse, baseline["good"])
-            self.assertFalse(passed)
-            self.assertTrue(any("neck | topwear" in c for c in complaints), complaints)
-
-    def test_a_seam_that_did_not_exist_before_is_a_complaint(self):
-        """The usual way to make one boundary better is to move the fault to
-        the next one."""
-        with tempfile.TemporaryDirectory() as root:
-            baseline = {"seams": []}
-            directory = build_run(os.path.join(root, "run"), garment_bias=8)
-            passed, complaints = check_run(directory, baseline)
-            self.assertFalse(passed)
-            self.assertTrue(any("new seam" in c for c in complaints), complaints)
-
-    def test_a_seam_getting_better_is_not_a_complaint(self):
-        with tempfile.TemporaryDirectory() as root:
-            bad = build_run(os.path.join(root, "bad"), garment_bias=8)
-            baseline = write_baseline(os.path.join(root, "baseline.json"), [bad])
-            better = build_run(os.path.join(root, "better"))
-            passed, _ = check_run(better, baseline["bad"])
-            self.assertTrue(passed)
+def test_layers_that_reproduce_the_picture_have_no_seam():
+    row = row_for(report())
+    assert row["longest_run_px"] == 0
+    assert row["mean_excess"] < 0.5
 
 
-if __name__ == "__main__":
-    unittest.main()
+def test_a_layer_off_by_a_few_levels_draws_a_line():
+    row = row_for(report(garment_bias=6))
+    assert row["longest_run_px"] > 60
+    assert row["mean_excess"] > 4
+
+
+def test_an_edge_the_picture_has_too_is_not_a_seam():
+    assert row_for(report(draw_edge=True))["longest_run_px"] == 0
+
+
+def test_the_run_survives_a_gap():
+    original, layers = build_scene(garment_bias=6)
+    layers["topwear"][64, 50:53, :3] = 200
+    row = row_for(seam_report_layers(original, layers))
+    assert row["longest_run_px"] > 60
+
+
+def test_the_same_error_inside_a_busy_region_is_not_flagged():
+    quiet = row_for(report(garment_bias=6))
+    busy = row_for(report(garment_bias=6, busy=True))
+    assert quiet["longest_run_px"] > 60
+    assert busy["longest_run_px"] < 10
+
+
+def test_same_report_passes_its_baseline():
+    value = report(garment_bias=6)
+    passed, complaints = compare_seam_report(value, value)
+    assert passed, complaints
+
+
+def test_a_new_or_worse_seam_is_a_complaint():
+    clean = report()
+    worse = report(garment_bias=8)
+    passed, complaints = compare_seam_report(worse, clean)
+    assert not passed
+    assert any("neck | topwear" in complaint for complaint in complaints)
+
+
+def test_a_seam_getting_better_is_not_a_complaint():
+    passed, _ = compare_seam_report(report(), report(garment_bias=8))
+    assert passed

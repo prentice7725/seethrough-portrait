@@ -66,6 +66,7 @@ from .layers import (
     layer_similarity,
     make_preview,
 )
+from .repair import repair_portrait_layers
 
 __all__ = [
     "ALL_TAGS",
@@ -206,6 +207,7 @@ def run_diffusion_stage(pipeline, device, rng, tag_version, num_inference_steps,
 @dataclass
 class PortraitPipelineResult:
     layer_dict: dict[str, np.ndarray]
+    raw_layer_dict: dict[str, np.ndarray]
     fullpage: np.ndarray
     input_img: np.ndarray
     resolution: int
@@ -215,6 +217,7 @@ class PortraitPipelineResult:
     guard: Any
     evaluation: Any
     report: dict[str, Any]
+    repair_report: dict[str, Any]
     all_runs_layers: list[dict[str, Any]] = field(default_factory=list)
     selection_trace: tuple = ()
 
@@ -385,6 +388,11 @@ def run_portrait_pipeline(
     pipeline.trans_vae.to(offload_device)
     empty_cache(device)
 
+    # Preserve the selected model output before the guard or repair changes
+    # it.  This is optional forensic output in Portrait Bundle v1 and must
+    # never be consumed as canonical layers.
+    raw_layer_dict = dict(layer_dict)
+
     final_evaluation = evaluate_portrait_layers(
         layer_dict, portrait_mask, enable_head_detail=enable_head_detail, config=portrait_config,
     )
@@ -398,8 +406,14 @@ def run_portrait_pipeline(
         })
         final_guard = apply_silhouette_guard(fullpage, layer_dict, portrait_mask, raw_config)
 
+    repair_result = repair_portrait_layers(layer_dict, fullpage)
+    layer_dict = repair_result.layers
+
     report = build_portrait_report(
-        source={"filename": "", "width": int(fullpage.shape[1]), "height": int(fullpage.shape[0])},
+        source={
+            "filename": "", "width": int(fullpage.shape[1]),
+            "height": int(fullpage.shape[0]), "tag_version": str(tag_version),
+        },
         run={
             "seed": int(seed),
             "resolution": int(resolution),
@@ -419,6 +433,7 @@ def run_portrait_pipeline(
 
     return PortraitPipelineResult(
         layer_dict=layer_dict,
+        raw_layer_dict=raw_layer_dict,
         fullpage=fullpage,
         input_img=input_img,
         resolution=resolution,
@@ -428,6 +443,7 @@ def run_portrait_pipeline(
         guard=final_guard,
         evaluation=final_evaluation,
         report=report,
+        repair_report=repair_result.report,
         all_runs_layers=all_runs_layers,
         selection_trace=selection_trace,
     )

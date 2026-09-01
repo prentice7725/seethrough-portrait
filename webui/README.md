@@ -2,8 +2,9 @@
 
 A single-image Portrait Mode webui that runs without ComfyUI. Upload one
 upper-body portrait, run A-001, and get the decomposed layers, the Silhouette
-Guard diagnostics, and the PASS / SOFT_PASS / REWORK / FAIL verdict -- all
-downloadable as a zip.
+Guard diagnostics, and the PASS / SOFT_PASS / REWORK / FAIL verdict. The
+downloadable zip is a versioned Portrait Bundle containing canonical,
+production-repaired layers.
 
 This is the M2 milestone from `PORTRAIT_MODE_FORK_PLAN_v0.1.md`: "single-image
 WebUI" whose exit condition is "A-001 can be run and exported from the UI."
@@ -39,11 +40,10 @@ Opens `http://127.0.0.1:7860`.
 2. Pick resolution / steps / seed, and whether to enable head detail,
    Silhouette Guard, and auto-fill.
 3. Click **Run A-001**.
-4. Read the verdict badge and reasons, browse the layer/diagnostic
-   thumbnails, and download the zip (layers, `*_portrait_report.json`,
-   `*_manifest.json`, coverage/missing/spill/reconstruction PNGs).
+4. Read the verdict badge and reasons, browse the layer/diagnostic thumbnails,
+   and download the `.portrait` bundle zip.
 
-Runs are also kept on disk under `webui/outputs/<timestamp>_<id>/` (gitignored)
+Runs are also kept under `webui/outputs/<timestamp>_<id>.portrait/` (gitignored)
 in case you want to inspect them without re-downloading the zip.
 
 ## Known limitations (M2 scope)
@@ -52,15 +52,9 @@ in case you want to inspect them without re-downloading the zip.
   square working resolution (`fullpage`), not un-padded back to the original
   image's aspect ratio/size, and there is no hair L/R splitting -- that part of
   `SeeThrough Post Process` stays ComfyUI-only for now.
-- **Spine export is supported**, with a caveat about draw order. Without
-  "depth-based draw order" the slots follow `SEMANTIC_Z_ORDER`, a fixed
-  back-to-front order over Portrait Mode's tag vocabulary, so the result can
-  differ from the ComfyUI Export Spine node, which sorts by estimated depth.
-  Turning depth ordering on runs Marigold and matches it -- at the cost of a
-  3 GB download on first use and roughly 15s per run. One layer, `head`, never
-  gets a depth estimate (the depth batch is indexed by the v2 tag list, which
-  has no `head`); it is slotted in from its semantic neighbours rather than
-  dropped, which is what the ComfyUI path does with it.
+- **No rig or Spine export.** Those consume Portrait Bundle v1 in the separate
+  [`portrait-autorig`](https://github.com/prentice7725/portrait-autorig)
+  project, keeping torch/diffusers out of animation tools and runtimes.
 - **No PSD export.** The ComfyUI extension builds a PSD client-side in the
   browser via `ag-psd`; this webui exports plain PNGs + JSON instead.
 - **One model resident at a time.** Switching the model dropdown unloads the

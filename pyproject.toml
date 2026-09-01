@@ -1,7 +1,7 @@
 [project]
 name = "seethrough-portrait"
-description = "A portrait-oriented ComfyUI See-through fork with silhouette recovery and coverage diagnostics."
-version = "1.3.0.dev1"
+description = "Produce validated, production-ready semantic Portrait Bundles from illustrations."
+version = "2.0.0.dev1"
 license = "MIT"
 requires-python = ">=3.10"
 dependencies = [
@@ -12,7 +12,7 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = "https://github.com/tackcrypto1031/tk_seethrough"
+Repository = "https://github.com/prentice7725/seethrough-portrait"
 
 [tool.comfy]
 PublisherId = "tackcrypto1031"
