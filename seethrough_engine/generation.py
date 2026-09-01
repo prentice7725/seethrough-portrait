@@ -67,6 +67,7 @@ from .layers import (
     make_preview,
 )
 from .repair import repair_portrait_layers
+from .semantic import semantic_warnings
 
 __all__ = [
     "ALL_TAGS",
@@ -430,6 +431,7 @@ def run_portrait_pipeline(
         config=portrait_config,
         selection_trace=selection_trace,
     )
+    report["semantic"]["warnings"] = semantic_warnings(layer_dict, fullpage)
 
     return PortraitPipelineResult(
         layer_dict=layer_dict,

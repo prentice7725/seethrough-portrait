@@ -16,11 +16,12 @@ import numpy as np
 from .image import composite_fidelity, composite_layers
 from .semantic import SEMANTIC_Z_ORDER
 
-REPAIR_VERSION = "1.0"
+REPAIR_VERSION = "1.1"
 REPAIR_ORDER = (
     "reclaim_occluded",
     "fit_layer_tone",
     "fit_edge_alpha",
+    "clean_garment_orphans",
     "fit_seam_residual",
 )
 
@@ -102,6 +103,25 @@ TONE_MIN_SAMPLE = 300
 TONE_MAX_SHIFT = 16
 TONE_CLUSTERS = 8       # at most; a layer with fewer materials uses fewer
 TONE_MIN_CLUSTER = 150  # ... and a cluster this small falls back to the layer's
+
+# A garment can retain isolated skin/head fragments after contested ownership
+# has been reclaimed.  These are not "small components are bad": a button,
+# ribbon, or detached ornament is valid garment content.  A component is only
+# removable when it is detached from the garment main mass, lies inside a
+# competing head/neck semantic region, that semantic explains the original
+# decisively better, and a virtual removal does not worsen reconstruction.
+GARMENT_TAGS: tuple[str, ...] = ("topwear", "neckwear")
+GARMENT_COMPETING_TAGS: tuple[str, ...] = (
+    "neck", "head", "face", "ears", "earl", "earr",
+)
+ORPHAN_ALPHA_THRESHOLD = 10
+ORPHAN_MIN_AREA_AT_768 = 8
+ORPHAN_MAX_AREA_RATIO = 0.02
+ORPHAN_MAX_DISTANCE_DIAGONAL_RATIO = 0.20
+ORPHAN_SEMANTIC_SUPPORT_RATIO = 0.80
+ORPHAN_BETTER_RATIO = 0.70
+ORPHAN_ERROR_MARGIN = 12
+ORPHAN_FRINGE_PX = 2
 
 def reclaim_occluded(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarray, *,
                      pairs: tuple[tuple[str, str], ...] = RECLAIM_PAIRS,
@@ -281,6 +301,179 @@ def fit_layer_tone(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarray,
         shifts[tag] = [[int(v) for v in row] for row in fitted]
 
     return out, shifts
+
+
+def _static_reconstruction_score(layer_dict: dict[str, np.ndarray],
+                                 original_rgba: np.ndarray,
+                                 order: tuple[str, ...]) -> tuple[float, int]:
+    """Published MAE precision and bad-pixel count for a non-regression gate."""
+    original = np.asarray(original_rgba)
+    composite = composite_layers(layer_dict, original.shape[:2], order=order)
+    subject = original[..., 3] > ORPHAN_ALPHA_THRESHOLD
+    error = np.abs(original[..., :3].astype(np.int32)
+                   - composite[..., :3].astype(np.int32)).sum(axis=2)
+    values = error[subject]
+    mae = round(float(values.mean()), 3) if values.size else 0.0
+    return mae, int((values > 30).sum())
+
+
+def clean_garment_orphans(
+    layer_dict: dict[str, np.ndarray],
+    original_rgba: np.ndarray,
+    *,
+    garment_tags: tuple[str, ...] = GARMENT_TAGS,
+    competing_tags: tuple[str, ...] = GARMENT_COMPETING_TAGS,
+    order: tuple[str, ...] = SEMANTIC_Z_ORDER,
+    alpha_threshold: int = ORPHAN_ALPHA_THRESHOLD,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """Remove only well-supported orphan semantic contamination from garments.
+
+    The garment main mass is never a candidate.  Detached components are
+    evaluated using four independent observations: distance from that mass,
+    overlap with a head/face/neck semantic, per-pixel agreement with the
+    original still, and an exact virtual-composite non-regression gate.  Small
+    size alone never authorizes deletion.  Ambiguous components remain in the
+    canonical layer and are recorded in the report.
+    """
+    original = np.asarray(original_rgba)
+    original_rgb = original[..., :3].astype(np.int32)
+    canvas_h, canvas_w = original.shape[:2]
+    canvas_scale = canvas_h * canvas_w / float(768 * 768)
+    min_area = max(4, int(round(ORPHAN_MIN_AREA_AT_768 * canvas_scale)))
+    max_distance = ORPHAN_MAX_DISTANCE_DIAGONAL_RATIO * float(
+        np.hypot(canvas_h, canvas_w))
+    out = dict(layer_dict)
+    report: dict[str, Any] = {}
+
+    support = np.zeros((canvas_h, canvas_w), bool)
+    best_competing_error = np.full((canvas_h, canvas_w), 1_000_000, np.int32)
+    for tag in competing_tags:
+        layer = out.get(tag)
+        if layer is None:
+            continue
+        arr = np.asarray(layer)
+        present = arr[..., 3] > alpha_threshold
+        if not present.any():
+            continue
+        error = np.abs(original_rgb - arr[..., :3].astype(np.int32)).sum(axis=2)
+        best_competing_error[present] = np.minimum(
+            best_competing_error[present], error[present])
+        support |= present
+
+    if not support.any():
+        return out, report
+
+    current_score = _static_reconstruction_score(out, original, order)
+    fringe_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * ORPHAN_FRINGE_PX + 1,) * 2)
+
+    for tag in garment_tags:
+        layer = out.get(tag)
+        if layer is None:
+            continue
+        arr = np.asarray(layer)
+        strong = arr[..., 3] > alpha_threshold
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            strong.astype(np.uint8), 8)
+        if count <= 2:
+            continue
+        main = 1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA]))
+        main_area = int(stats[main, cv2.CC_STAT_AREA])
+        max_area = max(min_area, int(round(main_area * ORPHAN_MAX_AREA_RATIO)))
+        distance_to_main = cv2.distanceTransform(
+            (labels != main).astype(np.uint8), cv2.DIST_L2, 3)
+        garment_error = np.abs(
+            original_rgb - arr[..., :3].astype(np.int32)).sum(axis=2)
+        component_rows: list[dict[str, Any]] = []
+        removed_px = 0
+        ignored_tiny_components = 0
+
+        candidates = sorted(
+            range(1, count),
+            key=lambda index: int(stats[index, cv2.CC_STAT_AREA]),
+            reverse=True,
+        )
+        for index in candidates:
+            if index == main:
+                continue
+            component = labels == index
+            area = int(stats[index, cv2.CC_STAT_AREA])
+            x = int(stats[index, cv2.CC_STAT_LEFT])
+            y = int(stats[index, cv2.CC_STAT_TOP])
+            width = int(stats[index, cv2.CC_STAT_WIDTH])
+            height = int(stats[index, cv2.CC_STAT_HEIGHT])
+            if area < min_area:
+                ignored_tiny_components += 1
+                continue
+            distance = float(distance_to_main[component].min())
+            semantic_ratio = float((component & support).sum()) / max(area, 1)
+            decisively_competing = (
+                support
+                & (best_competing_error + ORPHAN_ERROR_MARGIN < garment_error)
+            )
+            better_ratio = float((component & decisively_competing).sum()) / max(area, 1)
+            fill_ratio = float(area) / max(width * height, 1)
+            row: dict[str, Any] = {
+                "area_px": area,
+                "bbox_xywh": [x, y, width, height],
+                "distance_to_main_px": round(distance, 2),
+                "semantic_support_ratio": round(semantic_ratio, 4),
+                "competing_better_ratio": round(better_ratio, 4),
+                "fill_ratio": round(fill_ratio, 4),
+            }
+
+            structural = (
+                min_area <= area <= max_area
+                and distance <= max_distance
+            )
+            evidence = (
+                semantic_ratio >= ORPHAN_SEMANTIC_SUPPORT_RATIO
+                and better_ratio >= ORPHAN_BETTER_RATIO
+            )
+            if not structural:
+                row.update(status="kept", reason="outside conservative size/distance gate")
+                component_rows.append(row)
+                continue
+            if not evidence:
+                row.update(status="ambiguous", reason="semantic/original evidence is not decisive")
+                component_rows.append(row)
+                continue
+
+            fringe = cv2.dilate(component.astype(np.uint8), fringe_kernel).astype(bool)
+            remove = component | (
+                fringe & (arr[..., 3] > 0) & support & decisively_competing)
+            patched = np.array(arr, copy=True)
+            patched[remove] = 0
+            tentative = dict(out)
+            tentative[tag] = patched
+            tentative_score = _static_reconstruction_score(tentative, original, order)
+            if (tentative_score[0] <= current_score[0]
+                    and tentative_score[1] <= current_score[1]):
+                previous_score = current_score
+                out = tentative
+                arr = patched
+                current_score = tentative_score
+                count_removed = int(remove.sum())
+                removed_px += count_removed
+                row.update(
+                    status="removed",
+                    removed_px=count_removed,
+                    fidelity_mae_delta=round(tentative_score[0] - previous_score[0], 3),
+                    bad_px_delta=int(tentative_score[1] - previous_score[1]),
+                )
+            else:
+                row.update(status="ambiguous", reason="virtual removal worsened reconstruction")
+            component_rows.append(row)
+
+        if component_rows:
+            report[tag] = {
+                "main_area_px": main_area,
+                "removed_px": removed_px,
+                "ignored_tiny_components": ignored_tiny_components,
+                "components": component_rows,
+            }
+
+    return out, report
 
 
 def fit_edge_alpha(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarray, *,
@@ -467,6 +660,7 @@ def repair_portrait_layers(layer_dict: dict[str, np.ndarray],
     working, reclaimed = reclaim_occluded(layer_dict, original_rgba)
     working, tone_fit = fit_layer_tone(working, original_rgba)
     working, edge_fit = fit_edge_alpha(working, original_rgba)
+    working, orphan_cleanup = clean_garment_orphans(working, original_rgba)
     working, seam_fit = fit_seam_residual(working, original_rgba)
     return RepairResult(
         layers=working,
@@ -475,6 +669,7 @@ def repair_portrait_layers(layer_dict: dict[str, np.ndarray],
             "order": list(REPAIR_ORDER),
             "reclaim_occluded": reclaimed,
             "fit_layer_tone": tone_fit,
+            "clean_garment_orphans": orphan_cleanup,
             "fit_edge_alpha": edge_fit,
             "fit_seam_residual": seam_fit,
         },
