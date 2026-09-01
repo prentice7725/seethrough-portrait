@@ -35,7 +35,7 @@ repository. The projects share a file contract and no Python imports.
   `body_remainder`.
 - **Portrait-aware auto-fill** selects the best layer set from up to five runs.
 - **Fidelity repair** runs `reclaim_occluded → fit_layer_tone → fit_edge_alpha
-  → clean_garment_orphans → fit_seam_residual` against the original still
+  → fit_seam_residual → clean_garment_orphans` against the original still
   image and conservatively removes isolated garment semantic contamination.
 - **Static validation** measures whole-composite fidelity and thin, continuous
   seam artifacts separately.

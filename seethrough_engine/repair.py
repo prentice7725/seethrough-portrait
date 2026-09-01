@@ -16,13 +16,13 @@ import numpy as np
 from .image import composite_fidelity, composite_layers
 from .semantic import SEMANTIC_Z_ORDER
 
-REPAIR_VERSION = "1.1"
+REPAIR_VERSION = "1.2"
 REPAIR_ORDER = (
     "reclaim_occluded",
     "fit_layer_tone",
     "fit_edge_alpha",
-    "clean_garment_orphans",
     "fit_seam_residual",
+    "clean_garment_orphans",
 )
 
 # A garment layer sometimes comes back holding the skin visible through its own
@@ -115,12 +115,14 @@ GARMENT_COMPETING_TAGS: tuple[str, ...] = (
     "neck", "head", "face", "ears", "earl", "earr",
 )
 ORPHAN_ALPHA_THRESHOLD = 10
-ORPHAN_MIN_AREA_AT_768 = 8
+ORPHAN_MIN_AREA_AT_768 = 1
 ORPHAN_MAX_AREA_RATIO = 0.02
 ORPHAN_MAX_DISTANCE_DIAGONAL_RATIO = 0.20
 ORPHAN_SEMANTIC_SUPPORT_RATIO = 0.80
 ORPHAN_BETTER_RATIO = 0.70
 ORPHAN_ERROR_MARGIN = 12
+ORPHAN_REDUNDANT_MAX_ERROR = 18
+ORPHAN_REDUNDANT_RATIO = 0.70
 ORPHAN_FRINGE_PX = 2
 
 def reclaim_occluded(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarray, *,
@@ -305,16 +307,56 @@ def fit_layer_tone(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarray,
 
 def _static_reconstruction_score(layer_dict: dict[str, np.ndarray],
                                  original_rgba: np.ndarray,
-                                 order: tuple[str, ...]) -> tuple[float, int]:
-    """Published MAE precision and bad-pixel count for a non-regression gate."""
+                                 order: tuple[str, ...]) -> tuple[int, int]:
+    """Exact RGB error and bad-pixel count for a non-regression gate.
+
+    The public report rounds MAE for readability.  A repair gate must not use
+    that rounded value: several individually hidden regressions could
+    otherwise accumulate into a visible final difference.
+    """
     original = np.asarray(original_rgba)
     composite = composite_layers(layer_dict, original.shape[:2], order=order)
     subject = original[..., 3] > ORPHAN_ALPHA_THRESHOLD
     error = np.abs(original[..., :3].astype(np.int32)
                    - composite[..., :3].astype(np.int32)).sum(axis=2)
     values = error[subject]
-    mae = round(float(values.mean()), 3) if values.size else 0.0
-    return mae, int((values > 30).sum())
+    return int(values.sum()), int((values > 30).sum())
+
+
+def _merge_semantic_ownership(owner: np.ndarray, contaminant: np.ndarray,
+                              mask: np.ndarray, *, owner_is_front: bool) -> np.ndarray:
+    """Fold one RGBA contribution into its semantic owner without flattening.
+
+    Alpha compositing is associative, so merging the two layers in their
+    existing front/back order preserves how their pair renders over any layer
+    below them.  The caller still checks the full canonical composite because
+    unrelated layers may sit between the pair in the global z-order.
+    """
+    if not mask.any():
+        return owner
+    patched = np.array(owner, copy=True)
+    owner_a = owner[..., 3].astype(np.float32) / 255.0
+    contaminant_a = contaminant[..., 3].astype(np.float32) / 255.0
+    owner_rgb = owner[..., :3].astype(np.float32)
+    contaminant_rgb = contaminant[..., :3].astype(np.float32)
+    if owner_is_front:
+        combined_a = owner_a + contaminant_a * (1.0 - owner_a)
+        premultiplied = (
+            owner_rgb * owner_a[..., None]
+            + contaminant_rgb * contaminant_a[..., None] * (1.0 - owner_a[..., None])
+        )
+    else:
+        combined_a = contaminant_a + owner_a * (1.0 - contaminant_a)
+        premultiplied = (
+            contaminant_rgb * contaminant_a[..., None]
+            + owner_rgb * owner_a[..., None] * (1.0 - contaminant_a[..., None])
+        )
+    combined_rgb = premultiplied / np.maximum(combined_a[..., None], 1e-6)
+    patched[..., :3][mask] = np.rint(
+        np.clip(combined_rgb[mask], 0, 255)).astype(np.uint8)
+    patched[..., 3][mask] = np.rint(
+        np.clip(combined_a[mask] * 255.0, 0, 255)).astype(np.uint8)
+    return patched
 
 
 def clean_garment_orphans(
@@ -339,7 +381,7 @@ def clean_garment_orphans(
     original_rgb = original[..., :3].astype(np.int32)
     canvas_h, canvas_w = original.shape[:2]
     canvas_scale = canvas_h * canvas_w / float(768 * 768)
-    min_area = max(4, int(round(ORPHAN_MIN_AREA_AT_768 * canvas_scale)))
+    min_area = max(1, int(round(ORPHAN_MIN_AREA_AT_768 * canvas_scale)))
     max_distance = ORPHAN_MAX_DISTANCE_DIAGONAL_RATIO * float(
         np.hypot(canvas_h, canvas_w))
     out = dict(layer_dict)
@@ -347,6 +389,8 @@ def clean_garment_orphans(
 
     support = np.zeros((canvas_h, canvas_w), bool)
     best_competing_error = np.full((canvas_h, canvas_w), 1_000_000, np.int32)
+    best_competing_owner = np.full((canvas_h, canvas_w), -1, np.int16)
+    available_competing_tags: list[str] = []
     for tag in competing_tags:
         layer = out.get(tag)
         if layer is None:
@@ -355,9 +399,12 @@ def clean_garment_orphans(
         present = arr[..., 3] > alpha_threshold
         if not present.any():
             continue
+        owner_index = len(available_competing_tags)
+        available_competing_tags.append(tag)
         error = np.abs(original_rgb - arr[..., :3].astype(np.int32)).sum(axis=2)
-        best_competing_error[present] = np.minimum(
-            best_competing_error[present], error[present])
+        better = present & (error < best_competing_error)
+        best_competing_error[better] = error[better]
+        best_competing_owner[better] = owner_index
         support |= present
 
     if not support.any():
@@ -412,6 +459,13 @@ def clean_garment_orphans(
                 & (best_competing_error + ORPHAN_ERROR_MARGIN < garment_error)
             )
             better_ratio = float((component & decisively_competing).sum()) / max(area, 1)
+            redundant_ownership = (
+                support
+                & (best_competing_error <= ORPHAN_REDUNDANT_MAX_ERROR)
+                & (garment_error <= ORPHAN_REDUNDANT_MAX_ERROR)
+            )
+            redundant_ratio = float(
+                (component & redundant_ownership).sum()) / max(area, 1)
             fill_ratio = float(area) / max(width * height, 1)
             row: dict[str, Any] = {
                 "area_px": area,
@@ -419,6 +473,7 @@ def clean_garment_orphans(
                 "distance_to_main_px": round(distance, 2),
                 "semantic_support_ratio": round(semantic_ratio, 4),
                 "competing_better_ratio": round(better_ratio, 4),
+                "redundant_ownership_ratio": round(redundant_ratio, 4),
                 "fill_ratio": round(fill_ratio, 4),
             }
 
@@ -428,7 +483,10 @@ def clean_garment_orphans(
             )
             evidence = (
                 semantic_ratio >= ORPHAN_SEMANTIC_SUPPORT_RATIO
-                and better_ratio >= ORPHAN_BETTER_RATIO
+                and (
+                    better_ratio >= ORPHAN_BETTER_RATIO
+                    or redundant_ratio >= ORPHAN_REDUNDANT_RATIO
+                )
             )
             if not structural:
                 row.update(status="kept", reason="outside conservative size/distance gate")
@@ -440,13 +498,38 @@ def clean_garment_orphans(
                 continue
 
             fringe = cv2.dilate(component.astype(np.uint8), fringe_kernel).astype(bool)
+            ownership_evidence = decisively_competing | redundant_ownership
             remove = component | (
-                fringe & (arr[..., 3] > 0) & support & decisively_competing)
+                fringe & (arr[..., 3] > 0) & support & ownership_evidence)
             patched = np.array(arr, copy=True)
             patched[remove] = 0
             tentative = dict(out)
             tentative[tag] = patched
             tentative_score = _static_reconstruction_score(tentative, original, order)
+            strategy = "clear"
+            transferred_px: dict[str, int] = {}
+            if not (tentative_score[0] <= current_score[0]
+                    and tentative_score[1] <= current_score[1]):
+                transferred = dict(tentative)
+                rank = {name: index for index, name in enumerate(order)}
+                for owner_index, owner_tag in enumerate(available_competing_tags):
+                    owner_mask = remove & (best_competing_owner == owner_index)
+                    if not owner_mask.any():
+                        continue
+                    transferred[owner_tag] = _merge_semantic_ownership(
+                        np.asarray(out[owner_tag]), arr, owner_mask,
+                        owner_is_front=(
+                            rank.get(owner_tag, -1) > rank.get(tag, -1)
+                        ),
+                    )
+                    transferred_px[owner_tag] = int(owner_mask.sum())
+                transferred_score = _static_reconstruction_score(
+                    transferred, original, order)
+                if (transferred_score[0] <= current_score[0]
+                        and transferred_score[1] <= current_score[1]):
+                    tentative = transferred
+                    tentative_score = transferred_score
+                    strategy = "transfer"
             if (tentative_score[0] <= current_score[0]
                     and tentative_score[1] <= current_score[1]):
                 previous_score = current_score
@@ -457,8 +540,10 @@ def clean_garment_orphans(
                 removed_px += count_removed
                 row.update(
                     status="removed",
+                    strategy=strategy,
                     removed_px=count_removed,
-                    fidelity_mae_delta=round(tentative_score[0] - previous_score[0], 3),
+                    transferred_px=transferred_px if strategy == "transfer" else {},
+                    rgb_error_delta=int(tentative_score[0] - previous_score[0]),
                     bad_px_delta=int(tentative_score[1] - previous_score[1]),
                 )
             else:
@@ -660,8 +745,8 @@ def repair_portrait_layers(layer_dict: dict[str, np.ndarray],
     working, reclaimed = reclaim_occluded(layer_dict, original_rgba)
     working, tone_fit = fit_layer_tone(working, original_rgba)
     working, edge_fit = fit_edge_alpha(working, original_rgba)
-    working, orphan_cleanup = clean_garment_orphans(working, original_rgba)
     working, seam_fit = fit_seam_residual(working, original_rgba)
+    working, orphan_cleanup = clean_garment_orphans(working, original_rgba)
     return RepairResult(
         layers=working,
         report={
@@ -669,8 +754,8 @@ def repair_portrait_layers(layer_dict: dict[str, np.ndarray],
             "order": list(REPAIR_ORDER),
             "reclaim_occluded": reclaimed,
             "fit_layer_tone": tone_fit,
-            "clean_garment_orphans": orphan_cleanup,
             "fit_edge_alpha": edge_fit,
             "fit_seam_residual": seam_fit,
+            "clean_garment_orphans": orphan_cleanup,
         },
     )

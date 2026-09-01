@@ -516,6 +516,29 @@ class GarmentOrphanCleanupTests(unittest.TestCase):
         self.assertLessEqual(after["mae"], before["mae"])
         self.assertLessEqual(after["bad_px"], before["bad_px"])
 
+    def test_redundant_skin_fragment_is_transferred_to_neck_exactly(self):
+        neck = rgba([(48, 48, 56, 56)], value=195)
+        garment = rgba([(28, 68, 100, 118)], value=90)
+        garment[50:54, 50:54, :3] = 205
+        garment[50:54, 50:54, 3] = 128
+        layers = {"neck": neck, "topwear": garment}
+        original = composite_layers(layers, (CANVAS, CANVAS))
+        before = composite_layers(layers, (CANVAS, CANVAS))
+
+        out, report = clean_garment_orphans(layers, original)
+        after = composite_layers(out, (CANVAS, CANVAS))
+
+        self.assertFalse((out["topwear"][50:54, 50:54, 3] > 10).any())
+        np.testing.assert_array_equal(after, before)
+        row = next(
+            item for item in report["topwear"]["components"]
+            if item["bbox_xywh"] == [50, 50, 4, 4]
+        )
+        self.assertEqual(row["status"], "removed")
+        self.assertEqual(row["strategy"], "transfer")
+        self.assertEqual(row["transferred_px"], {"neck": 16})
+        self.assertEqual(row["rgb_error_delta"], 0)
+
     def test_a001_neck_topwear_repair_does_not_regress(self):
         layers, original = contested_scene()
         subject = original[..., 3] > 10
