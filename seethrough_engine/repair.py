@@ -14,9 +14,10 @@ import cv2
 import numpy as np
 
 from .image import composite_fidelity, composite_layers
+from .scale import canvas_scale, odd_kernel, scale_area, scale_length
 from .semantic import SEMANTIC_Z_ORDER
 
-REPAIR_VERSION = "1.2"
+REPAIR_VERSION = "1.3"
 REPAIR_ORDER = (
     "reclaim_occluded",
     "fit_layer_tone",
@@ -157,14 +158,15 @@ def reclaim_occluded(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarra
     never open a gap where there is nothing behind to show through.
     """
     original = np.asarray(original_rgba)[..., :3].astype(np.int32)
-    feather = RECLAIM_FEATHER_PX if feather is None else feather
+    feather = (max(0.5, RECLAIM_FEATHER_PX * canvas_scale(original.shape))
+               if feather is None else feather)
     if min_area is None:
-        scale = original.shape[0] * original.shape[1] / (768.0 * 768.0)
-        min_area = max(64, int(round(RECLAIM_MIN_AREA_AT_768 * scale)))
+        min_area = scale_area(RECLAIM_MIN_AREA_AT_768, original.shape)
 
     out = dict(layer_dict)
     moved: dict[str, int] = {}
-    kernel = np.ones((5, 5), np.uint8)
+    kernel_size = odd_kernel(5, original.shape)
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
 
     for front_tag, back_tag in pairs:
         front, back = out.get(front_tag), out.get(back_tag)
@@ -380,8 +382,7 @@ def clean_garment_orphans(
     original = np.asarray(original_rgba)
     original_rgb = original[..., :3].astype(np.int32)
     canvas_h, canvas_w = original.shape[:2]
-    canvas_scale = canvas_h * canvas_w / float(768 * 768)
-    min_area = max(1, int(round(ORPHAN_MIN_AREA_AT_768 * canvas_scale)))
+    min_area = scale_area(ORPHAN_MIN_AREA_AT_768, original.shape)
     max_distance = ORPHAN_MAX_DISTANCE_DIAGONAL_RATIO * float(
         np.hypot(canvas_h, canvas_w))
     out = dict(layer_dict)
@@ -411,8 +412,13 @@ def clean_garment_orphans(
         return out, report
 
     current_score = _static_reconstruction_score(out, original, order)
+    # This fringe follows the raster antialiasing footprint, not a geometric
+    # distance in the portrait. The resize kernel remains about two output
+    # pixels at both 768 and 1024; scaling it to three overreaches into valid
+    # cloth and makes exact ownership transfer fail on A002.
+    fringe = ORPHAN_FRINGE_PX
     fringe_kernel = cv2.getStructuringElement(
-        cv2.MORPH_ELLIPSE, (2 * ORPHAN_FRINGE_PX + 1,) * 2)
+        cv2.MORPH_ELLIPSE, (2 * fringe + 1,) * 2)
 
     for tag in garment_tags:
         layer = out.get(tag)
@@ -742,10 +748,26 @@ def repair_portrait_layers(layer_dict: dict[str, np.ndarray],
     Ordering is part of the interface.  Callers do not invoke the individual
     stages and downstream consumers must not invoke this module at all.
     """
-    working, reclaimed = reclaim_occluded(layer_dict, original_rgba)
-    working, tone_fit = fit_layer_tone(working, original_rgba)
-    working, edge_fit = fit_edge_alpha(working, original_rgba)
-    working, seam_fit = fit_seam_residual(working, original_rgba)
+    shape = np.asarray(original_rgba).shape
+    working, reclaimed = reclaim_occluded(
+        layer_dict, original_rgba,
+        min_area=scale_area(RECLAIM_MIN_AREA_AT_768, shape),
+        feather=max(0.5, RECLAIM_FEATHER_PX * canvas_scale(shape)),
+    )
+    working, tone_fit = fit_layer_tone(
+        working, original_rgba,
+        min_sample=scale_area(TONE_MIN_SAMPLE, shape),
+        min_cluster=scale_area(TONE_MIN_CLUSTER, shape),
+    )
+    working, edge_fit = fit_edge_alpha(
+        working, original_rgba,
+        band=scale_length(EDGE_BAND_PX, shape),
+        outside=scale_length(EDGE_OUTSIDE_PX, shape),
+    )
+    working, seam_fit = fit_seam_residual(
+        working, original_rgba,
+        band=scale_length(SEAM_BAND_PX, shape),
+    )
     working, orphan_cleanup = clean_garment_orphans(working, original_rgba)
     return RepairResult(
         layers=working,

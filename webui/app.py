@@ -104,6 +104,7 @@ def _prepare_subject_image(image_rgba: np.ndarray, has_provided_mask: bool,
     from portrait_core import PortraitConfig
     from portrait_core.masks import bbox_fill_ratio
     from seethrough_engine import matting
+    from seethrough_engine.scale import scale_length
 
     alpha_cfg = PortraitConfig.load().section("alpha")
     threshold = float(alpha_cfg["binary_threshold"]) * 255.0
@@ -122,7 +123,9 @@ def _prepare_subject_image(image_rgba: np.ndarray, has_provided_mask: bool,
             "supply a subject mask (white = subject)."
         )
 
-    found = matting.detect_flat_background(image_rgba)
+    border = scale_length(matting.BORDER_RING_PX, image_rgba.shape)
+    edge_band = scale_length(matting.EDGE_BAND_PX, image_rgba.shape)
+    found = matting.detect_flat_background(image_rgba, border=border)
     if not found["flat"]:
         raise gr.Error(
             f"Cannot key this background: {found['reason']}. Flat-background keying "
@@ -130,7 +133,8 @@ def _prepare_subject_image(image_rgba: np.ndarray, has_provided_mask: bool,
             "supply a subject mask instead."
         )
 
-    keyed, info = matting.key_flat_background(image_rgba)
+    keyed, info = matting.key_flat_background(
+        image_rgba, border=border, edge_band=edge_band)
     log(f"Keyed a flat background rgb{tuple(info['color'])}: "
         f"{info['border_share']:.0%} of the border, spread {info['border_std']}, "
         f"{info['foreground_ratio']:.1%} of the canvas kept, "
@@ -269,7 +273,7 @@ def run_a001(
 
         progress(1.0, desc="Done")
         return (
-            _verdict_badge(manifest["verdict"]),
+            _verdict_badge(report["verdict"]),
             _coverage_table(report["coverage"]),
             reasons_md,
             layer_gallery,
@@ -343,12 +347,12 @@ def build_app() -> gr.Blocks:
                 with gr.Row():
                     seed_in = gr.Number(label="Seed", value=42, precision=0)
                     resolution_in = gr.Slider(
-                        label="Resolution", minimum=512, maximum=2048, step=64, value=1280
+                        label="Resolution", minimum=512, maximum=2048, step=64, value=768
                     )
                 head_res_in = gr.Dropdown(
                     label="Head detail resolution",
                     choices=[HEAD_RES_MATCH, "640", "768", "1024", "1280"],
-                    value=HEAD_RES_MATCH,
+                    value="768",
                     info=(
                         "The v3 head pass re-diffuses a crop of the head on its own "
                         "square canvas, and its size is what decides whether the fine "
@@ -356,7 +360,9 @@ def build_app() -> gr.Blocks:
                         "the layers composite to mae 15.1, while 768 returns it at "
                         "11.9. Set this to 768 with a 512 body to keep the detail "
                         "without paying for a full-resolution body pass. Peak VRAM "
-                        "follows the larger of the two."
+                        "follows the larger of the two. A002 currently regresses "
+                        "at a 1024 head pass, so 768 is the validated safe profile; "
+                        "local eye fidelity will flag a visible loss."
                     ),
                 )
                 steps_in = gr.Slider(

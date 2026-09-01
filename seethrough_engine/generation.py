@@ -68,6 +68,9 @@ from .layers import (
 )
 from .repair import repair_portrait_layers
 from .semantic import semantic_warnings
+from .image import composite_layers
+from .local_fidelity import local_fidelity_report
+from .ownership import recover_missing_ownership
 
 __all__ = [
     "ALL_TAGS",
@@ -219,6 +222,7 @@ class PortraitPipelineResult:
     evaluation: Any
     report: dict[str, Any]
     repair_report: dict[str, Any]
+    ownership_report: dict[str, Any] = field(default_factory=dict)
     all_runs_layers: list[dict[str, Any]] = field(default_factory=list)
     selection_trace: tuple = ()
 
@@ -394,11 +398,19 @@ def run_portrait_pipeline(
     # never be consumed as canonical layers.
     raw_layer_dict = dict(layer_dict)
 
-    final_evaluation = evaluate_portrait_layers(
-        layer_dict, portrait_mask, enable_head_detail=enable_head_detail, config=portrait_config,
-    )
     if silhouette_guard:
-        final_guard = apply_silhouette_guard(fullpage, layer_dict, portrait_mask, portrait_config)
+        pre_recovery_guard = apply_silhouette_guard(
+            fullpage, layer_dict, portrait_mask, portrait_config)
+        repair_result = repair_portrait_layers(
+            pre_recovery_guard.guarded_layers, fullpage)
+        ownership_result = recover_missing_ownership(
+            repair_result.layers,
+            fullpage,
+            pre_recovery_guard.subject_mask,
+        )
+        layer_dict = ownership_result.layers
+        final_guard = apply_silhouette_guard(
+            fullpage, layer_dict, portrait_mask, portrait_config)
         layer_dict = final_guard.guarded_layers
     else:
         raw_config = PortraitConfig(raw={
@@ -406,9 +418,13 @@ def run_portrait_pipeline(
             "guard": {**portrait_config.section("guard"), "enabled": False, "clip_layers_to_subject": False},
         })
         final_guard = apply_silhouette_guard(fullpage, layer_dict, portrait_mask, raw_config)
+        ownership_result = None
+        repair_result = repair_portrait_layers(layer_dict, fullpage)
+        layer_dict = repair_result.layers
 
-    repair_result = repair_portrait_layers(layer_dict, fullpage)
-    layer_dict = repair_result.layers
+    final_evaluation = evaluate_portrait_layers(
+        layer_dict, portrait_mask, enable_head_detail=enable_head_detail, config=portrait_config,
+    )
 
     report = build_portrait_report(
         source={
@@ -432,6 +448,33 @@ def run_portrait_pipeline(
         selection_trace=selection_trace,
     )
     report["semantic"]["warnings"] = semantic_warnings(layer_dict, fullpage)
+    ownership_report = ownership_result.report if ownership_result is not None else {
+        "version": "disabled",
+        "initial_missing_px": int(final_guard.metrics.missing_area_px),
+        "semantic_recovered_px": 0,
+        "recovered_by_tag": {},
+        "unresolved_remainder_px": int(final_guard.metrics.missing_area_px),
+        "unresolved_remainder_ratio": round(float(final_guard.metrics.missing_ratio), 6),
+        "candidates": [],
+    }
+    report["semantic_ownership"] = ownership_report
+    canonical_for_validation = dict(layer_dict)
+    if np.any(final_guard.body_remainder[..., 3] > 10):
+        canonical_for_validation["body_remainder"] = final_guard.body_remainder
+    local_report = local_fidelity_report(
+        fullpage,
+        composite_layers(canonical_for_validation, fullpage.shape[:2]),
+        layer_dict,
+    )
+    report["local_fidelity"] = local_report
+    report["semantic"]["warnings"] = list(dict.fromkeys(
+        [*report["semantic"]["warnings"], *local_report["warnings"]]
+    ))
+    if local_report["status"] == "review" and report["verdict"] in {
+        "PASS", "SOFT_PASS", "SOFT_PASS_LOW_CONFIDENCE",
+    }:
+        report["verdict"] = "REWORK"
+        report["reasons"].append("Face-critical local fidelity requires review.")
 
     return PortraitPipelineResult(
         layer_dict=layer_dict,
@@ -446,6 +489,7 @@ def run_portrait_pipeline(
         evaluation=final_evaluation,
         report=report,
         repair_report=repair_result.report,
+        ownership_report=ownership_report,
         all_runs_layers=all_runs_layers,
         selection_trace=selection_trace,
     )

@@ -1,0 +1,68 @@
+{
+  "fixture": "A002-neutral-resolution-regression",
+  "captured_at": "2026-09-02",
+  "source": {
+    "logical_input": "A002 neutral",
+    "normalized_1024_to_768_rgb_mae": 2.207299,
+    "same_seed": 42,
+    "same_steps": 30
+  },
+  "baseline": {
+    "resolution": 768,
+    "head_resolution": 768,
+    "seed": 42,
+    "steps": 30,
+    "eyewhite_present": true,
+    "sclera_preserved": true,
+    "eye_local_fidelity": {
+      "status": "pass",
+      "left_sclera_lost_ratio": 0.23871,
+      "right_sclera_lost_ratio": 0.215686
+    },
+    "topwear_contamination": {
+      "removed_px": 372,
+      "ambiguous_components": 12,
+      "ambiguous_area_px": 60
+    },
+    "initial_missing_px": 39033,
+    "unresolved_remainder_ratio": 0.1859380023,
+    "semantic_tag_count": 14,
+    "global_composite_fidelity": {
+      "mae": 9.014,
+      "bad_ratio": 0.05336,
+      "bad_px": 11555,
+      "subject_px": 216561
+    },
+    "semantic_only_mae": 102.115,
+    "semantic_warnings": []
+  },
+  "comparison": {
+    "resolution": 1024,
+    "head_resolution": 1024,
+    "seed": 42,
+    "steps": 30,
+    "eyewhite_present": false,
+    "sclera_preserved": false,
+    "eye_local_fidelity": {
+      "status": "review",
+      "left_sclera_lost_ratio": 1.0,
+      "right_sclera_lost_ratio": 1.0
+    },
+    "topwear_contamination": {
+      "removed_px": 1303,
+      "ambiguous_components": 3,
+      "ambiguous_area_px": 46
+    },
+    "initial_missing_px": 68331,
+    "unresolved_remainder_ratio": 0.1821436054,
+    "semantic_tag_count": 13,
+    "global_composite_fidelity": {
+      "mae": 9.438,
+      "bad_ratio": 0.04761,
+      "bad_px": 18331,
+      "subject_px": 385015
+    },
+    "semantic_only_mae": 103.335,
+    "semantic_warnings": ["missing_eyewhite"]
+  }
+}

@@ -10,6 +10,8 @@ from __future__ import annotations
 import cv2
 import numpy as np
 
+from .scale import scale_area
+
 SEMANTIC_Z_ORDER: tuple[str, ...] = (
     "body_remainder",
     "wings",
@@ -93,8 +95,7 @@ def semantic_warnings(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarr
 
     count, labels, stats, _ = cv2.connectedComponentsWithStats(
         irises.astype(np.uint8), 8)
-    scale = irises.size / float(768 * 768)
-    min_iris_area = max(12, int(round(20 * scale)))
+    min_iris_area = scale_area(20, irises.shape)
     rgb = original[..., :3].astype(np.float32)
     maximum = rgb.max(axis=2)
     chroma = rgb.max(axis=2) - rgb.min(axis=2)
@@ -113,7 +114,7 @@ def semantic_warnings(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarr
         iris = labels == index
         ring = cv2.dilate(iris.astype(np.uint8), kernel).astype(bool) & ~iris
         observed = ring & support & bright_neutral
-        required = max(12, int(round(area * 0.08)))
+        required = max(scale_area(12, irises.shape), int(round(area * 0.08)))
         if int(observed.sum()) >= required:
             return ["missing_eyewhite"]
 

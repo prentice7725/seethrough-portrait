@@ -53,11 +53,21 @@
     },
     "layer_contract": {
       "type": "object",
-      "required": ["canonical_stage", "raw_layers_preserved", "silhouette_guard", "fidelity_repair"],
+      "required": ["canonical_stage", "raw_layers_preserved", "silhouette_guard", "semantic_ownership", "fidelity_repair"],
       "properties": {
         "canonical_stage": {"const": "production_repaired"},
         "raw_layers_preserved": {"type": "boolean"},
         "silhouette_guard": {"type": "boolean"},
+        "semantic_ownership": {
+          "type": "object",
+          "required": ["version", "stage", "report"],
+          "properties": {
+            "version": {"type": "string"},
+            "stage": {"const": "post_repair_pre_remainder"},
+            "report": {"const": "diagnostics/semantic_ownership.json"}
+          },
+          "additionalProperties": false
+        },
         "fidelity_repair": {
           "type": "object",
           "required": ["version", "order", "report"],
@@ -76,10 +86,11 @@
     "diagnostics": {"type": "object", "additionalProperties": {"type": "string"}},
     "validation": {
       "type": "object",
-      "required": ["static_reconstruction", "seams"],
+      "required": ["static_reconstruction", "seams", "local_fidelity"],
       "properties": {
         "static_reconstruction": {"enum": ["pass", "review", "fail"]},
-        "seams": {"enum": ["pass", "review", "fail", "not_run"]}
+        "seams": {"enum": ["pass", "review", "fail", "not_run"]},
+        "local_fidelity": {"enum": ["pass", "review", "unavailable"]}
       },
       "additionalProperties": false
     },
