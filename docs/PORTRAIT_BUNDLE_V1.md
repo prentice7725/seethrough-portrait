@@ -42,13 +42,8 @@ downstream consumer such as `portrait-autorig`.
   repair prevents newly transferred source pixels from biasing tone/seam fits.
 - The fidelity-repair order is fixed: `reclaim_occluded`, `fit_layer_tone`,
   `fit_edge_alpha`, `fit_seam_residual`, `clean_garment_orphans`.
-- Pixel geometry in ownership, repair, seam, and local-feature validation is
-  normalized to a 768 px reference canvas (lengths by scale, areas by scale²).
 - `semantics.warnings` records observable producer-side semantic omissions,
   such as `missing_eyewhite`. It is not a rig-readiness or motion verdict.
-- `diagnostics/local_fidelity.json` compares left/right eye and mouth ROIs
-  against the source. Visible sclera loss downgrades normal PASS-family
-  verdicts even when whole-subject MAE appears acceptable.
 - A consumer must reject an unknown major format version.
 - A consumer must never run fidelity repair when
   `layer_contract.canonical_stage` is `production_repaired`.

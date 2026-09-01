@@ -20,37 +20,11 @@ layers exist only for debugging, provenance, and regression analysis.
 
 ## Fidelity repair
 
-The ordered static reconstruction pass: reclaim occluded pixels, fit material
-tone, fit edge alpha, fit residual seams, then remove or transfer
-well-supported orphan semantic contamination. It compares layers with the original still
+The ordered static reconstruction pass: reclaim occluded pixels, remove
+well-supported orphan semantic contamination, fit material tone, fit edge
+alpha, then fit residual seams. It compares layers with the original still
 image and contains no animation policy. A proposed cleanup is accepted only
 when canonical composite fidelity does not regress.
-
-## Semantic ownership recovery
-
-The conservative static pass after existing semantic fidelity repair and
-before `body_remainder` construction. It returns high-confidence missing pixels to an
-existing semantic layer using local connectivity, source colour, competing
-ownership, and an exact reconstruction gate. Pixels without decisive evidence
-remain unresolved residual.
-
-## Unresolved residual
-
-Subject pixels left after semantic ownership recovery. Only this residual may
-be published as `body_remainder`; the term no longer means every pixel omitted
-by model decomposition.
-
-## Local fidelity
-
-Static reconstruction measured in feature-anchored face regions rather than
-averaged over the whole subject. Left/right eye and mouth results expose small
-critical losses, such as sclera disappearance, that global MAE can hide.
-
-## Resolution regression fixture
-
-A recorded same-input A/B comparison across generation resolutions. It tracks
-semantic tags, unresolved residual, garment contamination, global fidelity,
-local eye fidelity, and warnings.
 
 ## Semantic warning
 

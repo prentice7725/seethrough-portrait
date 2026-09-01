@@ -124,9 +124,6 @@ try:
     from .seethrough_engine import generation as st_generation
     from .seethrough_engine import repair as st_repair
     from .seethrough_engine import semantic as st_semantic
-    from .seethrough_engine import ownership as st_ownership
-    from .seethrough_engine import local_fidelity as st_local_fidelity
-    from .seethrough_engine import image as st_image
     from .seethrough_engine import depth as st_depth
 except ImportError:
     from seethrough_engine import model_loading as st_model_loading
