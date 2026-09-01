@@ -149,6 +149,16 @@ def _verdict_badge(verdict: str) -> str:
     )
 
 
+def _report_verdict_badge(report: dict) -> str:
+    """Render the Portrait Mode verdict, which belongs to the diagnostic report.
+
+    A Portrait Bundle manifest only records static bundle validation. The
+    pipeline's PASS / REWORK / FAIL verdict remains in portrait_report.json
+    (and is already available as ``result.report`` in this call path).
+    """
+    return _verdict_badge(str(report.get("verdict", "UNKNOWN")))
+
+
 def _coverage_table(coverage: dict) -> str:
     rows = "\n".join(
         f"| {key} | {value} |" for key, value in coverage.items()
@@ -269,7 +279,7 @@ def run_a001(
 
         progress(1.0, desc="Done")
         return (
-            _verdict_badge(manifest["verdict"]),
+            _report_verdict_badge(report),
             _coverage_table(report["coverage"]),
             reasons_md,
             layer_gallery,
