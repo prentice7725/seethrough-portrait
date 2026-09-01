@@ -1,5 +1,9 @@
 # PORTRAIT_MODE_FORK_PLAN_v0.1
 
+> Historical plan. Auto-rigging, expressions, Spine export, and the browser
+> preview moved to `https://github.com/prentice7725/portrait-autorig` when
+> Portrait Bundle v1 became the file seam between the two projects.
+
 ## Purpose
 
 Fork tk_seethrough into a portrait-focused derivative that can decompose
@@ -196,4 +200,3 @@ first frame and the last one agree.
 **8 GB profile.** Their low-VRAM path is CPU offload plus quantized weights plus
 freeing VRAM between inference stages -- the third of those is the one this fork
 has not tried.
-

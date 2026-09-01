@@ -1,4 +1,4 @@
-"""Seam guard: find the thin, long artifacts the composite metrics cannot see.
+"""Static seam guard: find the thin, long artifacts the composite metrics cannot see.
 
 `composite_fidelity` averages over the subject, and a seam is one pixel wide.
 On A-001 the whole-subject mae reached 8.84 while a line across the neck was
@@ -15,37 +15,23 @@ decomposition steps only in the composite.
 The number that matters is not how wrong a boundary pixel is but how far the
 wrongness runs: a 2-luma error over 200 contiguous pixels is a line, and the
 same error scattered over 200 unrelated pixels is nothing. So the report is
-ranked by the longest run, not by the mean.
-
-    python -m seethrough_engine.seams <run dir> [<run dir> ...]
-    python -m seethrough_engine.seams --check <run dir>
-
-`--check` exits non-zero when a seam is worse than the thresholds below, which
-are set from what the pipeline currently achieves rather than from taste: see
-`docs/PORTRAIT_AUTO_RIG_FEASIBILITY_v0.1.md` for the A-001 baseline they came
-from.
+ranked by the longest run, not by the mean. The input is the same full-canvas
+canonical layer mapping written into Portrait Bundle v1.
 """
 
 from __future__ import annotations
 
-import json
-import os
-import sys
 from typing import Any
 
 import cv2
 import numpy as np
-from PIL import Image
 
 __all__ = [
     "STEP_THRESHOLD",
     "FLAT_STEP",
-    "QUIET_ENERGY_FACTOR",
-    "QUIET_ENERGY_FLOOR",
-    "seam_report",
-    "check_run",
-    "load_baseline",
-    "write_baseline",
+    "QUIET_ENERGY",
+    "seam_report_layers",
+    "compare_seam_report",
 ]
 
 # A boundary pixel counts toward a run when the composite steps this much more
@@ -115,46 +101,35 @@ def _luma(rgb):
     return rgb.astype(np.float32) @ _LUMA
 
 
-def _run_manifest(run_dir):
-    names = [f for f in os.listdir(run_dir) if f.endswith("_rig_manifest.json")]
-    if not names:
-        raise FileNotFoundError(f"no *_rig_manifest.json in {run_dir}")
-    with open(os.path.join(run_dir, names[0]), encoding="utf-8") as f:
-        return names[0][: -len("_rig_manifest.json")], json.load(f)
+def _render_layers(layer_dict: dict[str, np.ndarray],
+                   frame_size: tuple[int, int]):
+    """Render canonical full-canvas layers and their topmost owner."""
+    from .semantic import semantic_rank
 
-
-def _render(run_dir, manifest):
-    """The rig's parts at rest, back to front, with the topmost owner per pixel.
-
-    Expression parts are left out: they are an overlay that may or may not be
-    attached, and a guard has to measure the same thing every time.
-    """
-    height = manifest["canvas"]["height"]
-    width = manifest["canvas"]["width"]
+    height, width = int(frame_size[0]), int(frame_size[1])
     rgb = np.zeros((height, width, 3), np.float32)
     alpha = np.zeros((height, width, 1), np.float32)
     owner = np.full((height, width), -1, np.int16)
-    parts = sorted(manifest["parts"], key=lambda p: p["z"])
-    for index, part in enumerate(parts):
-        image = np.array(Image.open(os.path.join(run_dir, *part["image"].split("/")))
-                         .convert("RGBA")).astype(np.float32)
-        x1, y1, x2, y2 = part["xyxy"]
-        a = image[:, :, 3:4] / 255.0
-        window = rgb[y1:y2, x1:x2]
-        window[:] = window * (1.0 - a) + image[:, :, :3] * a
-        alpha[y1:y2, x1:x2] = np.clip(alpha[y1:y2, x1:x2] + a, 0.0, 1.0)
-        owner[y1:y2, x1:x2][image[:, :, 3] > 128] = index
-    return rgb, alpha[:, :, 0], owner, [p["tag"] for p in parts]
+    tags = sorted(layer_dict, key=semantic_rank)
+    for index, tag in enumerate(tags):
+        image = np.asarray(layer_dict[tag]).astype(np.float32)
+        if image.shape != (height, width, 4):
+            raise ValueError(
+                f"layer {tag!r} must match canvas {(height, width, 4)}, got {image.shape}"
+            )
+        a = image[..., 3:4] / 255.0
+        rgb[:] = rgb * (1.0 - a) + image[..., :3] * a
+        alpha[:] = np.clip(alpha + a, 0.0, 1.0)
+        owner[image[..., 3] > 128] = index
+    return rgb, alpha[..., 0], owner, tags
 
 
-def seam_report(run_dir: str, *, step_threshold: float = STEP_THRESHOLD,
-                flat_step: float = FLAT_STEP, quiet_energy: float = QUIET_ENERGY,
-                band: int = BAND_PX) -> dict[str, Any]:
-    """Every boundary between two layers, and how much of it is a line."""
-    base_name, manifest = _run_manifest(run_dir)
-    composite, _, owner, tags = _render(run_dir, manifest)
-    original = np.array(Image.open(os.path.join(run_dir, f"{base_name}_original.png"))
-                        .convert("RGBA"))
+def _measure_seams(original: np.ndarray, composite: np.ndarray,
+                   owner: np.ndarray, tags: list[str], *, run: str,
+                   step_threshold: float = STEP_THRESHOLD,
+                   flat_step: float = FLAT_STEP,
+                   quiet_energy: float = QUIET_ENERGY,
+                   band: int = BAND_PX) -> dict[str, Any]:
     subject = original[:, :, 3] > 128
     lc, lo = _luma(composite), _luma(original[:, :, :3])
     # How busy the picture is around each pixel, which is what decides whether
@@ -239,111 +214,49 @@ def seam_report(run_dir: str, *, step_threshold: float = STEP_THRESHOLD,
             "band_residual": round(residual, 2),
         })
     rows.sort(key=lambda r: (-r["longest_run_px"], -r["mean_excess"]))
-    return {"run": os.path.basename(os.path.normpath(run_dir)),
+    return {"run": run,
             "step_threshold": step_threshold,
             "quiet_energy": round(quiet_energy, 1), "seams": rows}
 
 
-def check_run(run_dir: str, baseline: dict[str, Any], *,
-              run_slack: int = RUN_SLACK_PX,
-              excess_slack: float = EXCESS_SLACK) -> tuple[bool, list[str]]:
-    """`(passed, complaints)` against a recorded baseline.
 
-    A seam that appears where the baseline had none is a complaint too: the
-    usual way to make one boundary better is to move the fault to the next one.
-    """
-    report = seam_report(run_dir)
+
+def seam_report_layers(original_rgba: np.ndarray,
+                       layer_dict: dict[str, np.ndarray], *,
+                       run: str = "portrait-bundle",
+                       step_threshold: float = STEP_THRESHOLD,
+                       flat_step: float = FLAT_STEP,
+                       quiet_energy: float = QUIET_ENERGY,
+                       band: int = BAND_PX) -> dict[str, Any]:
+    """Measure static seams directly at the Portrait Bundle seam."""
+    original = np.asarray(original_rgba)
+    composite, _, owner, tags = _render_layers(layer_dict, original.shape[:2])
+    return _measure_seams(
+        original, composite, owner, tags, run=run,
+        step_threshold=step_threshold, flat_step=flat_step,
+        quiet_energy=quiet_energy, band=band,
+    )
+
+
+def compare_seam_report(report: dict[str, Any], baseline: dict[str, Any], *,
+                        run_slack: int = RUN_SLACK_PX,
+                        excess_slack: float = EXCESS_SLACK) -> tuple[bool, list[str]]:
+    """Compare two array-based reports for regression gating."""
     before = {row["pair"]: row for row in baseline.get("seams", [])}
     complaints = []
-    for row in report["seams"]:
+    for row in report.get("seams", []):
         was = before.get(row["pair"])
         if was is None:
             if row["longest_run_px"] > run_slack:
-                complaints.append(
-                    f"{row['pair']}: new seam, {row['longest_run_px']} px")
+                complaints.append(f"{row['pair']}: new seam, {row['longest_run_px']} px")
             continue
         if row["longest_run_px"] > was["longest_run_px"] + run_slack:
             complaints.append(
                 f"{row['pair']}: {was['longest_run_px']} -> "
-                f"{row['longest_run_px']} px of continuous seam")
+                f"{row['longest_run_px']} px of continuous seam"
+            )
         if row["mean_excess"] > was["mean_excess"] + excess_slack:
             complaints.append(
-                f"{row['pair']}: mean excess {was['mean_excess']} -> "
-                f"{row['mean_excess']}")
+                f"{row['pair']}: mean excess {was['mean_excess']} -> {row['mean_excess']}"
+            )
     return not complaints, complaints
-
-
-def load_baseline(path: str) -> dict[str, Any]:
-    with open(path, encoding="utf-8") as f:
-        return json.load(f)
-
-
-def write_baseline(path: str, run_dirs) -> dict[str, Any]:
-    """Record what the pipeline achieves today, for future changes to beat."""
-    baseline = {os.path.basename(os.path.normpath(d)): seam_report(d) for d in run_dirs}
-    with open(path, "w", encoding="utf-8") as f:
-        json.dump(baseline, f, indent=2)
-    return baseline
-
-
-def _print(report, limit=8):
-    print(f"run {report['run']}   (counted where the original steps under "
-          f"{FLAT_STEP} luma, its neighbourhood is under {report.get('quiet_energy')}, "
-          f"and the composite steps {report['step_threshold']}+ more)")
-    print(f"  {'pair':34s} {'bound':>6s} {'flat':>6s} {'mean':>6s} {'p95':>6s} "
-          f"{'max':>6s} {'over':>5s} {'longest':>8s} {'band mae':>9s}")
-    for row in report["seams"][:limit]:
-        print(f"  {row['pair']:34s} {row['boundary_px']:6d} {row['flat_px']:6d} "
-              f"{row['mean_excess']:6.2f} {row['p95_excess']:6.2f} {row['max_excess']:6.2f} "
-              f"{row['over_threshold_px']:5d} {row['longest_run_px']:8d} "
-              f"{row['band_residual']:9.2f}")
-
-
-DEFAULT_BASELINE = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                "docs", "seam_baseline.json")
-
-
-def main(argv=None) -> int:
-    argv = list(sys.argv[1:] if argv is None else argv)
-    check = "--check" in argv
-    record = "--record" in argv
-    path = DEFAULT_BASELINE
-    if "--baseline" in argv:
-        path = argv[argv.index("--baseline") + 1]
-        argv = [a for a in argv if a != path]
-    runs = [a for a in argv if not a.startswith("--")]
-    if not runs:
-        print(__doc__, file=sys.stderr)
-        return 2
-
-    if record:
-        write_baseline(path, runs)
-        print(f"recorded {len(runs)} run(s) to {path}")
-        return 0
-
-    if check:
-        if not os.path.isfile(path):
-            print(f"no baseline at {path}; record one with --record", file=sys.stderr)
-            return 2
-        baseline = load_baseline(path)
-        failed = False
-        for run_dir in runs:
-            name = os.path.basename(os.path.normpath(run_dir))
-            if name not in baseline:
-                print(f"{name}: not in the baseline, nothing to compare against")
-                continue
-            passed, complaints = check_run(run_dir, baseline[name])
-            print(f"{name}: " + ("seams ok" if passed else "SEAM GUARD"))
-            for line in complaints:
-                print(f"  {line}")
-            failed |= not passed
-        return 1 if failed else 0
-
-    for run_dir in runs:
-        _print(seam_report(run_dir))
-        print()
-    return 0
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

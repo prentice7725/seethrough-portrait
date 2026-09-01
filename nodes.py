@@ -122,12 +122,12 @@ except ImportError:
 try:
     from .seethrough_engine import model_loading as st_model_loading
     from .seethrough_engine import generation as st_generation
-    from .seethrough_engine import spine as st_spine
+    from .seethrough_engine import repair as st_repair
     from .seethrough_engine import depth as st_depth
 except ImportError:
     from seethrough_engine import model_loading as st_model_loading
     from seethrough_engine import generation as st_generation
-    from seethrough_engine import spine as st_spine
+    from seethrough_engine import repair as st_repair
     from seethrough_engine import depth as st_depth
 
 print("[SeeThrough] All see-through imports OK", flush=True)
@@ -823,6 +823,7 @@ class SeeThrough_GenerateLayers_Custom:
 
         portrait_result = None
         if portrait_mode:
+            raw_layer_dict = dict(layer_dict)
             final_evaluation = evaluate_portrait_layers(
                 layer_dict, portrait_mask,
                 enable_head_detail=enable_head_detail,
@@ -844,11 +845,14 @@ class SeeThrough_GenerateLayers_Custom:
                     },
                 })
                 final_guard = apply_silhouette_guard(fullpage, layer_dict, portrait_mask, raw_config)
+            repair_result = st_repair.repair_portrait_layers(layer_dict, fullpage)
+            layer_dict = repair_result.layers
             report = build_portrait_report(
                 source={
                     "filename": "",
                     "width": int(fullpage.shape[1]),
                     "height": int(fullpage.shape[0]),
+                    "tag_version": str(tag_version),
                 },
                 run={
                     "seed": int(seed),
@@ -870,6 +874,8 @@ class SeeThrough_GenerateLayers_Custom:
                 "guard": final_guard,
                 "evaluation": final_evaluation,
                 "report": report,
+                "raw_layer_dict": raw_layer_dict,
+                "repair_report": repair_result.report,
             }
             print(
                 f"[SeeThrough Portrait] verdict={report['verdict']}, "
@@ -918,7 +924,7 @@ class SeeThrough_GenerateDepth:
     def generate(self, layers, depth_model, seed=42):
         # The batching, v2-slot folding and depth redistribution are shared
         # with the standalone webui (seethrough_engine.depth), which uses them
-        # to order a Spine export the same way this graph does.
+        # to preserve the decomposition graph's depth ordering.
         layer_dict = layers.layer_dict
         fullpage = layers.fullpage
         resolution = layers.resolution
@@ -1321,169 +1327,6 @@ class SeeThrough_SavePSD:
         return (info_path,)
 
 
-# Shared with the standalone webui (seethrough_engine.spine), which applies
-# the same mapping when it exports a Spine project.
-DEFAULT_SPINE_NAMES = st_spine.DEFAULT_SPINE_NAMES
-
-
-class SeeThrough_LayerRename:
-    """Rename layer tags to Spine-friendly names. Uses built-in defaults
-    or a user-supplied JSON mapping (one key per line: "old_tag": "new_name")."""
-
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "parts": ("SEETHROUGH_PARTS",),
-            },
-            "optional": {
-                "custom_mapping_json": ("STRING", {
-                    "default": "",
-                    "multiline": True,
-                    "tooltip": "JSON object to override default names, e.g. {\"hairf\": \"bangs\", \"topwear\": \"shirt\"}. Leave empty to use defaults.",
-                }),
-            },
-        }
-
-    RETURN_TYPES = ("SEETHROUGH_PARTS",)
-    RETURN_NAMES = ("parts",)
-    FUNCTION = "rename"
-    CATEGORY = "SeeThrough"
-
-    def rename(self, parts, custom_mapping_json=""):
-        import json as _json
-        tag2pinfo = parts["tag2pinfo"]
-        frame_size = parts["frame_size"]
-
-        mapping = dict(DEFAULT_SPINE_NAMES)
-        if custom_mapping_json.strip():
-            try:
-                user_map = _json.loads(custom_mapping_json.strip())
-                mapping.update(user_map)
-            except Exception as e:
-                print(f"[SeeThrough] LayerRename: invalid JSON, using defaults. Error: {e}", flush=True)
-
-        new_tag2pinfo = {}
-        for tag, pinfo in tag2pinfo.items():
-            new_name = mapping.get(tag, tag)
-            pinfo_copy = dict(pinfo)
-            pinfo_copy["tag"] = new_name
-            pinfo_copy["original_tag"] = tag
-            new_tag2pinfo[new_name] = pinfo_copy
-
-        print(f"[SeeThrough] LayerRename: {len(new_tag2pinfo)} layers renamed", flush=True)
-        return ({"tag2pinfo": new_tag2pinfo, "frame_size": frame_size,
-                 "all_runs_layers": parts.get("all_runs_layers")},)
-
-
-class SeeThrough_LayerFilter:
-    """Filter layers by inclusion/exclusion lists. Useful to remove unwanted
-    parts (wings, tail, objects) before export."""
-
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "parts": ("SEETHROUGH_PARTS",),
-                "mode": (["include", "exclude"], {"default": "exclude",
-                          "tooltip": "include = keep only listed tags; exclude = remove listed tags"}),
-                "tags": ("STRING", {
-                    "default": "\n".join([
-                        "front-hair", "back-hair", "head", "headwear",
-                        "face", "irides", "irides-left", "irides-right",
-                        "eyebrow", "eyebrow-left", "eyebrow-right",
-                        "eye-white", "eye-white-left", "eye-white-right",
-                        "eyelash", "eyelash-left", "eyelash-right",
-                        "eye-left", "eye-right", "eyewear",
-                        "ears", "ear-left", "ear-right", "earwear",
-                        "nose", "mouth",
-                        "neck", "neckwear",
-                        "topwear", "bottomwear",
-                        "handwear", "handwear-left", "handwear-right",
-                        "legwear", "footwear",
-                        "tail", "wings", "objects",
-                    ]),
-                    "multiline": True,
-                    "tooltip": "One tag per line. All available tags are pre-filled — delete the ones you want to exclude (exclude mode) or keep only the ones you need (include mode). Names shown are post-rename defaults; if not using LayerRename, use original tags (e.g. hairf, eyel).",
-                }),
-            },
-        }
-
-    RETURN_TYPES = ("SEETHROUGH_PARTS",)
-    RETURN_NAMES = ("parts",)
-    FUNCTION = "filter_layers"
-    CATEGORY = "SeeThrough"
-
-    def filter_layers(self, parts, mode="exclude", tags=""):
-        tag2pinfo = parts["tag2pinfo"]
-        frame_size = parts["frame_size"]
-
-        tag_set = {t.strip() for t in tags.strip().splitlines() if t.strip()}
-
-        if not tag_set:
-            return (parts,)
-
-        if mode == "include":
-            filtered = {k: v for k, v in tag2pinfo.items() if k in tag_set}
-        else:
-            filtered = {k: v for k, v in tag2pinfo.items() if k not in tag_set}
-
-        print(f"[SeeThrough] LayerFilter ({mode}): {len(tag2pinfo)} → {len(filtered)} layers", flush=True)
-        return ({"tag2pinfo": filtered, "frame_size": frame_size},)
-
-
-class SeeThrough_ExportSpine:
-    """Export layers as a Spine 2D skeleton project (JSON + images/).
-    Output can be opened directly in the Spine editor."""
-
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "parts": ("SEETHROUGH_PARTS",),
-                "filename_prefix": ("STRING", {"default": "seethrough_spine"}),
-                "spine_version": ("STRING", {"default": "4.2.28",
-                                              "tooltip": "Spine editor version string for the skeleton JSON."}),
-            },
-            "optional": {
-                "output_path": ("STRING", {
-                    "default": "",
-                    "tooltip": "Custom output directory path. Leave empty to use ComfyUI default output folder.",
-                }),
-            },
-        }
-
-    RETURN_TYPES = ("STRING",)
-    RETURN_NAMES = ("spine_json_path",)
-    FUNCTION = "export"
-    CATEGORY = "SeeThrough"
-    OUTPUT_NODE = True
-
-    def export(self, parts, filename_prefix="seethrough_spine", spine_version="4.2.28", output_path=""):
-        # Skeleton JSON, coordinate conversion and draw order are shared with
-        # the standalone webui (seethrough_engine.spine). Layers here have been
-        # through Marigold, so `draw_order` sorts them by `depth_median`
-        # exactly as this node always did; the webui, which has no depth pass,
-        # gets the semantic fallback instead.
-        tag2pinfo = parts["tag2pinfo"]
-        frame_size = parts["frame_size"]
-
-        if output_path.strip():
-            output_dir = output_path.strip()
-            os.makedirs(output_dir, exist_ok=True)
-        else:
-            output_dir = folder_paths.get_output_directory()
-        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
-        uid = str(uuid.uuid4())[:8]
-
-        project_dir = os.path.join(output_dir, f"{filename_prefix}_{ts}_{uid}")
-        json_path = st_spine.write_spine_project(
-            project_dir, filename_prefix, tag2pinfo, frame_size, spine_version=spine_version)
-
-        print(f"[SeeThrough] ExportSpine: {len(tag2pinfo)} slots → {json_path}", flush=True)
-        return (json_path,)
-
-
 class SeeThrough_LoadSource:
     """Loads an image like ComfyUI's LoadImage but also outputs the source filename.
 
@@ -1554,9 +1397,6 @@ NODE_CLASS_MAPPINGS = {
     "SeeThrough_GenerateDepth": SeeThrough_GenerateDepth,
     "SeeThrough_PostProcess": SeeThrough_PostProcess,
     "SeeThrough_SavePSD": SeeThrough_SavePSD,
-    "SeeThrough_LayerRename": SeeThrough_LayerRename,
-    "SeeThrough_LayerFilter": SeeThrough_LayerFilter,
-    "SeeThrough_ExportSpine": SeeThrough_ExportSpine,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -1568,7 +1408,4 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "SeeThrough_GenerateDepth": "SeeThrough Generate Depth",
     "SeeThrough_PostProcess": "SeeThrough Post Process",
     "SeeThrough_SavePSD": "SeeThrough Save PSD",
-    "SeeThrough_LayerRename": "SeeThrough Layer Rename",
-    "SeeThrough_LayerFilter": "SeeThrough Layer Filter",
-    "SeeThrough_ExportSpine": "SeeThrough Export Spine",
 }

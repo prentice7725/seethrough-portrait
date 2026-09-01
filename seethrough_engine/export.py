@@ -1,10 +1,4 @@
-"""Write a Portrait Mode run (layers, diagnostics, JSON report) to disk for
-the standalone webui. Independent of `SeeThrough_SavePSD` in nodes.py, which
-additionally builds a browser-side PSD via the ComfyUI frontend and grouped
-all-runs data this webui does not need; both write the same filename
-conventions (`{base}_{tag}.png`, `{base}_portrait_report.json`, ...) so a
-person comparing a ComfyUI run against a webui run recognizes the layout.
-"""
+"""Portrait Bundle v1 writer; intentionally unaware of rigs and runtimes."""
 
 from __future__ import annotations
 
@@ -15,182 +9,174 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from . import rig as rig_export
-from . import spine as spine_export
 from .generation import PortraitPipelineResult
+from .image import composite_fidelity, composite_layers
+from .repair import REPAIR_ORDER, REPAIR_VERSION
+from .seams import RUN_SLACK_PX, seam_report_layers
+from .semantic import SEMANTIC_Z_ORDER
 
-SPINE_SUBDIR = "spine"
+BUNDLE_FORMAT = "portrait-bundle"
+BUNDLE_VERSION = "1.0"
 
 
-def save_portrait_run(output_dir: str, base_name: str, result: PortraitPipelineResult,
-                       source_filename: str = "", export_spine: bool = False,
-                       spine_version: str = "4.2.28",
-                       depth_dict: dict[str, np.ndarray] | None = None,
-                       export_rig: bool = False,
-                       rig_gradient_tags: tuple[str, ...] = ()) -> dict[str, Any]:
-    """Persist one Portrait Mode run. Returns a manifest dict (also written to
-    `{base_name}_manifest.json`) with every artifact's filename, relative to
-    `output_dir`.
+def _write_json(path: str, value: Any) -> None:
+    with open(path, "w", encoding="utf-8") as handle:
+        json.dump(value, handle, indent=2, ensure_ascii=False)
 
-    With `export_spine`, also writes a Spine 2D project under `spine/` -- the
-    skeleton JSON next to the cropped per-layer PNGs it references, which is
-    the layout the Spine editor opens directly. It goes inside `output_dir` so
-    that zipping the run carries it along. Without `depth_dict` the draw order
-    is semantic -- see `seethrough_engine.spine.SEMANTIC_Z_ORDER`; pass one
-    (from `seethrough_engine.depth.estimate_layer_depths`) to sort by estimated
-    depth the way the ComfyUI graph does. The manifest records which was used.
 
-    With `export_rig`, also writes `{base_name}_rig_manifest.json` plus part
-    PNGs under `rig/` -- the pseudo-2.5D rig of
-    `docs/PORTRAIT_AUTO_RIG_FEASIBILITY_v0.1.md`, which the browser preview
-    consumes. It costs no model and no GPU pass, only numpy and cv2 over
-    layers this function already has in hand.
-    """
-    os.makedirs(output_dir, exist_ok=True)
+def _save_rgba(path: str, value: np.ndarray) -> None:
+    arr = np.asarray(value)
+    if arr.ndim != 3 or arr.shape[-1] != 4:
+        raise ValueError(f"bundle image must be HxWx4 RGBA, got {arr.shape}")
+    Image.fromarray(arr.astype(np.uint8), mode="RGBA").save(path)
 
-    original_filename = f"{base_name}_original.png"
-    Image.fromarray(result.fullpage).save(os.path.join(output_dir, original_filename))
 
-    layer_files: dict[str, str] = {}
-    for tag, img in result.layer_dict.items():
-        if img is None:
+def _nonempty_layers(layer_dict: dict[str, np.ndarray], threshold: int = 10):
+    for tag, value in layer_dict.items():
+        if value is None:
             continue
-        arr = np.asarray(img)
-        if arr.ndim != 3 or arr.shape[-1] != 4 or not np.any(arr[..., 3] > 10):
-            continue
-        filename = f"{base_name}_{tag}.png"
-        Image.fromarray(arr).save(os.path.join(output_dir, filename))
-        layer_files[tag] = filename
+        arr = np.asarray(value)
+        if arr.ndim == 3 and arr.shape[-1] == 4 and np.any(arr[..., 3] > threshold):
+            yield tag, arr.astype(np.uint8)
+
+
+def _static_verdict(fidelity: dict[str, Any]) -> str:
+    ratio = float(fidelity.get("bad_ratio", 1.0))
+    return "pass" if ratio <= 0.03 else "review" if ratio <= 0.10 else "fail"
+
+
+def save_portrait_bundle(output_dir: str, result: PortraitPipelineResult, *,
+                         source_filename: str = "",
+                         preserve_raw_layers: bool = True) -> dict[str, Any]:
+    """Publish one Portrait Bundle v1 into ``output_dir``."""
+    output_dir = os.path.abspath(output_dir)
+    for subdir in ("layers", "diagnostics"):
+        os.makedirs(os.path.join(output_dir, subdir), exist_ok=True)
+    if preserve_raw_layers:
+        os.makedirs(os.path.join(output_dir, "raw_layers"), exist_ok=True)
+
+    _save_rgba(os.path.join(output_dir, "original.png"), result.fullpage)
+
+    canonical = dict(result.layer_dict)
+    remainder = np.asarray(result.guard.body_remainder)
+    if remainder.ndim == 3 and remainder.shape[-1] == 4 and np.any(remainder[..., 3] > 10):
+        if "body_remainder" in canonical:
+            raise ValueError("canonical semantic layers already contain body_remainder")
+        canonical["body_remainder"] = remainder
+
+    layer_entries: dict[str, dict[str, str]] = {}
+    for tag, arr in _nonempty_layers(canonical):
+        relative = f"layers/{tag}.png"
+        _save_rgba(os.path.join(output_dir, *relative.split("/")), arr)
+        layer_entries[tag] = {"path": relative, "source_tag": tag}
+
+    raw_entries: dict[str, str] = {}
+    if preserve_raw_layers:
+        for tag, arr in _nonempty_layers(result.raw_layer_dict):
+            relative = f"raw_layers/{tag}.png"
+            _save_rgba(os.path.join(output_dir, *relative.split("/")), arr)
+            raw_entries[tag] = relative
 
     guard = result.guard
-    diagnostics: dict[str, str] = {}
-    diagnostic_arrays = {
+    diagnostic_paths: dict[str, str] = {}
+    for name, value in {
         "coverage_mask": guard.generated_union_post_guard,
         "missing_mask": guard.missing_mask,
         "spill_mask": guard.spill_mask,
-    }
-    for name, arr in diagnostic_arrays.items():
-        filename = f"{base_name}_{name}.png"
-        u8 = np.rint(np.clip(arr, 0.0, 1.0) * 255.0).astype(np.uint8)
-        Image.fromarray(u8, mode="L").save(os.path.join(output_dir, filename))
-        diagnostics[name] = filename
+    }.items():
+        relative = f"diagnostics/{name}.png"
+        u8 = np.rint(np.clip(value, 0.0, 1.0) * 255.0).astype(np.uint8)
+        Image.fromarray(u8, mode="L").save(os.path.join(output_dir, *relative.split("/")))
+        diagnostic_paths[name] = relative
 
-    reconstruction_filename = f"{base_name}_reconstruction.png"
-    Image.fromarray(guard.reconstruction_rgba).save(os.path.join(output_dir, reconstruction_filename))
-    diagnostics["reconstruction"] = reconstruction_filename
+    reconstruction_relative = "diagnostics/reconstruction.png"
+    _save_rgba(os.path.join(output_dir, *reconstruction_relative.split("/")),
+               guard.reconstruction_rgba)
+    diagnostic_paths["reconstruction"] = reconstruction_relative
 
-    if np.any(guard.body_remainder[..., 3] > 0):
-        remainder_filename = f"{base_name}_body_remainder.png"
-        Image.fromarray(guard.body_remainder).save(os.path.join(output_dir, remainder_filename))
-        diagnostics["body_remainder"] = remainder_filename
+    composite = composite_layers(canonical, result.fullpage.shape[:2])
+    composite_relative = "diagnostics/layer_composite.png"
+    _save_rgba(os.path.join(output_dir, *composite_relative.split("/")), composite)
+    diagnostic_paths["layer_composite"] = composite_relative
 
-    # Every coverage metric in the report is computed on alpha, so a layer that
-    # is present and correctly shaped but the wrong colour scores as well as a
-    # right one -- and `reconstruction` above cannot show it either, since it
-    # copies the original's RGB. Compositing the layers and diffing against the
-    # original is what makes a dropped feature (a missing `eyewhite` leaving
-    # skin where the sclera was) visible at all. Numpy-only, no GPU, no model.
-    #
-    # Composite the *rendered* stack, semantic layers plus the recovered
-    # remainder, because that is what the exporters and the rig preview draw.
-    # Scoring the semantic layers alone makes every remainder-heavy run look
-    # catastrophic for a reason nobody will ever see: on run
-    # 20260829_134652 -- 18.6% remainder -- semantic-only reads mae 112.9 while
-    # what actually renders is 18.7. The semantic-only figure is still worth
-    # keeping alongside, as the measure of how much the remainder is propping
-    # the picture up.
-    subject_mask = guard.subject_mask
-    stack = dict(result.layer_dict)
-    stack.update(rig_export.split_remainder(guard.body_remainder, result.layer_dict))
-
-    composite = rig_export.composite_layers(stack, result.fullpage.shape[:2])
-    composite_filename = f"{base_name}_layer_composite.png"
-    Image.fromarray(composite).save(os.path.join(output_dir, composite_filename))
-    diagnostics["layer_composite"] = composite_filename
-
-    fidelity = rig_export.composite_fidelity(result.fullpage, composite, subject_mask)
-    fidelity["semantic_only"] = rig_export.composite_fidelity(
+    fidelity = composite_fidelity(result.fullpage, composite, guard.subject_mask)
+    fidelity["semantic_only"] = composite_fidelity(
         result.fullpage,
-        rig_export.composite_layers(result.layer_dict, result.fullpage.shape[:2]),
-        subject_mask,
+        composite_layers(result.layer_dict, result.fullpage.shape[:2]),
+        guard.subject_mask,
     )
+    fidelity["repair"] = dict(result.repair_report)
+    fidelity_relative = "diagnostics/fidelity.json"
+    _write_json(os.path.join(output_dir, *fidelity_relative.split("/")), fidelity)
+    diagnostic_paths["fidelity"] = fidelity_relative
 
     error = np.abs(result.fullpage[..., :3].astype(np.int32)
                    - composite[..., :3].astype(np.int32)).sum(axis=2)
-    error_filename = f"{base_name}_composite_error.png"
+    error_relative = "diagnostics/composite_error.png"
     Image.fromarray(np.clip(error, 0, 255).astype(np.uint8), mode="L").save(
-        os.path.join(output_dir, error_filename))
-    diagnostics["composite_error"] = error_filename
+        os.path.join(output_dir, *error_relative.split("/")))
+    diagnostic_paths["composite_error"] = error_relative
 
     report = dict(result.report)
     report["composite"] = fidelity
     report["source"] = {**report.get("source", {}), "filename": source_filename}
-    report["artifacts"] = {"original": original_filename, "layers": dict(layer_files), **diagnostics}
-    report_filename = f"{base_name}_portrait_report.json"
-    with open(os.path.join(output_dir, report_filename), "w", encoding="utf-8") as f:
-        json.dump(report, f, indent=2, ensure_ascii=False)
+    report_relative = "diagnostics/portrait_report.json"
+    _write_json(os.path.join(output_dir, *report_relative.split("/")), report)
+    diagnostic_paths["portrait_report"] = report_relative
 
-    spine_manifest: dict[str, Any] = {}
-    if export_spine:
-        parts = spine_export.rename_parts(
-            spine_export.layers_to_parts(
-                result.layer_dict, original_rgba=result.fullpage,
-            body_remainder=result.guard.body_remainder,
-                depth_dict=depth_dict,
-            )
-        )
-        project_dir = os.path.join(output_dir, SPINE_SUBDIR)
-        json_path = spine_export.write_spine_project(
-            project_dir, base_name, parts, result.fullpage.shape[:2],
-            spine_version=spine_version,
-        )
-        spine_manifest = {
-            "json": f"{SPINE_SUBDIR}/{os.path.basename(json_path)}",
-            "images": f"{SPINE_SUBDIR}/images",
-            "slots": list(spine_export.draw_order(parts)),
-            "order": "depth" if depth_dict else "semantic",
-        }
+    seams_relative = "diagnostics/seams.json"
+    seams = seam_report_layers(result.fullpage, canonical)
+    longest = max((int(row["longest_run_px"]) for row in seams["seams"]), default=0)
+    seam_status = "pass" if longest <= RUN_SLACK_PX else "review"
+    seams["status"] = seam_status
+    _write_json(os.path.join(output_dir, *seams_relative.split("/")), seams)
+    diagnostic_paths["seams"] = seams_relative
 
-    rig_manifest: dict[str, Any] = {}
-    if export_rig:
-        rig_dict, rig_images = rig_export.build_rig(
-            result.layer_dict, original_rgba=result.fullpage,
-            body_remainder=result.guard.body_remainder,
-            depth_dict=depth_dict, frame_size=result.fullpage.shape[:2],
-            gradient_tags=rig_gradient_tags, run_id=os.path.basename(output_dir),
-            tag_version=str(report.get("source", {}).get("tag_version", "")),
-        )
-        rig_path = rig_export.write_rig_project(output_dir, base_name, rig_dict, rig_images)
-        rig_manifest = {
-            "manifest": os.path.basename(rig_path),
-            "images": f"{rig_export.RIG_SUBDIR}/images",
-            "parts": [part["name"] for part in rig_dict["parts"]],
-            "anchors": sorted(rig_dict["anchors"]),
-            "depth": rig_dict["source"]["depth"],
-            "reclaimed": rig_dict["source"]["reclaimed"],
-        }
-
-    manifest = {
-        "base": base_name,
-        "source_filename": source_filename,
-        "width": int(result.fullpage.shape[1]),
-        "height": int(result.fullpage.shape[0]),
-        "original": original_filename,
-        "layers": layer_files,
-        "diagnostics": diagnostics,
-        "report": report_filename,
-        "composite": fidelity,
-        "verdict": report["verdict"],
-        "recovery_verdict": report["recovery_verdict"],
-        "reasons": report["reasons"],
+    tag_version = str(report.get("source", {}).get("tag_version", ""))
+    manifest: dict[str, Any] = {
+        "format": BUNDLE_FORMAT,
+        "version": BUNDLE_VERSION,
+        "canvas": {
+            "width": int(result.fullpage.shape[1]),
+            "height": int(result.fullpage.shape[0]),
+            "coordinate_system": "top-left-y-down",
+            "color_space": "srgb",
+            "alpha": "straight",
+        },
+        "semantics": {
+            "schema": "portrait-semantic-tags",
+            "version": tag_version,
+            "z_order": [tag for tag in SEMANTIC_Z_ORDER if tag in layer_entries],
+        },
+        "original": "original.png",
+        "layers": layer_entries,
+        "raw_layers": raw_entries,
+        "layer_contract": {
+            "canonical_stage": "production_repaired",
+            "raw_layers_preserved": bool(preserve_raw_layers),
+            "silhouette_guard": bool(report.get("run", {}).get("silhouette_guard", True)),
+            "fidelity_repair": {
+                "version": REPAIR_VERSION,
+                "order": list(REPAIR_ORDER),
+                "report": fidelity_relative,
+            },
+        },
+        "diagnostics": diagnostic_paths,
+        "validation": {
+            "static_reconstruction": _static_verdict(fidelity),
+            "seams": seam_status,
+        },
+        "source": {"filename": source_filename},
     }
-    if spine_manifest:
-        manifest["spine"] = spine_manifest
-    if rig_manifest:
-        manifest["rig"] = rig_manifest
-    manifest_filename = f"{base_name}_manifest.json"
-    with open(os.path.join(output_dir, manifest_filename), "w", encoding="utf-8") as f:
-        json.dump(manifest, f, indent=2, ensure_ascii=False)
-    manifest["manifest_file"] = manifest_filename
-
+    _write_json(os.path.join(output_dir, "manifest.json"), manifest)
     return manifest
+
+
+def save_portrait_run(output_dir: str, base_name: str,
+                      result: PortraitPipelineResult, source_filename: str = "",
+                      **removed_options) -> dict[str, Any]:
+    """Compatibility name while callers migrate to ``save_portrait_bundle``."""
+    enabled = [name for name, value in removed_options.items() if value]
+    if enabled:
+        raise TypeError("Portrait Bundle export cannot create: " + ", ".join(enabled))
+    return save_portrait_bundle(output_dir, result, source_filename=source_filename)

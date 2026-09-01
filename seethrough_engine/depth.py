@@ -1,5 +1,5 @@
 """Per-layer depth estimation with Marigold, shared by the ComfyUI
-`SeeThrough_GenerateDepth` node and the standalone webui's Spine export.
+`SeeThrough_GenerateDepth` node and decomposition diagnostics.
 
 Marigold is run once over a batch, not once per layer. The batch is indexed by
 `VALID_BODY_PARTS_V2` because that is the vocabulary the depth model was

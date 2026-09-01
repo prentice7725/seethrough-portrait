@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://github.com/prentice7725/seethrough-portrait/blob/main/docs/portrait-bundle-v1.schema.json",
+  "title": "Portrait Bundle v1",
+  "type": "object",
+  "required": ["format", "version", "canvas", "semantics", "original", "layers", "layer_contract", "diagnostics", "validation"],
+  "properties": {
+    "format": {"const": "portrait-bundle"},
+    "version": {"type": "string", "pattern": "^1\\.[0-9]+$"},
+    "canvas": {
+      "type": "object",
+      "required": ["width", "height", "coordinate_system", "color_space", "alpha"],
+      "properties": {
+        "width": {"type": "integer", "minimum": 1},
+        "height": {"type": "integer", "minimum": 1},
+        "coordinate_system": {"const": "top-left-y-down"},
+        "color_space": {"const": "srgb"},
+        "alpha": {"const": "straight"}
+      },
+      "additionalProperties": false
+    },
+    "semantics": {
+      "type": "object",
+      "required": ["schema", "version", "z_order"],
+      "properties": {
+        "schema": {"const": "portrait-semantic-tags"},
+        "version": {"type": "string"},
+        "z_order": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+      },
+      "additionalProperties": false
+    },
+    "original": {"type": "string", "pattern": "^original\\.png$"},
+    "layers": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["path", "source_tag"],
+        "properties": {
+          "path": {"type": "string", "pattern": "^layers/.+\\.png$"},
+          "source_tag": {"type": "string"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "raw_layers": {
+      "type": "object",
+      "additionalProperties": {"type": "string", "pattern": "^raw_layers/.+\\.png$"}
+    },
+    "layer_contract": {
+      "type": "object",
+      "required": ["canonical_stage", "raw_layers_preserved", "silhouette_guard", "fidelity_repair"],
+      "properties": {
+        "canonical_stage": {"const": "production_repaired"},
+        "raw_layers_preserved": {"type": "boolean"},
+        "silhouette_guard": {"type": "boolean"},
+        "fidelity_repair": {
+          "type": "object",
+          "required": ["version", "order", "report"],
+          "properties": {
+            "version": {"type": "string"},
+            "order": {
+              "const": ["reclaim_occluded", "fit_layer_tone", "fit_edge_alpha", "fit_seam_residual"]
+            },
+            "report": {"type": "string", "pattern": "^diagnostics/fidelity\\.json$"}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "diagnostics": {"type": "object", "additionalProperties": {"type": "string"}},
+    "validation": {
+      "type": "object",
+      "required": ["static_reconstruction", "seams"],
+      "properties": {
+        "static_reconstruction": {"enum": ["pass", "review", "fail"]},
+        "seams": {"enum": ["pass", "review", "fail", "not_run"]}
+      },
+      "additionalProperties": false
+    },
+    "source": {"type": "object"}
+  },
+  "additionalProperties": false
+}

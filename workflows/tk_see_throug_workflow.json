@@ -40,50 +40,6 @@
       "widgets_values": []
     },
     {
-      "id": 27,
-      "type": "SeeThrough_ExportSpine",
-      "pos": [
-        1656.521062366945,
-        89.01823320195241
-      ],
-      "size": [
-        270,
-        106
-      ],
-      "flags": {},
-      "order": 8,
-      "mode": 4,
-      "inputs": [
-        {
-          "name": "parts",
-          "type": "SEETHROUGH_PARTS",
-          "link": 32
-        }
-      ],
-      "outputs": [
-        {
-          "name": "spine_json_path",
-          "type": "STRING",
-          "links": null
-        }
-      ],
-      "properties": {
-        "Node name for S&R": "SeeThrough_ExportSpine",
-        "aux_id": "tackcrypto1031/tk_seethrough",
-        "ver": "bbe64e75f48686088b9db1b0941831de8fd0ca79",
-        "ue_properties": {
-          "widget_ue_connectable": {},
-          "input_ue_unconnectable": {},
-          "version": "7.5.2"
-        }
-      },
-      "widgets_values": [
-        "seethrough_spine",
-        "4.2.28",
-        ""
-      ]
-    },
-    {
       "id": 14,
       "type": "Note",
       "pos": [
@@ -108,35 +64,6 @@
       },
       "widgets_values": [
         "Download PSD 버튼을 눌러 다운로드.\n\nAll Runs PSD는 이번에 실행한 모든 run의 레이어를 그룹별로 나눠서 하나의 PSD에 담은 것입니다."
-      ],
-      "color": "#432",
-      "bgcolor": "#653"
-    },
-    {
-      "id": 28,
-      "type": "Note",
-      "pos": [
-        1676.3081560287098,
-        -185.07424947799524
-      ],
-      "size": [
-        225.90637736103372,
-        148.94740715998864
-      ],
-      "flags": {},
-      "order": 1,
-      "mode": 0,
-      "inputs": [],
-      "outputs": [],
-      "properties": {
-        "ue_properties": {
-          "widget_ue_connectable": {},
-          "version": "7.5.2",
-          "input_ue_unconnectable": {}
-        }
-      },
-      "widgets_values": [
-        "바로 내보내면 Spine으로 가져올 수 있는 JSON이 output 폴더에 생성됩니다.\n\n최신 Spine은 PSD를 직접 가져올 수 있는데 기본은 꺼져 있습니다. 필요하거나 Spine 무료판이라 PSD를 못 가져오면 그때 켜세요."
       ],
       "color": "#432",
       "bgcolor": "#653"
@@ -203,8 +130,7 @@
           "name": "parts",
           "type": "SEETHROUGH_PARTS",
           "links": [
-            30,
-            32
+            30
           ]
         },
         {
@@ -433,14 +359,6 @@
       "IMAGE"
     ],
     [
-      32,
-      24,
-      1,
-      27,
-      0,
-      "SEETHROUGH_PARTS"
-    ],
-    [
       35,
       30,
       0,
@@ -457,21 +375,7 @@
       "STRING"
     ]
   ],
-  "groups": [
-    {
-      "id": 2,
-      "title": "匯出Spine Json",
-      "bounding": [
-        1646.521062366945,
-        15.41823320195241,
-        296.22009840279634,
-        196.70049201398226
-      ],
-      "color": "#3f789e",
-      "font_size": 24,
-      "flags": {}
-    }
-  ],
+  "groups": [],
   "definitions": {
     "subgraphs": [
       {
