@@ -33,7 +33,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
-HEAD_RES_MATCH = "same as body"
+HEAD_RES_MATCH = "본문과 동일"
 
 OUTPUT_ROOT = Path(__file__).resolve().parent / "outputs"
 
@@ -307,93 +307,87 @@ def build_app() -> gr.Blocks:
         require_subfolder=st_paths.LAYERDIFF_MARKER_SUBFOLDER,
     ) + [st_paths.DEFAULT_LAYERDIFF_REPO]
 
-    with gr.Blocks(title="SeeThrough Portrait -- A-001") as demo:
+    with gr.Blocks(title="SeeThrough Portrait") as demo:
         gr.Markdown(
-            "# SeeThrough Portrait Mode\n"
-            "Single-image Portrait Mode: decompose an upper-body portrait into "
-            "layers, run the Silhouette Guard, and see the PASS / SOFT_PASS / "
-            "REWORK / FAIL verdict -- no ComfyUI required."
+            "# SeeThrough Portrait\n"
+            "인물 이미지 한 장을 레이어로 분해하고 Silhouette Guard를 적용해 "
+            "PASS / SOFT_PASS / REWORK / FAIL 결과를 확인합니다. ComfyUI는 필요하지 않습니다."
         )
         gr.Markdown(
-            "The download is a **Portrait Bundle v1** containing validated, "
-            "production-repaired canonical layers. Animation tools consume the "
-            "bundle in the separate `portrait-autorig` project."
+            "다운로드 파일은 검증과 fidelity repair가 끝난 canonical 레이어를 담은 "
+            "**Portrait Bundle v1**입니다. 애니메이션 제작은 별도 `portrait-autorig` "
+            "프로젝트에서 이 Bundle을 사용합니다."
         )
 
         with gr.Row():
             with gr.Column(scale=1):
                 image_in = gr.Image(
-                    label="Portrait (transparent-background PNG recommended)",
+                    label="인물 이미지 (투명 배경 PNG 권장)",
                     type="numpy",
                     image_mode="RGBA",
                 )
                 key_bg_in = gr.Checkbox(
-                    label="Flat background to alpha",
+                    label="단색 배경을 투명 처리",
                     value=True,
                     info=(
-                        "For images from a model that cannot emit RGBA: detects a "
-                        "solid background colour and keys it out, estimating "
-                        "fractional alpha on anti-aliased edges so hair does not "
-                        "keep a coloured rim. Skipped when the upload already has "
-                        "a real matte."
+                        "RGBA를 만들 수 없는 모델의 이미지용 옵션입니다. 단색 배경을 "
+                        "찾아 제거하고, 머리카락 가장자리는 반투명도로 추정해 색 테두리가 "
+                        "남지 않게 합니다. 업로드 이미지에 실제 알파 마스크가 있으면 적용하지 않습니다."
                     ),
                 )
                 subject_mask_in = gr.Image(
-                    label="Subject mask (optional, white = subject) -- for opaque backgrounds",
+                    label="피사체 마스크 (선택, 흰색 = 피사체 · 불투명 배경용)",
                     type="numpy",
                     image_mode="L",
                 )
                 model_in = gr.Dropdown(
-                    label="Model",
+                    label="모델",
                     choices=model_choices,
                     # First local checkpoint if there is one (no network on
                     # launch), else the repo id, which downloads on first run.
                     value=model_choices[0],
                 )
                 with gr.Row():
-                    seed_in = gr.Number(label="Seed", value=42, precision=0)
+                    seed_in = gr.Number(label="시드", value=42, precision=0)
                     resolution_in = gr.Slider(
-                        label="Resolution", minimum=512, maximum=2048, step=64, value=1280
+                        label="해상도", minimum=512, maximum=2048, step=64, value=1280
                     )
                 head_res_in = gr.Dropdown(
-                    label="Head detail resolution",
+                    label="얼굴 디테일 해상도",
                     choices=[HEAD_RES_MATCH, "640", "768", "1024", "1280"],
                     value=HEAD_RES_MATCH,
                     info=(
-                        "The v3 head pass re-diffuses a crop of the head on its own "
-                        "square canvas, and its size is what decides whether the fine "
-                        "facial layers resolve: on A-001, 512 returns no eyewhite and "
-                        "the layers composite to mae 15.1, while 768 returns it at "
-                        "11.9. Set this to 768 with a 512 body to keep the detail "
-                        "without paying for a full-resolution body pass. Peak VRAM "
-                        "follows the larger of the two."
+                        "얼굴 영역을 별도 정사각형 캔버스에서 다시 생성합니다. 이 값이 "
+                        "눈흰자처럼 작은 얼굴 레이어의 표현력을 결정합니다. 본문을 512로 "
+                        "두고 이 값을 768로 설정하면 전체 고해상도 본문 생성 없이 얼굴 "
+                        "디테일을 확보할 수 있습니다. 피크 VRAM은 두 해상도 중 큰 값을 따릅니다."
                     ),
                 )
                 steps_in = gr.Slider(
-                    label="Inference steps", minimum=1, maximum=100, step=1, value=30
+                    label="추론 단계", minimum=1, maximum=100, step=1, value=30
                 )
                 with gr.Row():
-                    head_detail_in = gr.Checkbox(label="Enable head detail", value=True)
-                    guard_in = gr.Checkbox(label="Silhouette Guard", value=True)
-                    autofill_in = gr.Checkbox(label="Auto-fill (up to 5 runs)", value=False)
-                run_btn = gr.Button("Run A-001", variant="primary")
+                    head_detail_in = gr.Checkbox(label="얼굴 디테일 생성", value=True)
+                    guard_in = gr.Checkbox(label="실루엣 보호 (Silhouette Guard)", value=True)
+                    autofill_in = gr.Checkbox(label="자동 보완 (최대 5회 실행)", value=False)
+                run_btn = gr.Button("Run", variant="primary")
 
             with gr.Column(scale=1):
-                verdict_out = gr.HTML(label="Verdict")
-                coverage_out = gr.Markdown(label="Coverage")
-                reasons_out = gr.Markdown(label="Reasons")
-                report_zip_out = gr.File(label="Download Portrait Bundle (.zip)")
+                verdict_out = gr.HTML(label="판정")
+                coverage_out = gr.Markdown(label="커버리지")
+                reasons_out = gr.Markdown(label="판정 사유")
+                report_zip_out = gr.File(label="Portrait Bundle 다운로드 (.zip)")
 
         with gr.Row():
-            layer_gallery_out = gr.Gallery(label="Layers", columns=6, height=300)
+            layer_gallery_out = gr.Gallery(label="레이어", columns=6, height=300)
         with gr.Row():
             diagnostics_gallery_out = gr.Gallery(
-                label="Diagnostics (coverage / missing / spill / reconstruction / body_remainder)",
+                label="진단 이미지 (커버리지 / 누락 / 유출 / 복원 / body_remainder)",
                 columns=5,
                 height=220,
             )
 
-        with gr.Accordion("Run log", open=False):
+        with gr.Accordion("실행 로그", open=False):
             log_out = gr.Textbox(label="", lines=10, max_lines=30)
 
         run_btn.click(
