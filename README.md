@@ -79,6 +79,28 @@ pip install -r requirements.txt
 | LayerDiff 3D | `layerdifforg/seethroughv0.0.2_layerdiff3d` | semantic layer 생성 |
 | Marigold Depth | `layerdifforg/seethroughv0.0.1_marigold` | depth 추정 및 PostProcess |
 
+## 8GB GPU 및 처리 시간
+
+독립 WebUI는 UNet의 남은 VRAM을 측정해 통째로 올릴 수 없을 때 **leaf-level
+block streaming**으로 전환합니다. 따라서 8GB급 GPU에서도 실행할 수 있습니다.
+이는 단순히 `resolution`이나 `steps`를 낮추는 방식이 아닙니다. 이 모델의 UNet은
+bf16에서도 약 7.58 GiB이므로, 가중치가 통째로 들어가지 않는 카드에서는 연산 전에
+OOM이 날 수 있기 때문입니다. VAE는 512px 초과 해상도에서 타일링됩니다.
+
+다음은 RTX 5060 Laptop 8GB (A-001, seed 42, 30 steps)에서 기록한 단일 생성
+패스의 참고 측정치입니다. 실제 시간은 GPU, 여유 VRAM, 입력과 Portrait Mode의
+auto-fill 횟수에 따라 달라집니다.
+
+| 설정 | 처리 시간 | 피크 VRAM | 레이어 |
+| --- | ---: | ---: | ---: |
+| res 512, head off | 60.7초 | 2.03 GiB | 13 |
+| res 512, head on | 109.6초 | 2.03 GiB | 24 |
+| res 1280, head off | 333.9초 | 3.66 GiB | 13 |
+| res 1280, head on | 609.9초 | 3.66 GiB | 24 |
+
+head 단계는 같은 해상도에서 추가 프레임만 생성하므로 위 측정에서는 VRAM보다
+시간에 영향을 줍니다.
+
 ### ComfyUI 노드
 
 | 노드 | 설명 |
