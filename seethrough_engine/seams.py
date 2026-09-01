@@ -26,6 +26,8 @@ from typing import Any
 import cv2
 import numpy as np
 
+from .scale import scale_length
+
 __all__ = [
     "STEP_THRESHOLD",
     "FLAT_STEP",
@@ -129,7 +131,8 @@ def _measure_seams(original: np.ndarray, composite: np.ndarray,
                    step_threshold: float = STEP_THRESHOLD,
                    flat_step: float = FLAT_STEP,
                    quiet_energy: float = QUIET_ENERGY,
-                   band: int = BAND_PX) -> dict[str, Any]:
+                   band: int | None = None) -> dict[str, Any]:
+    band = scale_length(BAND_PX, original.shape) if band is None else band
     subject = original[:, :, 3] > 128
     lc, lo = _luma(composite), _luma(original[:, :, :3])
     # How busy the picture is around each pixel, which is what decides whether
@@ -175,7 +178,7 @@ def _measure_seams(original: np.ndarray, composite: np.ndarray,
         values = np.array(entry["excess"], np.float32)
         flat = np.array(entry["flat"], np.float32) < flat_step
         flat &= np.array(entry["quiet"], bool)
-        if values.size < 8:
+        if values.size < scale_length(8, original.shape):
             continue
         # A line has a direction: only the pixels agreeing with the boundary's
         # dominant sign are part of it.
@@ -194,8 +197,12 @@ def _measure_seams(original: np.ndarray, composite: np.ndarray,
         # should too: a seam sitting at 1 to 2 luma dips below any threshold
         # every few pixels, and counting raw runs reported 11 px for a line that
         # is plainly 150 long. One gap does not make two lines.
-        joined = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8),
-                                  iterations=2)
+        join_radius = scale_length(1, original.shape)
+        join_kernel = np.ones((2 * join_radius + 1,) * 2, np.uint8)
+        joined = cv2.morphologyEx(
+            mask, cv2.MORPH_CLOSE, join_kernel,
+            iterations=scale_length(2, original.shape),
+        )
         count, _, stats, _ = cv2.connectedComponentsWithStats(joined, 8)
         longest = int(max((stats[k, cv2.CC_STAT_AREA] for k in range(1, count)), default=0))
         band_mask = cv2.dilate(joined, np.ones((2 * band + 1,) * 2, np.uint8)) > 0
@@ -227,7 +234,7 @@ def seam_report_layers(original_rgba: np.ndarray,
                        step_threshold: float = STEP_THRESHOLD,
                        flat_step: float = FLAT_STEP,
                        quiet_energy: float = QUIET_ENERGY,
-                       band: int = BAND_PX) -> dict[str, Any]:
+                       band: int | None = None) -> dict[str, Any]:
     """Measure static seams directly at the Portrait Bundle seam."""
     original = np.asarray(original_rgba)
     composite, _, owner, tags = _render_layers(layer_dict, original.shape[:2])

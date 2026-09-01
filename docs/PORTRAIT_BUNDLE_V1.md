@@ -17,6 +17,8 @@ downstream consumer such as `portrait-autorig`.
 ├─ raw_layers/             # optional; diagnostic only
 └─ diagnostics/
    ├─ portrait_report.json
+   ├─ semantic_ownership.json
+   ├─ local_fidelity.json
    ├─ fidelity.json
    ├─ seams.json
    ├─ coverage_mask.png
@@ -34,6 +36,10 @@ downstream consumer such as `portrait-autorig`.
 - Coordinates use a top-left origin with Y increasing downward.
 - RGB is sRGB and alpha is straight (unpremultiplied).
 - `layers/` contains `production_repaired` canonical layers.
+- After existing semantic layers complete fidelity repair, missing subject
+  pixels pass through conservative semantic ownership recovery. Only
+  unresolved residual becomes `body_remainder`. Keeping recovery after fitted
+  repair prevents newly transferred source pixels from biasing tone/seam fits.
 - The fidelity-repair order is fixed: `reclaim_occluded`, `fit_layer_tone`,
   `fit_edge_alpha`, `fit_seam_residual`, `clean_garment_orphans`.
 - `semantics.warnings` records observable producer-side semantic omissions,

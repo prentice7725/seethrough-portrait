@@ -26,6 +26,10 @@ class NodeEngineDelegationTests(unittest.TestCase):
         self.assertIn("st_generation.run_diffusion_stage(", self.source)
         self.assertIn("st_generation.layer_similarity(", self.source)
 
+    def test_portrait_postprocess_uses_shared_ownership_and_local_fidelity_modules(self):
+        self.assertIn("st_ownership.recover_missing_ownership(", self.source)
+        self.assertIn("st_local_fidelity.local_fidelity_report(", self.source)
+
 
 if __name__ == "__main__":
     unittest.main()

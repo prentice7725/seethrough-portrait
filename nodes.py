@@ -130,6 +130,9 @@ except ImportError:
     from seethrough_engine import generation as st_generation
     from seethrough_engine import repair as st_repair
     from seethrough_engine import semantic as st_semantic
+    from seethrough_engine import ownership as st_ownership
+    from seethrough_engine import local_fidelity as st_local_fidelity
+    from seethrough_engine import image as st_image
     from seethrough_engine import depth as st_depth
 
 print("[SeeThrough] All see-through imports OK", flush=True)
@@ -826,12 +829,18 @@ class SeeThrough_GenerateLayers_Custom:
         portrait_result = None
         if portrait_mode:
             raw_layer_dict = dict(layer_dict)
-            final_evaluation = evaluate_portrait_layers(
-                layer_dict, portrait_mask,
-                enable_head_detail=enable_head_detail,
-                config=portrait_config,
-            )
             if silhouette_guard:
+                pre_recovery_guard = apply_silhouette_guard(
+                    fullpage, layer_dict, portrait_mask, portrait_config,
+                )
+                repair_result = st_repair.repair_portrait_layers(
+                    pre_recovery_guard.guarded_layers, fullpage)
+                ownership_result = st_ownership.recover_missing_ownership(
+                    repair_result.layers,
+                    fullpage,
+                    pre_recovery_guard.subject_mask,
+                )
+                layer_dict = ownership_result.layers
                 final_guard = apply_silhouette_guard(
                     fullpage, layer_dict, portrait_mask, portrait_config,
                 )
@@ -847,8 +856,14 @@ class SeeThrough_GenerateLayers_Custom:
                     },
                 })
                 final_guard = apply_silhouette_guard(fullpage, layer_dict, portrait_mask, raw_config)
-            repair_result = st_repair.repair_portrait_layers(layer_dict, fullpage)
-            layer_dict = repair_result.layers
+                ownership_result = None
+                repair_result = st_repair.repair_portrait_layers(layer_dict, fullpage)
+                layer_dict = repair_result.layers
+            final_evaluation = evaluate_portrait_layers(
+                layer_dict, portrait_mask,
+                enable_head_detail=enable_head_detail,
+                config=portrait_config,
+            )
             report = build_portrait_report(
                 source={
                     "filename": "",
@@ -873,6 +888,34 @@ class SeeThrough_GenerateLayers_Custom:
             )
             report["semantic"]["warnings"] = st_semantic.semantic_warnings(
                 layer_dict, fullpage)
+            ownership_report = ownership_result.report if ownership_result is not None else {
+                "version": "disabled",
+                "initial_missing_px": int(final_guard.metrics.missing_area_px),
+                "semantic_recovered_px": 0,
+                "recovered_by_tag": {},
+                "unresolved_remainder_px": int(final_guard.metrics.missing_area_px),
+                "unresolved_remainder_ratio": round(float(final_guard.metrics.missing_ratio), 6),
+                "candidates": [],
+            }
+            report["semantic_ownership"] = ownership_report
+            canonical_for_validation = dict(layer_dict)
+            if np.any(final_guard.body_remainder[..., 3] > 10):
+                canonical_for_validation["body_remainder"] = final_guard.body_remainder
+            local_report = st_local_fidelity.local_fidelity_report(
+                fullpage,
+                st_image.composite_layers(canonical_for_validation, fullpage.shape[:2]),
+                layer_dict,
+            )
+            report["local_fidelity"] = local_report
+            report["semantic"]["warnings"] = list(dict.fromkeys(
+                [*report["semantic"]["warnings"], *local_report["warnings"]]
+            ))
+            if local_report["status"] == "review" and report["verdict"] in {
+                "PASS", "SOFT_PASS", "SOFT_PASS_LOW_CONFIDENCE",
+            }:
+                report["verdict"] = "REWORK"
+                report["reasons"].append(
+                    "Face-critical local fidelity requires review.")
             portrait_result = {
                 "mask": portrait_mask,
                 "guard": final_guard,
@@ -880,6 +923,7 @@ class SeeThrough_GenerateLayers_Custom:
                 "report": report,
                 "raw_layer_dict": raw_layer_dict,
                 "repair_report": repair_result.report,
+                "ownership_report": ownership_report,
             }
             print(
                 f"[SeeThrough Portrait] verdict={report['verdict']}, "

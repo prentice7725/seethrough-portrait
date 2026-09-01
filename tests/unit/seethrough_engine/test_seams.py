@@ -56,7 +56,10 @@ def test_an_edge_the_picture_has_too_is_not_a_seam():
 
 def test_the_run_survives_a_gap():
     original, layers = build_scene(garment_bias=6)
-    layers["topwear"][64, 50:53, :3] = 200
+    # Geometry is normalized to a 768 px reference. On this 128 px synthetic
+    # canvas one pixel represents the small interruption the old three-pixel
+    # fixture represented at production resolution.
+    layers["topwear"][64, 50:51, :3] = 200
     row = row_for(seam_report_layers(original, layers))
     assert row["longest_run_px"] > 60
 

@@ -12,8 +12,10 @@ from PIL import Image
 from .generation import PortraitPipelineResult
 from .image import composite_fidelity, composite_layers
 from .repair import REPAIR_ORDER, REPAIR_VERSION
+from .ownership import OWNERSHIP_VERSION
 from .seams import RUN_SLACK_PX, seam_report_layers
 from .semantic import SEMANTIC_Z_ORDER, semantic_warnings
+from .scale import scale_length
 
 BUNDLE_FORMAT = "portrait-bundle"
 BUNDLE_VERSION = "1.0"
@@ -110,6 +112,18 @@ def save_portrait_bundle(output_dir: str, result: PortraitPipelineResult, *,
     _write_json(os.path.join(output_dir, *fidelity_relative.split("/")), fidelity)
     diagnostic_paths["fidelity"] = fidelity_relative
 
+    ownership_relative = "diagnostics/semantic_ownership.json"
+    _write_json(
+        os.path.join(output_dir, *ownership_relative.split("/")),
+        dict(getattr(result, "ownership_report", {}) or {}),
+    )
+    diagnostic_paths["semantic_ownership"] = ownership_relative
+
+    local_relative = "diagnostics/local_fidelity.json"
+    local_report = dict(result.report.get("local_fidelity") or {})
+    _write_json(os.path.join(output_dir, *local_relative.split("/")), local_report)
+    diagnostic_paths["local_fidelity"] = local_relative
+
     error = np.abs(result.fullpage[..., :3].astype(np.int32)
                    - composite[..., :3].astype(np.int32)).sum(axis=2)
     error_relative = "diagnostics/composite_error.png"
@@ -133,7 +147,9 @@ def save_portrait_bundle(output_dir: str, result: PortraitPipelineResult, *,
     seams_relative = "diagnostics/seams.json"
     seams = seam_report_layers(result.fullpage, canonical)
     longest = max((int(row["longest_run_px"]) for row in seams["seams"]), default=0)
-    seam_status = "pass" if longest <= RUN_SLACK_PX else "review"
+    seam_slack = scale_length(RUN_SLACK_PX, result.fullpage.shape)
+    seam_status = "pass" if longest <= seam_slack else "review"
+    seams["run_slack_px"] = seam_slack
     seams["status"] = seam_status
     _write_json(os.path.join(output_dir, *seams_relative.split("/")), seams)
     diagnostic_paths["seams"] = seams_relative
@@ -162,6 +178,11 @@ def save_portrait_bundle(output_dir: str, result: PortraitPipelineResult, *,
             "canonical_stage": "production_repaired",
             "raw_layers_preserved": bool(preserve_raw_layers),
             "silhouette_guard": bool(report.get("run", {}).get("silhouette_guard", True)),
+            "semantic_ownership": {
+                "version": OWNERSHIP_VERSION,
+                "stage": "post_repair_pre_remainder",
+                "report": ownership_relative,
+            },
             "fidelity_repair": {
                 "version": REPAIR_VERSION,
                 "order": list(REPAIR_ORDER),
@@ -172,6 +193,7 @@ def save_portrait_bundle(output_dir: str, result: PortraitPipelineResult, *,
         "validation": {
             "static_reconstruction": _static_verdict(fidelity),
             "seams": seam_status,
+            "local_fidelity": str(local_report.get("status", "unavailable")),
         },
         "source": {"filename": source_filename},
     }

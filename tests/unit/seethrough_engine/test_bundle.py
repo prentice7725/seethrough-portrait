@@ -34,12 +34,22 @@ def result_fixture():
         fullpage=canonical.copy(),
         guard=guard,
         repair_report={"version": REPAIR_VERSION, "order": list(REPAIR_ORDER)},
+        ownership_report={
+            "version": "1.0",
+            "initial_missing_px": 0,
+            "semantic_recovered_px": 0,
+            "recovered_by_tag": {},
+            "unresolved_remainder_px": 0,
+            "unresolved_remainder_ratio": 0.0,
+            "candidates": [],
+        },
         report={
             "verdict": "PASS",
             "recovery_verdict": "PASS",
             "reasons": [],
             "source": {"tag_version": "v3"},
             "run": {"silhouette_guard": True},
+            "local_fidelity": {"version": "1.0", "status": "pass", "warnings": []},
         },
     )
 
@@ -52,6 +62,8 @@ def test_bundle_publishes_repaired_layers_and_keeps_raw_forensics(tmp_path):
     assert manifest["layer_contract"]["canonical_stage"] == "production_repaired"
     assert manifest["layer_contract"]["fidelity_repair"]["version"] == REPAIR_VERSION
     assert manifest["layer_contract"]["fidelity_repair"]["order"] == list(REPAIR_ORDER)
+    assert manifest["layer_contract"]["semantic_ownership"]["stage"] == "post_repair_pre_remainder"
+    assert manifest["validation"]["local_fidelity"] == "pass"
     assert manifest["semantics"]["warnings"] == []
     assert "rig" not in manifest
     assert "spine" not in manifest
@@ -61,6 +73,8 @@ def test_bundle_publishes_repaired_layers_and_keeps_raw_forensics(tmp_path):
     assert canonical[8, 8, 0] != raw[8, 8, 0]
     assert (tmp_path / "diagnostics" / "fidelity.json").is_file()
     assert (tmp_path / "diagnostics" / "seams.json").is_file()
+    assert (tmp_path / "diagnostics" / "semantic_ownership.json").is_file()
+    assert (tmp_path / "diagnostics" / "local_fidelity.json").is_file()
 
     with open(tmp_path / "manifest.json", encoding="utf-8") as handle:
         assert json.load(handle) == manifest

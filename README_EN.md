@@ -39,6 +39,11 @@ repository. The projects share a file contract and no Python imports.
   image and conservatively removes isolated garment semantic contamination.
 - **Static validation** measures whole-composite fidelity and thin, continuous
   seam artifacts separately.
+- **Semantic ownership recovery** returns high-confidence missing pixels to an
+  existing canonical layer before unresolved residual becomes
+  `body_remainder`.
+- **Face-local fidelity** checks left/right eye and mouth ROIs so sclera loss
+  cannot hide behind an acceptable whole-subject MAE.
 - **Two verdicts** distinguish silhouette recovery from semantic completeness.
 
 ## Portrait Bundle v1
