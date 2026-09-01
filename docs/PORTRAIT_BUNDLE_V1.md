@@ -35,7 +35,9 @@ downstream consumer such as `portrait-autorig`.
 - RGB is sRGB and alpha is straight (unpremultiplied).
 - `layers/` contains `production_repaired` canonical layers.
 - The fidelity-repair order is fixed: `reclaim_occluded`, `fit_layer_tone`,
-  `fit_edge_alpha`, `fit_seam_residual`.
+  `fit_edge_alpha`, `fit_seam_residual`, `clean_garment_orphans`.
+- `semantics.warnings` records observable producer-side semantic omissions,
+  such as `missing_eyewhite`. It is not a rig-readiness or motion verdict.
 - A consumer must reject an unknown major format version.
 - A consumer must never run fidelity repair when
   `layer_contract.canonical_stage` is `production_repaired`.

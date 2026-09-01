@@ -13,7 +13,7 @@ from .generation import PortraitPipelineResult
 from .image import composite_fidelity, composite_layers
 from .repair import REPAIR_ORDER, REPAIR_VERSION
 from .seams import RUN_SLACK_PX, seam_report_layers
-from .semantic import SEMANTIC_Z_ORDER
+from .semantic import SEMANTIC_Z_ORDER, semantic_warnings
 
 BUNDLE_FORMAT = "portrait-bundle"
 BUNDLE_VERSION = "1.0"
@@ -118,6 +118,12 @@ def save_portrait_bundle(output_dir: str, result: PortraitPipelineResult, *,
     diagnostic_paths["composite_error"] = error_relative
 
     report = dict(result.report)
+    report["semantic"] = dict(report.get("semantic") or {})
+    observed_semantic_warnings = list(
+        report["semantic"].get("warnings")
+        or semantic_warnings(canonical, result.fullpage)
+    )
+    report["semantic"]["warnings"] = observed_semantic_warnings
     report["composite"] = fidelity
     report["source"] = {**report.get("source", {}), "filename": source_filename}
     report_relative = "diagnostics/portrait_report.json"
@@ -147,6 +153,7 @@ def save_portrait_bundle(output_dir: str, result: PortraitPipelineResult, *,
             "schema": "portrait-semantic-tags",
             "version": tag_version,
             "z_order": [tag for tag in SEMANTIC_Z_ORDER if tag in layer_entries],
+            "warnings": observed_semantic_warnings,
         },
         "original": "original.png",
         "layers": layer_entries,

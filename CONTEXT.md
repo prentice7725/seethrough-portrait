@@ -20,9 +20,17 @@ layers exist only for debugging, provenance, and regression analysis.
 
 ## Fidelity repair
 
-The ordered static reconstruction pass: reclaim occluded pixels, fit material
-tone, fit edge alpha, then fit residual seams. It compares layers with the
-original still image and contains no animation policy.
+The ordered static reconstruction pass: reclaim occluded pixels, remove
+well-supported orphan semantic contamination, fit material tone, fit edge
+alpha, then fit residual seams. It compares layers with the original still
+image and contains no animation policy. A proposed cleanup is accepted only
+when canonical composite fidelity does not regress.
+
+## Semantic warning
+
+A producer-side observation that a portrait visibly contains a semantic
+feature which has no independent canonical tag. It describes semantic output
+completeness only; it is not a downstream readiness or motion-policy verdict.
 
 ## Static validation
 

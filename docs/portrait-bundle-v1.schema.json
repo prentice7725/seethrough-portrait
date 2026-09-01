@@ -25,7 +25,12 @@
       "properties": {
         "schema": {"const": "portrait-semantic-tags"},
         "version": {"type": "string"},
-        "z_order": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+        "z_order": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "warnings": {
+          "type": "array",
+          "items": {"type": "string"},
+          "uniqueItems": true
+        }
       },
       "additionalProperties": false
     },
@@ -59,7 +64,7 @@
           "properties": {
             "version": {"type": "string"},
             "order": {
-              "const": ["reclaim_occluded", "fit_layer_tone", "fit_edge_alpha", "fit_seam_residual"]
+              "const": ["reclaim_occluded", "fit_layer_tone", "fit_edge_alpha", "fit_seam_residual", "clean_garment_orphans"]
             },
             "report": {"type": "string", "pattern": "^diagnostics/fidelity\\.json$"}
           },

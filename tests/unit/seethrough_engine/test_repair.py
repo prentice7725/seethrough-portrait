@@ -5,10 +5,14 @@ import numpy as np
 from seethrough_engine.image import composite_fidelity, composite_layers
 from seethrough_engine.repair import (
     RECLAIM_PAIRS,
+    REPAIR_ORDER,
+    REPAIR_VERSION,
+    clean_garment_orphans,
     fit_edge_alpha,
     fit_layer_tone,
     fit_seam_residual,
     reclaim_occluded,
+    repair_portrait_layers,
 )
 from seethrough_engine.semantic import SEMANTIC_Z_ORDER
 
@@ -456,3 +460,98 @@ class ReclaimOccludedTests(unittest.TestCase):
         after = composite_fidelity(
             original, composite_layers(out, (CANVAS, CANVAS)), subject)
         self.assertLess(after["mae"], before["mae"])
+
+
+def orphan_scene():
+    """Garment body plus one head-owned orphan and one real detached button."""
+    original = np.zeros((CANVAS, CANVAS, 4), np.uint8)
+    original[..., 3] = 255
+    original[18:60, 38:90, :3] = 205
+    original[60:72, 44:84, :3] = 90
+    original[68:124, 20:108, :3] = 90
+    original[84:90, 12:18, :3] = 90
+
+    head = rgba([(38, 18, 90, 60)], value=205)
+    garment = rgba([(20, 68, 108, 124)], value=90)
+    garment[60:72, 44:84, :3] = 90
+    garment[60:72, 44:84, 3] = 255
+    garment[36:42, 56:66, :3] = 70
+    garment[36:42, 56:66, 3] = 255
+    garment[84:90, 12:18, :3] = 90
+    garment[84:90, 12:18, 3] = 255
+    return {"head": head, "topwear": garment}, original
+
+
+class GarmentOrphanCleanupTests(unittest.TestCase):
+    def test_only_the_head_owned_orphan_is_removed(self):
+        layers, original = orphan_scene()
+        before_input = layers["topwear"].copy()
+        out, report = clean_garment_orphans(layers, original)
+
+        self.assertFalse((out["topwear"][36:42, 56:66, 3] > 0).any())
+        self.assertTrue((out["topwear"][60:72, 44:84, 3] > 10).all())
+        self.assertTrue((out["topwear"][68:124, 20:108, 3] > 10).all())
+        self.assertTrue((out["topwear"][84:90, 12:18, 3] > 10).all())
+        self.assertGreater(report["topwear"]["removed_px"], 0)
+        np.testing.assert_array_equal(layers["topwear"], before_input)
+
+    def test_a_disconnected_button_is_reported_not_deleted(self):
+        layers, original = orphan_scene()
+        out, report = clean_garment_orphans(layers, original)
+        self.assertTrue((out["topwear"][84:90, 12:18, 3] > 10).all())
+        self.assertTrue(any(
+            row["status"] in {"kept", "ambiguous"}
+            and row["bbox_xywh"] == [12, 84, 6, 6]
+            for row in report["topwear"]["components"]
+        ))
+
+    def test_cleanup_never_regresses_published_composite_fidelity(self):
+        layers, original = orphan_scene()
+        subject = original[..., 3] > 10
+        before = composite_fidelity(
+            original, composite_layers(layers, (CANVAS, CANVAS)), subject)
+        out, _ = clean_garment_orphans(layers, original)
+        after = composite_fidelity(
+            original, composite_layers(out, (CANVAS, CANVAS)), subject)
+        self.assertLessEqual(after["mae"], before["mae"])
+        self.assertLessEqual(after["bad_px"], before["bad_px"])
+
+    def test_redundant_skin_fragment_is_transferred_to_neck_exactly(self):
+        neck = rgba([(48, 48, 56, 56)], value=195)
+        garment = rgba([(28, 68, 100, 118)], value=90)
+        garment[50:54, 50:54, :3] = 205
+        garment[50:54, 50:54, 3] = 128
+        layers = {"neck": neck, "topwear": garment}
+        original = composite_layers(layers, (CANVAS, CANVAS))
+        before = composite_layers(layers, (CANVAS, CANVAS))
+
+        out, report = clean_garment_orphans(layers, original)
+        after = composite_layers(out, (CANVAS, CANVAS))
+
+        self.assertFalse((out["topwear"][50:54, 50:54, 3] > 10).any())
+        np.testing.assert_array_equal(after, before)
+        row = next(
+            item for item in report["topwear"]["components"]
+            if item["bbox_xywh"] == [50, 50, 4, 4]
+        )
+        self.assertEqual(row["status"], "removed")
+        self.assertEqual(row["strategy"], "transfer")
+        self.assertEqual(row["transferred_px"], {"neck": 16})
+        self.assertEqual(row["rgb_error_delta"], 0)
+
+    def test_a001_neck_topwear_repair_does_not_regress(self):
+        layers, original = contested_scene()
+        subject = original[..., 3] > 10
+        working, _ = reclaim_occluded(layers, original)
+        working, _ = fit_layer_tone(working, original)
+        working, _ = fit_edge_alpha(working, original)
+        before = composite_fidelity(
+            original, composite_layers(working, (CANVAS, CANVAS)), subject)
+        cleaned, report = clean_garment_orphans(working, original)
+        after = composite_fidelity(
+            original, composite_layers(cleaned, (CANVAS, CANVAS)), subject)
+        self.assertEqual(after, before)
+        self.assertEqual(report, {})
+        result = repair_portrait_layers(layers, original)
+        self.assertEqual(result.report["version"], REPAIR_VERSION)
+        self.assertEqual(result.report["order"], list(REPAIR_ORDER))
