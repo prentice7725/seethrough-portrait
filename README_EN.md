@@ -78,6 +78,29 @@ Models download into `models/SeeThrough/` on first use.
 | LayerDiff 3D | `layerdifforg/seethroughv0.0.2_layerdiff3d` | semantic layers |
 | Marigold Depth | `layerdifforg/seethroughv0.0.1_marigold` | depth and PostProcess |
 
+## 8GB GPUs and processing time
+
+The standalone webui measures available VRAM and switches to **leaf-level
+block streaming** when the UNet cannot reside on the GPU as a whole, allowing
+it to run on an 8GB-class GPU. This is not something that lowering
+`resolution` or `steps` alone can solve: this model's UNet is about 7.58 GiB
+even in bf16, so a card that cannot hold all weights can fail before inference
+begins. The VAE is tiled above 512px.
+
+These are reference measurements for a single generation pass on an RTX 5060
+Laptop 8GB (A-001, seed 42, 30 steps). Actual time varies with the GPU,
+available VRAM, input, and the number of Portrait Mode auto-fill attempts.
+
+| Settings | Wall time | Peak VRAM | Layers |
+| --- | ---: | ---: | ---: |
+| res 512, head off | 60.7s | 2.03 GiB | 13 |
+| res 512, head on | 109.6s | 2.03 GiB | 24 |
+| res 1280, head off | 333.9s | 3.66 GiB | 13 |
+| res 1280, head on | 609.9s | 3.66 GiB | 24 |
+
+The head stage generates extra frames at the same resolution, so in these
+measurements it adds time rather than peak VRAM.
+
 ### ComfyUI nodes
 
 | Node | Purpose |
