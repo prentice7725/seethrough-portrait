@@ -123,11 +123,13 @@ try:
     from .seethrough_engine import model_loading as st_model_loading
     from .seethrough_engine import generation as st_generation
     from .seethrough_engine import repair as st_repair
+    from .seethrough_engine import semantic as st_semantic
     from .seethrough_engine import depth as st_depth
 except ImportError:
     from seethrough_engine import model_loading as st_model_loading
     from seethrough_engine import generation as st_generation
     from seethrough_engine import repair as st_repair
+    from seethrough_engine import semantic as st_semantic
     from seethrough_engine import depth as st_depth
 
 print("[SeeThrough] All see-through imports OK", flush=True)
@@ -869,6 +871,8 @@ class SeeThrough_GenerateLayers_Custom:
                 config=portrait_config,
                 selection_trace=selection_trace,
             )
+            report["semantic"]["warnings"] = st_semantic.semantic_warnings(
+                layer_dict, fullpage)
             portrait_result = {
                 "mask": portrait_mask,
                 "guard": final_guard,
