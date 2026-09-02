@@ -74,6 +74,7 @@ def replay(bundle: Path, *, write_previews: bool = False) -> dict:
             "removed_px": int(cleanup.get("removed_px", 0)),
             "ambiguous_components": len(ambiguous),
             "ambiguous_area_px": int(sum(row.get("area_px", 0) for row in ambiguous)),
+            "components": cleanup.get("components", []),
         },
     }
 
