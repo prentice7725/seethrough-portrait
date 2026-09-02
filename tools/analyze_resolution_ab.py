@@ -23,7 +23,7 @@ from portrait_core import PortraitConfig, apply_silhouette_guard, resolve_subjec
 from seethrough_engine.image import composite_fidelity, composite_layers
 from seethrough_engine.local_fidelity import local_fidelity_report
 from seethrough_engine.ownership import recover_missing_ownership
-from seethrough_engine.repair import repair_portrait_layers
+from seethrough_engine.repair import REPAIR_VERSION, repair_portrait_layers
 from seethrough_engine.resolution_regression import (
     bundle_resolution_snapshot,
     compare_resolution_snapshots,
@@ -51,12 +51,13 @@ def replay(bundle: Path, *, write_previews: bool = False) -> dict:
     composite = composite_layers(canonical, original.shape[:2])
     if write_previews:
         diagnostics = bundle / "diagnostics"
+        replay_prefix = f"replay_v{REPAIR_VERSION.replace('.', '')}"
         Image.fromarray(after_guard.guarded_layers["topwear"]).save(
-            diagnostics / "replay_v13_topwear.png")
+            diagnostics / f"{replay_prefix}_topwear.png")
         Image.fromarray(after_guard.body_remainder).save(
-            diagnostics / "replay_v13_body_remainder.png")
+            diagnostics / f"{replay_prefix}_body_remainder.png")
         Image.fromarray(composite).save(
-            diagnostics / "replay_v13_layer_composite.png")
+            diagnostics / f"{replay_prefix}_layer_composite.png")
     cleanup = repaired.report["clean_garment_orphans"].get("topwear", {})
     ambiguous = [
         row for row in cleanup.get("components", [])

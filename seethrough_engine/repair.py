@@ -17,13 +17,14 @@ from .image import composite_fidelity, composite_layers
 from .scale import canvas_scale, odd_kernel, scale_area, scale_length
 from .semantic import SEMANTIC_Z_ORDER
 
-REPAIR_VERSION = "1.3"
+REPAIR_VERSION = "1.6"
 REPAIR_ORDER = (
     "reclaim_occluded",
     "fit_layer_tone",
     "fit_edge_alpha",
-    "fit_seam_residual",
     "clean_garment_orphans",
+    "fit_edge_alpha_final",
+    "fit_seam_residual",
 )
 
 # A garment layer sometimes comes back holding the skin visible through its own
@@ -653,10 +654,18 @@ def fit_edge_alpha(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarray,
 #
 # It is fixed by the only thing that knows the answer: the original, read in a
 # narrow band on each side of the boundary and faded to nothing a few pixels in,
-# so the correction cannot introduce an edge of its own.
+# so the correction cannot introduce an edge of its own.  This is deliberately
+# the *last* repair stage: orphan cleanup can transfer garment debris back to
+# the neck or another face semantic, changing both alpha and colour at the
+# exact boundary that needs the final correction.
 SEAM_PAIRS: tuple[tuple[str, str], ...] = (("topwear", "neck"), ("neckwear", "neck"))
 SEAM_BAND_PX = 3
 SEAM_MAX_SHIFT = 12
+# A seam correction changes the composite seen by the other side of the same
+# boundary.  One solve is intentionally conservative but under-corrects
+# partially-covered pixels; a second, independently clamped residual solve
+# converges that handoff without turning the pass into broad colour fitting.
+SEAM_ITERATIONS = 2
 
 # This pass is intentionally static. Whether two repaired parts may move apart
 # safely is a downstream deformation-guard question, not portrait repair.
@@ -666,6 +675,7 @@ def fit_seam_residual(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarr
                       pairs: tuple[tuple[str, str], ...] = SEAM_PAIRS,
                       order: tuple[str, ...] = SEMANTIC_Z_ORDER,
                       band: int = SEAM_BAND_PX, max_shift: int = SEAM_MAX_SHIFT,
+                      iterations: int = 1,
                       alpha_threshold: int = 10,
                       ) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
     """Take the residual out of both sides of a shared boundary.
@@ -676,10 +686,16 @@ def fit_seam_residual(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarr
     the same two levels at a boundary is a line, which is the thing being
     removed.
     """
+    if iterations < 1:
+        raise ValueError("iterations must be positive")
     original = np.asarray(original_rgba)[..., :3].astype(np.float32)
     canvas_h, canvas_w = original.shape[:2]
     out = dict(layer_dict)
     report: dict[str, Any] = {}
+    initial_rgb = {
+        tag: np.asarray(image)[..., :3].astype(np.float32)
+        for tag, image in out.items()
+    }
 
     def rank(tag: str) -> int:
         return order.index(tag) if tag in order else -1
@@ -687,49 +703,52 @@ def fit_seam_residual(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarr
     for front_tag, back_tag in pairs:
         if front_tag not in out or back_tag not in out:
             continue
-        composite = composite_layers(out, (canvas_h, canvas_w), order=order,
-                                     alpha_threshold=alpha_threshold)[..., :3].astype(np.float32)
-        owner = np.full((canvas_h, canvas_w), -1, np.int16)
-        for index, tag in enumerate(sorted(out, key=rank)):
-            owner[np.asarray(out[tag])[..., 3] > 128] = index
-        names = sorted(out, key=rank)
-        front, back = names.index(front_tag), names.index(back_tag)
-
-        # Where the two actually touch, in either direction.
-        contact = np.zeros((canvas_h, canvas_w), np.uint8)
-        for shift in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-            rolled = np.roll(owner, shift, axis=(0, 1))
-            contact |= (((owner == front) & (rolled == back))
-                        | ((owner == back) & (rolled == front))).astype(np.uint8)
-        if not contact.any():
-            report[f"{front_tag}|{back_tag}"] = {"skipped": "no contact"}
-            continue
-
-        residual = np.clip(original - composite, -max_shift, max_shift)
-        distance = cv2.distanceTransform(1 - contact, cv2.DIST_L2, 3)
-        falloff = np.clip(1.0 - distance / float(band), 0.0, 1.0)
-        falloff = falloff * falloff * (3.0 - 2.0 * falloff)     # smooth, so no inner edge
-
         moved = {}
-        for tag, index in ((front_tag, front), (back_tag, back)):
-            side = (owner == index) & (falloff > 0)
-            if not side.any():
-                continue
-            layer = np.array(out[tag], copy=True)
-            # Divided by the layer's own coverage: a correction of R applied to
-            # a layer showing at alpha a moves the composite by a*R, and at a
-            # seam the alphas are exactly where they are not 1. Clamped, so a
-            # nearly transparent pixel cannot demand an enormous shift.
-            coverage = np.clip(layer[..., 3].astype(np.float32) / 255.0, 0.5, 1.0)
-            correction = residual / coverage[..., None] * (falloff * side)[..., None]
-            # Rounded, not truncated: the corrections here are one or two
-            # levels, and truncation would quietly eat most of one of them.
-            layer[..., :3] = np.rint(np.clip(layer[..., :3].astype(np.float32)
-                                             + np.clip(correction, -max_shift, max_shift),
-                                             0, 255)).astype(np.uint8)
-            out[tag] = layer
-            moved[tag] = int(side.sum())
-        report[f"{front_tag}|{back_tag}"] = {"px": moved}
+        completed = 0
+        for _ in range(iterations):
+            composite = composite_layers(out, (canvas_h, canvas_w), order=order,
+                                         alpha_threshold=alpha_threshold)[..., :3].astype(np.float32)
+            owner = np.full((canvas_h, canvas_w), -1, np.int16)
+            for index, tag in enumerate(sorted(out, key=rank)):
+                owner[np.asarray(out[tag])[..., 3] > 128] = index
+            names = sorted(out, key=rank)
+            front, back = names.index(front_tag), names.index(back_tag)
+
+            # Where the two actually touch, in either direction.
+            contact = np.zeros((canvas_h, canvas_w), np.uint8)
+            for shift in ((1, 0), (-1, 0), (0, 1), (0, -1)):
+                rolled = np.roll(owner, shift, axis=(0, 1))
+                contact |= (((owner == front) & (rolled == back))
+                            | ((owner == back) & (rolled == front))).astype(np.uint8)
+            if not contact.any():
+                break
+
+            residual = np.clip(original - composite, -max_shift, max_shift)
+            distance = cv2.distanceTransform(1 - contact, cv2.DIST_L2, 3)
+            falloff = np.clip(1.0 - distance / float(band), 0.0, 1.0)
+            falloff = falloff * falloff * (3.0 - 2.0 * falloff)  # smooth, no inner edge
+
+            for tag, index in ((front_tag, front), (back_tag, back)):
+                side = (owner == index) & (falloff > 0)
+                if not side.any():
+                    continue
+                layer = np.array(out[tag], copy=True)
+                coverage = np.clip(layer[..., 3].astype(np.float32) / 255.0, 0.5, 1.0)
+                correction = residual / coverage[..., None] * (falloff * side)[..., None]
+                corrected = layer[..., :3].astype(np.float32) + np.clip(
+                    correction, -max_shift, max_shift)
+                # Two local solves must not allow a semantic to drift farther
+                # than the documented one-pass cap from its input colour.
+                corrected = np.clip(corrected,
+                                    initial_rgb[tag] - max_shift,
+                                    initial_rgb[tag] + max_shift)
+                layer[..., :3] = np.rint(np.clip(corrected, 0, 255)).astype(np.uint8)
+                out[tag] = layer
+                moved[tag] = moved.get(tag, 0) + int(side.sum())
+            completed += 1
+        key = f"{front_tag}|{back_tag}"
+        report[key] = ({"px": moved, "iterations": completed}
+                       if completed else {"skipped": "no contact"})
 
     return out, report
 
@@ -764,11 +783,20 @@ def repair_portrait_layers(layer_dict: dict[str, np.ndarray],
         band=scale_length(EDGE_BAND_PX, shape),
         outside=scale_length(EDGE_OUTSIDE_PX, shape),
     )
+    working, orphan_cleanup = clean_garment_orphans(working, original_rgba)
+    # Cleanup can alter an ownership edge. Refit edge coverage against the
+    # final owner set, then fit its colour residual. This is deliberately a
+    # second narrow-band solve, not a broad re-application of tone fitting.
+    working, final_edge_fit = fit_edge_alpha(
+        working, original_rgba,
+        band=scale_length(EDGE_BAND_PX, shape),
+        outside=scale_length(EDGE_OUTSIDE_PX, shape),
+    )
     working, seam_fit = fit_seam_residual(
         working, original_rgba,
         band=scale_length(SEAM_BAND_PX, shape),
+        iterations=SEAM_ITERATIONS,
     )
-    working, orphan_cleanup = clean_garment_orphans(working, original_rgba)
     return RepairResult(
         layers=working,
         report={
@@ -777,7 +805,8 @@ def repair_portrait_layers(layer_dict: dict[str, np.ndarray],
             "reclaim_occluded": reclaimed,
             "fit_layer_tone": tone_fit,
             "fit_edge_alpha": edge_fit,
-            "fit_seam_residual": seam_fit,
             "clean_garment_orphans": orphan_cleanup,
+            "fit_edge_alpha_final": final_edge_fit,
+            "fit_seam_residual": seam_fit,
         },
     )

@@ -35,15 +35,16 @@ repository. The projects share a file contract and no Python imports.
   `body_remainder`.
 - **Portrait-aware auto-fill** selects the best layer set from up to five runs.
 - **Fidelity repair** runs `reclaim_occluded → fit_layer_tone → fit_edge_alpha
-  → fit_seam_residual → clean_garment_orphans` against the original still
+  → clean_garment_orphans → fit_edge_alpha_final → fit_seam_residual` against
+  the original still
   image and conservatively removes isolated garment semantic contamination.
 - **Static validation** measures whole-composite fidelity and thin, continuous
   seam artifacts separately.
 - **Semantic ownership recovery** returns high-confidence missing pixels to an
   existing canonical layer before unresolved residual becomes
   `body_remainder`.
-- **Face-local fidelity** checks left/right eye and mouth ROIs so sclera loss
-  cannot hide behind an acceptable whole-subject MAE.
+- **Local fidelity** checks left/right eye, mouth, and neckline-contact ROIs so
+  sclera loss or a horizontal neck/topwear seam cannot hide behind a good global MAE.
 - **Two verdicts** distinguish silhouette recovery from semantic completeness.
 
 ## Portrait Bundle v1

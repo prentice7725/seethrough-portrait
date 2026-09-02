@@ -46,3 +46,34 @@ def test_closed_eye_does_not_create_a_false_sclera_warning():
     assert report["status"] == "pass"
     assert report["warnings"] == []
     assert all(not eye["sclera"]["visible_in_original"] for eye in report["eyes"])
+
+
+def neckline_scene():
+    size = 192
+    original = np.zeros((size, size, 4), np.uint8)
+    original[..., 3] = 255
+    neck = np.zeros_like(original)
+    neck[28:100, 70:122] = (218, 178, 158, 255)
+    topwear = np.zeros_like(original)
+    topwear[94:168, 38:154] = (86, 104, 138, 255)
+    # The original has a clean, faithful neckline handoff.
+    original[neck[..., 3] > 0] = neck[neck[..., 3] > 0]
+    original[topwear[..., 3] > 0] = topwear[topwear[..., 3] > 0]
+    return original, {"neck": neck, "topwear": topwear}
+
+
+def test_neckline_contact_guard_catches_a_horizontal_static_seam():
+    original, layers = neckline_scene()
+    seammed = original.copy()
+    seammed[94:100, 68:124, :3] = (40, 40, 40)
+    report = local_fidelity_report(original, seammed, layers)
+    assert report["status"] == "review"
+    assert report["neckline"]["status"] == "review"
+    assert report["neckline"]["max_bad_row_px"] > 0
+    assert "neckline_local_fidelity_regression" in report["warnings"]
+
+
+def test_faithful_neckline_contact_passes():
+    original, layers = neckline_scene()
+    report = local_fidelity_report(original, original, layers)
+    assert report["neckline"]["status"] == "pass"

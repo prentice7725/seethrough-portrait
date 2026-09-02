@@ -36,3 +36,12 @@ def test_global_mae_cannot_override_eye_local_regression():
     assert comparison["global_composite_fidelity"]["bad_ratio"] < \
         baseline["global_composite_fidelity"]["bad_ratio"]
     assert compare_resolution_snapshots(baseline, comparison)["status"] == "regression"
+
+
+def test_neckline_local_regression_is_reported_independently_of_eye_state():
+    payload = json.loads(FIXTURE.read_text(encoding="utf-8"))
+    baseline, comparison = payload["baseline"], payload["comparison"]
+    baseline["neckline_local_fidelity"] = {"status": "pass"}
+    comparison["neckline_local_fidelity"] = {"status": "review"}
+    result = compare_resolution_snapshots(baseline, comparison)
+    assert "neckline_local_fidelity_regressed" in result["regressions"]

@@ -37,15 +37,16 @@ Spine exporter와 브라우저 runtime은 별도
 - **Portrait-aware auto-fill** — coverage와 필수 semantic group을 기준으로 최대
   5회 실행 중 최선의 레이어 조합을 선택합니다.
 - **Fidelity repair** — `reclaim_occluded → fit_layer_tone → fit_edge_alpha →
-  fit_seam_residual → clean_garment_orphans` 순서로 정지화면을 원본과 맞추고,
+  clean_garment_orphans → fit_edge_alpha_final → fit_seam_residual` 순서로
+  정지화면을 원본과 맞추고,
   garment의 고립 semantic contamination을 보수적으로 제거합니다.
 - **Static validation** — 전체 composite fidelity와 가늘고 긴 seam을 별도로
   측정합니다.
 - **Semantic ownership recovery** — 누락 픽셀을 곧바로
   `body_remainder`로 보내지 않고, 연결성·원본 색·경쟁 semantic 근거가
   충분한 부분을 기존 canonical layer로 되돌립니다.
-- **얼굴 로컬 fidelity** — 좌/우 눈과 입 ROI를 따로 검사하여 전체 MAE가
-  놓치는 눈흰자 소실을 verdict와 diagnostic에 반영합니다.
+- **로컬 fidelity** — 좌/우 눈·입·목선 접촉 ROI를 따로 검사하여 전체 MAE가
+  놓치는 눈흰자 소실과 가로 neck/topwear seam을 verdict와 diagnostic에 반영합니다.
 - **두 verdict** — 실루엣 복구 상태와 semantic 완성도를 분리해 보고합니다.
 
 ## Portrait Bundle v1
