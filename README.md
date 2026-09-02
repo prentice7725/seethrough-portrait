@@ -37,15 +37,16 @@ Spine exporter와 브라우저 runtime은 별도
 - **Portrait-aware auto-fill** — coverage와 필수 semantic group을 기준으로 최대
   5회 실행 중 최선의 레이어 조합을 선택합니다.
 - **Fidelity repair** — `reclaim_occluded → fit_layer_tone → fit_edge_alpha →
-  fit_seam_residual → clean_garment_orphans` 순서로 정지화면을 원본과 맞추고,
+  clean_garment_orphans → fit_edge_alpha_final → fit_seam_residual` 순서로
+  정지화면을 원본과 맞추고,
   garment의 고립 semantic contamination을 보수적으로 제거합니다.
 - **Static validation** — 전체 composite fidelity와 가늘고 긴 seam을 별도로
   측정합니다.
 - **Semantic ownership recovery** — 누락 픽셀을 곧바로
   `body_remainder`로 보내지 않고, 연결성·원본 색·경쟁 semantic 근거가
   충분한 부분을 기존 canonical layer로 되돌립니다.
-- **얼굴 로컬 fidelity** — 좌/우 눈과 입 ROI를 따로 검사하여 전체 MAE가
-  놓치는 눈흰자 소실을 verdict와 diagnostic에 반영합니다.
+- **로컬 fidelity** — 좌/우 눈·입·목선 접촉 ROI를 따로 검사하여 전체 MAE가
+  놓치는 눈흰자 소실과 가로 neck/topwear seam을 verdict와 diagnostic에 반영합니다.
 - **두 verdict** — 실루엣 복구 상태와 semantic 완성도를 분리해 보고합니다.
 
 ## Portrait Bundle v1
@@ -91,7 +92,13 @@ pip install -r requirements.txt
 block streaming**으로 전환합니다. 따라서 8GB급 GPU에서도 실행할 수 있습니다.
 이는 단순히 `resolution`이나 `steps`를 낮추는 방식이 아닙니다. 이 모델의 UNet은
 bf16에서도 약 7.58 GiB이므로, 가중치가 통째로 들어가지 않는 카드에서는 연산 전에
-OOM이 날 수 있기 때문입니다. VAE는 512px 초과 해상도에서 타일링됩니다.
+OOM이 날 수 있기 때문입니다. VAE 타일링은 모델 로드 시 고정하지 않습니다. body/head
+각 diffusion 직전에 해상도와 실제 여유 VRAM으로 untiled를 우선 선택하고, CUDA OOM이면
+tiled로 정확히 한 번 재시도합니다. 512px VAE tile 기준으로 768은 2×2, 1024는 3×3
+serial decode가 되므로 여유가 있을 때 untiled가 기본입니다.
+
+측정 방식과 A002 768/1024 tiled-vs-untiled 결과는
+[VAE runtime policy](docs/VAE_RUNTIME_POLICY.md)에 기록합니다.
 
 다음은 RTX 5060 Laptop 8GB (A-001, seed 42, 30 steps)에서 기록한 단일 생성
 패스의 참고 측정치입니다. 실제 시간은 GPU, 여유 VRAM, 입력과 Portrait Mode의

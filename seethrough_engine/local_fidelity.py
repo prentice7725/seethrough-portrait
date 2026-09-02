@@ -7,10 +7,12 @@ from typing import Any
 import cv2
 import numpy as np
 
-from .scale import scale_area
+from .scale import scale_area, scale_length
 
 IRIS_TAGS = ("irides", "iridesl", "iridesr")
 MOUTH_TAGS = ("mouth",)
+NECK_TAGS = ("neck",)
+GARMENT_CONTACT_TAGS = ("topwear", "neckwear")
 ALPHA_THRESHOLD = 10
 MIN_IRIS_AREA_AT_768 = 20
 MIN_SCLERA_AREA_AT_768 = 12
@@ -22,6 +24,11 @@ EYE_BAD_RATIO_REVIEW = 0.18
 # the gate about feature preservation rather than pixel-perfect whitening.
 SCLERA_LOST_RATIO_REVIEW = 0.50
 MOUTH_BAD_RATIO_REVIEW = 0.18
+# This is a contact neighbourhood, not a crop around the entire torso. It
+# keeps a local neckline seam from being hidden by an otherwise good garment.
+NECKLINE_CONTACT_BAND_PX = 6
+NECKLINE_MIN_CONTACT_AREA_AT_768 = 24
+NECKLINE_BAD_RATIO_REVIEW = 0.15
 
 
 def _union(layer_dict: dict[str, np.ndarray], tags: tuple[str, ...]) -> np.ndarray | None:
@@ -61,6 +68,54 @@ def _roi_metrics(original: np.ndarray, composite: np.ndarray,
         "bad_ratio": round(bad / pixels, 6),
         "pixel_count": pixels,
     }
+
+
+def _masked_metrics(original: np.ndarray, composite: np.ndarray,
+                    mask: np.ndarray) -> dict[str, Any]:
+    """Measure an irregular semantic contact band rather than its full bbox."""
+    ys, xs = np.where(mask)
+    if len(xs) == 0:
+        raise ValueError("masked local fidelity metrics need at least one pixel")
+    error = np.abs(original[..., :3].astype(np.int32)
+                   - composite[..., :3].astype(np.int32)).sum(axis=2)
+    values = error[mask]
+    bad = values > LOCAL_BAD_RGB_SUM
+    x0, x1 = int(xs.min()), int(xs.max()) + 1
+    y0, y1 = int(ys.min()), int(ys.max()) + 1
+    bad_rows = np.bincount(ys[bad], minlength=mask.shape[0])
+    return {
+        "bbox_xyxy": [x0, y0, x1, y1],
+        "mae": round(float(values.mean()), 3),
+        "bad_px": int(bad.sum()),
+        "bad_ratio": round(float(bad.mean()), 6),
+        "pixel_count": int(values.size),
+        # This makes thin horizontal errors auditable without treating a
+        # geometric orientation as a different quality policy.
+        "max_bad_row_px": int(bad_rows.max(initial=0)),
+    }
+
+
+def _neckline_contact_mask(layer_dict: dict[str, np.ndarray],
+                           shape: tuple[int, ...]) -> np.ndarray | None:
+    """Return only the local neck/garment handoff neighbourhood.
+
+    A full neck or topwear bounding box is too broad: it lets a long, thin
+    static seam disappear into a mostly faithful region. Contact is inferred
+    from semantic alpha geometry and is resolution-normalized; no rig or pose
+    information is involved.
+    """
+    neck = _union(layer_dict, NECK_TAGS)
+    garment = _union(layer_dict, GARMENT_CONTACT_TAGS)
+    if neck is None or garment is None or not neck.any() or not garment.any():
+        return None
+    band = max(1, scale_length(NECKLINE_CONTACT_BAND_PX, shape))
+    near_neck = cv2.distanceTransform((~neck).astype(np.uint8), cv2.DIST_L2, 3) <= band
+    near_garment = cv2.distanceTransform(
+        (~garment).astype(np.uint8), cv2.DIST_L2, 3) <= band
+    contact = (near_neck & near_garment) & (neck | garment)
+    if int(contact.sum()) < scale_area(NECKLINE_MIN_CONTACT_AREA_AT_768, shape):
+        return None
+    return contact
 
 
 def _sclera_observation(original: np.ndarray, composite: np.ndarray,
@@ -153,6 +208,19 @@ def local_fidelity_report(original_rgba: np.ndarray, composite_rgba: np.ndarray,
             "status": "review" if metrics["bad_ratio"] > MOUTH_BAD_RATIO_REVIEW else "pass",
         }
 
+    neckline = None
+    neckline_mask = _neckline_contact_mask(layer_dict, original.shape)
+    if neckline_mask is not None:
+        metrics = _masked_metrics(original, composite, neckline_mask)
+        neckline = {
+            "feature": "neckline_contact",
+            **metrics,
+            "status": (
+                "review" if metrics["bad_ratio"] > NECKLINE_BAD_RATIO_REVIEW
+                else "pass"
+            ),
+        }
+
     warnings: list[str] = []
     if not eyes:
         status = "unavailable"
@@ -171,11 +239,16 @@ def local_fidelity_report(original_rgba: np.ndarray, composite_rgba: np.ndarray,
         warnings.append("mouth_local_fidelity_regression")
         if status == "pass":
             status = "review"
+    if neckline is not None and neckline["status"] == "review":
+        warnings.append("neckline_local_fidelity_regression")
+        if status in {"pass", "unavailable"}:
+            status = "review"
 
     return {
         "version": "1.0",
         "status": status,
         "eyes": eyes,
         "mouth": mouth,
+        "neckline": neckline,
         "warnings": warnings,
     }

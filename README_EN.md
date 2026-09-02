@@ -35,15 +35,16 @@ repository. The projects share a file contract and no Python imports.
   `body_remainder`.
 - **Portrait-aware auto-fill** selects the best layer set from up to five runs.
 - **Fidelity repair** runs `reclaim_occluded → fit_layer_tone → fit_edge_alpha
-  → fit_seam_residual → clean_garment_orphans` against the original still
+  → clean_garment_orphans → fit_edge_alpha_final → fit_seam_residual` against
+  the original still
   image and conservatively removes isolated garment semantic contamination.
 - **Static validation** measures whole-composite fidelity and thin, continuous
   seam artifacts separately.
 - **Semantic ownership recovery** returns high-confidence missing pixels to an
   existing canonical layer before unresolved residual becomes
   `body_remainder`.
-- **Face-local fidelity** checks left/right eye and mouth ROIs so sclera loss
-  cannot hide behind an acceptable whole-subject MAE.
+- **Local fidelity** checks left/right eye, mouth, and neckline-contact ROIs so
+  sclera loss or a horizontal neck/topwear seam cannot hide behind a good global MAE.
 - **Two verdicts** distinguish silhouette recovery from semantic completeness.
 
 ## Portrait Bundle v1
@@ -91,7 +92,13 @@ block streaming** when the UNet cannot reside on the GPU as a whole, allowing
 it to run on an 8GB-class GPU. This is not something that lowering
 `resolution` or `steps` alone can solve: this model's UNet is about 7.58 GiB
 even in bf16, so a card that cannot hold all weights can fail before inference
-begins. The VAE is tiled above 512px.
+begins. VAE tiling is not fixed at model load: immediately before each body or
+head diffusion call, the runtime prefers untiled from the stage resolution and
+live free VRAM, then retries exactly once with tiling on CUDA OOM. With the
+512px VAE tile, 768 becomes a serial 2×2 decode and 1024 a 3×3 decode.
+
+The measurement protocol and A002 768/1024 tiled-vs-untiled results are in
+[VAE runtime policy](docs/VAE_RUNTIME_POLICY.md).
 
 These are reference measurements for a single generation pass on an RTX 5060
 Laptop 8GB (A-001, seed 42, 30 steps). Actual time varies with the GPU,

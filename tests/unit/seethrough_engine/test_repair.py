@@ -1,7 +1,9 @@
 import unittest
+from unittest.mock import patch
 
 import numpy as np
 
+import seethrough_engine.repair as repair_module
 from seethrough_engine.image import composite_fidelity, composite_layers
 from seethrough_engine.repair import (
     RECLAIM_PAIRS,
@@ -172,6 +174,31 @@ class SeamResidualTests(unittest.TestCase):
         out, _ = fit_seam_residual(layers, original)
         for tag in layers:
             self.assertTrue(np.array_equal(out[tag][..., 3], layers[tag][..., 3]))
+
+    def test_pipeline_fits_the_final_boundary_after_orphan_cleanup(self):
+        """Cleanup can hand pixels back to neck after a seam fit.
+
+        The residual pass must therefore run on the production layer set, not
+        the intermediate one; otherwise that handoff reinstates a thin line.
+        """
+        original, layers = self.scene()
+        identity = lambda current, _original, **_kwargs: (dict(current), {})
+
+        def inject_garment_bias(current, _original):
+            changed = {tag: np.array(image, copy=True)
+                       for tag, image in current.items()}
+            changed["topwear"][64:110, 20:110, :3] = 206
+            return changed, {"topwear": {"transferred_px": {"neck": 1}}}
+
+        with patch.object(repair_module, "reclaim_occluded", identity), \
+             patch.object(repair_module, "fit_layer_tone", identity), \
+             patch.object(repair_module, "fit_edge_alpha", identity), \
+             patch.object(repair_module, "clean_garment_orphans", inject_garment_bias):
+            result = repair_module.repair_portrait_layers(layers, original)
+
+        self.assertEqual(int(result.layers["topwear"][64, 60, 0]), 200)
+        self.assertEqual(result.report["order"], list(REPAIR_ORDER))
+        self.assertIn("fit_edge_alpha_final", result.report)
 
 
 class EdgeFitTests(unittest.TestCase):

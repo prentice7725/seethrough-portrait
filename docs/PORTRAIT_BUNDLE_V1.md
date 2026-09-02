@@ -41,7 +41,12 @@ downstream consumer such as `portrait-autorig`.
   unresolved residual becomes `body_remainder`. Keeping recovery after fitted
   repair prevents newly transferred source pixels from biasing tone/seam fits.
 - The fidelity-repair order is fixed: `reclaim_occluded`, `fit_layer_tone`,
-  `fit_edge_alpha`, `fit_seam_residual`, `clean_garment_orphans`.
+  `fit_edge_alpha`, `clean_garment_orphans`, `fit_edge_alpha_final`,
+  `fit_seam_residual`. The final narrow edge and seam fits therefore evaluate
+  the published neck/garment ownership boundary.
+- `diagnostics/local_fidelity.json` measures eyes, mouth, and the local
+  neck/garment contact band. It reports source-visible loss and static seam
+  evidence; it is not a motion or rig-readiness policy.
 - `semantics.warnings` records observable producer-side semantic omissions,
   such as `missing_eyewhite`. It is not a rig-readiness or motion verdict.
 - A consumer must reject an unknown major format version.

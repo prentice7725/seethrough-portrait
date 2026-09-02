@@ -35,7 +35,9 @@ completeness only; it is not a downstream readiness or motion-policy verdict.
 ## Static validation
 
 Checks that canonical layers reconstruct the source portrait while still. It
-includes composite fidelity and seam detection.
+includes composite fidelity, seam detection, and feature-local eye, mouth, and
+neckline-contact checks. A local result reports static source reconstruction;
+it does not make a rig or motion-readiness claim.
 
 ## AutoRig compiler
 

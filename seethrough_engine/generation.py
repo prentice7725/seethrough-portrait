@@ -71,6 +71,7 @@ from .semantic import semantic_warnings
 from .image import composite_layers
 from .local_fidelity import local_fidelity_report
 from .ownership import recover_missing_ownership
+from .vae_runtime import run_with_vae_runtime
 
 __all__ = [
     "ALL_TAGS",
@@ -134,6 +135,8 @@ def run_diffusion_stage(pipeline, device, rng, tag_version, num_inference_steps,
                          body_embeds=None, body_pooled=None, head_embeds=None, head_pooled=None,
                          enable_head_detail=True, input_img=None, scale=1.0, pad_pos=None,
                          resolution=1280, head_resolution=None,
+                         vae_mode_override: str | None = None,
+                         vae_runtime_events: list[dict[str, Any]] | None = None,
                          log: Callable[[str], None] = _NOOP_LOG) -> dict[str, np.ndarray]:
     """Run a single diffusion pass (body stage, plus the head stage for v3
     when enabled) and return {tag: RGBA ndarray} in canvas (`fullpage`) space.
@@ -157,19 +160,31 @@ def run_diffusion_stage(pipeline, device, rng, tag_version, num_inference_steps,
     run_layer_dict: dict[str, np.ndarray] = {}
 
     if tag_version == "v2":
-        out = pipeline(strength=1.0, num_inference_steps=num_inference_steps, batch_size=1,
-                       generator=rng, guidance_scale=1.0,
-                       prompt_embeds=prompt_embeds, pooled_prompt_embeds=pooled_prompt_embeds,
-                       fullpage=fullpage)
+        out = run_with_vae_runtime(
+            pipeline, device, resolution, "body",
+            lambda: pipeline(
+                strength=1.0, num_inference_steps=num_inference_steps, batch_size=1,
+                generator=rng, guidance_scale=1.0,
+                prompt_embeds=prompt_embeds, pooled_prompt_embeds=pooled_prompt_embeds,
+                fullpage=fullpage,
+            ),
+            force_mode=vae_mode_override, telemetry=vae_runtime_events, log=log,
+        )
         log("v2 diffusion complete")
         for rst, tag in zip(out.images, VALID_BODY_PARTS_V2):
             run_layer_dict[tag] = rst
 
     elif tag_version == "v3":
-        out = pipeline(strength=1.0, num_inference_steps=num_inference_steps, batch_size=1,
-                       generator=rng, guidance_scale=1.0,
-                       prompt_embeds=body_embeds, pooled_prompt_embeds=body_pooled,
-                       fullpage=fullpage, group_index=0)
+        out = run_with_vae_runtime(
+            pipeline, device, resolution, "body",
+            lambda: pipeline(
+                strength=1.0, num_inference_steps=num_inference_steps, batch_size=1,
+                generator=rng, guidance_scale=1.0,
+                prompt_embeds=body_embeds, pooled_prompt_embeds=body_pooled,
+                fullpage=fullpage, group_index=0,
+            ),
+            force_mode=vae_mode_override, telemetry=vae_runtime_events, log=log,
+        )
         log("v3 body diffusion complete")
         for rst, tag in zip(out.images, VALID_BODY_PARTS_V3_BODY):
             run_layer_dict[tag] = rst
@@ -188,10 +203,16 @@ def run_diffusion_stage(pipeline, device, rng, tag_version, num_inference_steps,
                 input_head, head_pad_size, head_pad_pos = vendor.center_square_pad_resize(
                     input_head, head_resolution, return_pad_info=True)
 
-                out = pipeline(strength=1.0, num_inference_steps=num_inference_steps, batch_size=1,
-                               generator=rng, guidance_scale=1.0,
-                               prompt_embeds=head_embeds, pooled_prompt_embeds=head_pooled,
-                               fullpage=input_head, group_index=1)
+                out = run_with_vae_runtime(
+                    pipeline, device, head_resolution, "head",
+                    lambda: pipeline(
+                        strength=1.0, num_inference_steps=num_inference_steps, batch_size=1,
+                        generator=rng, guidance_scale=1.0,
+                        prompt_embeds=head_embeds, pooled_prompt_embeds=head_pooled,
+                        fullpage=input_head, group_index=1,
+                    ),
+                    force_mode=vae_mode_override, telemetry=vae_runtime_events, log=log,
+                )
                 log(f"v3 head diffusion complete ({head_resolution}px head canvas)")
 
                 canvas = np.zeros((resolution, resolution, 4), dtype=np.uint8)
@@ -240,6 +261,7 @@ def run_portrait_pipeline(
     max_runs: int = 5,
     silhouette_guard: bool = True,
     provided_subject_mask: np.ndarray | None = None,
+    vae_mode_override: str | None = None,
     portrait_config: PortraitConfig | None = None,
     device: torch.device | None = None,
     offload_device: torch.device | None = None,
@@ -311,6 +333,8 @@ def run_portrait_pipeline(
     unet_streamed = fit_unet_on(pipeline.unet, device, offload_device, log=log)
     empty_cache(device)
 
+    vae_runtime_events: list[dict[str, Any]] = []
+
     def _diffuse(run_seed: int) -> dict[str, np.ndarray]:
         rng = torch.Generator(device=device).manual_seed(run_seed)
         return run_diffusion_stage(
@@ -321,6 +345,8 @@ def run_portrait_pipeline(
             enable_head_detail=enable_head_detail, input_img=input_img,
             scale=scale, pad_pos=pad_pos, resolution=resolution,
             head_resolution=head_resolution, log=log,
+            vae_mode_override=vae_mode_override,
+            vae_runtime_events=vae_runtime_events,
         )
 
     layer_dict = _diffuse(seed)
@@ -448,6 +474,7 @@ def run_portrait_pipeline(
         selection_trace=selection_trace,
     )
     report["semantic"]["warnings"] = semantic_warnings(layer_dict, fullpage)
+    report["run"]["vae_runtime"] = vae_runtime_events
     ownership_report = ownership_result.report if ownership_result is not None else {
         "version": "disabled",
         "initial_missing_px": int(final_guard.metrics.missing_area_px),

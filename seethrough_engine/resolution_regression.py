@@ -43,8 +43,14 @@ def bundle_resolution_snapshot(bundle_dir: str | Path) -> dict[str, Any]:
         "seed": int(report["run"]["seed"]),
         "steps": int(report["run"]["steps"]),
         "eyewhite_present": "eyewhite" in manifest["layers"],
-        "sclera_preserved": local["status"] == "pass",
+        # A neckline review must not masquerade as an eye/sclera regression.
+        # This field is deliberately eye-specific; the complete local status
+        # remains available below for callers that need all critical features.
+        "sclera_preserved": bool(local["eyes"]) and not any(
+            eye["status"] == "review" for eye in local["eyes"]
+        ),
         "eye_local_fidelity": local,
+        "neckline_local_fidelity": local.get("neckline"),
         "topwear_contamination": {
             "removed_px": int(cleanup.get("removed_px", 0)),
             "ambiguous_components": len(ambiguous),
@@ -70,6 +76,11 @@ def compare_resolution_snapshots(baseline: dict[str, Any],
         regressions.append("eyewhite_tag_lost")
     if baseline["sclera_preserved"] and not comparison["sclera_preserved"]:
         regressions.append("eye_local_fidelity_regressed")
+    baseline_neckline = baseline.get("neckline_local_fidelity") or {}
+    comparison_neckline = comparison.get("neckline_local_fidelity") or {}
+    if (baseline_neckline.get("status") == "pass"
+            and comparison_neckline.get("status") == "review"):
+        regressions.append("neckline_local_fidelity_regressed")
     if comparison["semantic_tag_count"] < baseline["semantic_tag_count"]:
         regressions.append("semantic_tag_count_decreased")
     new_warnings = sorted(set(comparison["semantic_warnings"])
