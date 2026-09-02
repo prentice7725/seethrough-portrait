@@ -17,7 +17,7 @@ from .image import composite_fidelity, composite_layers
 from .scale import canvas_scale, odd_kernel, scale_area, scale_length
 from .semantic import SEMANTIC_Z_ORDER
 
-REPAIR_VERSION = "1.7"
+REPAIR_VERSION = "1.8"
 REPAIR_ORDER = (
     "reclaim_occluded",
     "fit_layer_tone",
