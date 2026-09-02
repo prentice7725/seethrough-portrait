@@ -752,6 +752,7 @@ def fit_neckline_contact(
     # boundary, preserving a genuinely low neckline and visible contour.
     trim_accepted = np.zeros_like(changed)
     trim_rejected = np.zeros_like(changed)
+    trim_changed = np.zeros_like(changed)
     current_score = _static_reconstruction_score(working, original, order)
     current_topwear = np.asarray(working[topwear_tag])
     current_neck = np.asarray(working[neck_tag])
@@ -846,7 +847,7 @@ def fit_neckline_contact(
 
             report_trim = {
                 "candidate_px": int(trim_evidence.sum()),
-                "changed_px": int(trim_changed.sum()) if 'trim_changed' in locals() else 0,
+                "changed_px": int(trim_changed.sum()),
                 "accepted_px": int(trim_accepted.sum()),
                 "rejected_px": int(trim_rejected.sum()),
             }

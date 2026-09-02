@@ -49,6 +49,9 @@ downstream consumer such as `portrait-autorig`.
 - `diagnostics/local_fidelity.json` measures eyes, mouth, and the local
   neck/garment contact band. It reports source-visible loss and static seam
   evidence; it is not a motion or rig-readiness policy.
+- `diagnostics/neckline_contact.json` records the producer-side contact ROI,
+  ownership candidates, accepted trim/underlap pixels, and exact before/after
+  local fidelity deltas for the neckline repair.
 - `semantics.warnings` records observable producer-side semantic omissions,
   such as `missing_eyewhite`. It is not a rig-readiness or motion verdict.
 - A consumer must reject an unknown major format version.

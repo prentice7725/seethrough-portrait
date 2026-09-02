@@ -75,6 +75,7 @@ def test_bundle_publishes_repaired_layers_and_keeps_raw_forensics(tmp_path):
     assert (tmp_path / "diagnostics" / "seams.json").is_file()
     assert (tmp_path / "diagnostics" / "semantic_ownership.json").is_file()
     assert (tmp_path / "diagnostics" / "local_fidelity.json").is_file()
+    assert (tmp_path / "diagnostics" / "neckline_contact.json").is_file()
 
     with open(tmp_path / "manifest.json", encoding="utf-8") as handle:
         assert json.load(handle) == manifest
