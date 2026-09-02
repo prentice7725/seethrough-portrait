@@ -686,12 +686,10 @@ def fit_neckline_contact(
         & (solved_error + float(NECKLINE_CONTACT_MIN_IMPROVEMENT) < current_error)
     )
     if not evidence.any():
-        return dict(layer_dict), {
-            "band_px": int(contact.sum()),
-            "candidate_px": 0,
-            "status": "kept",
-            "reason": "original does not decisively prefer topwear ownership",
-        }
+        # Keep the empty proposal and continue to the one-sided neck trim
+        # below. A lower-neck matte can be wrong even when no topwear pixel
+        # itself needs an alpha update.
+        evidence = np.zeros_like(contact)
 
     # Fade toward the interior edge of the local band.  This creates an
     # underlap/soft handoff without introducing a second hard line.
@@ -702,12 +700,7 @@ def fit_neckline_contact(
     ) * falloff
     changed = evidence & (np.abs(proposed_alpha - current_alpha) >= 1.0 / 255.0)
     if not changed.any():
-        return dict(layer_dict), {
-            "band_px": int(contact.sum()),
-            "candidate_px": int(evidence.sum()),
-            "status": "kept",
-            "reason": "sub-pixel alpha proposal",
-        }
+        changed = np.zeros_like(contact)
 
     def proposal(mask: np.ndarray) -> dict[str, np.ndarray]:
         patched = np.array(topwear, copy=True)
@@ -752,12 +745,126 @@ def fit_neckline_contact(
             else:
                 rejected |= component
 
+    # A lower-neck matte can remain visible where the garment has a one-sided
+    # contact (neck alpha exists, topwear alpha does not).  Trim only that
+    # lower contact neighbourhood when the original is decisively explained by
+    # the layers beneath the neck.  The y guard excludes the upper neck/head
+    # boundary, preserving a genuinely low neckline and visible contour.
+    trim_accepted = np.zeros_like(changed)
+    trim_rejected = np.zeros_like(changed)
+    current_score = _static_reconstruction_score(working, original, order)
+    current_topwear = np.asarray(working[topwear_tag])
+    current_neck = np.asarray(working[neck_tag])
+    current_garment = current_topwear[..., 3] > alpha_threshold
+    current_neck_mask = current_neck[..., 3] > alpha_threshold
+    garment_ys = np.where(current_garment)[0]
+    if garment_ys.size:
+        trim_contact = (
+            current_neck_mask
+            & ~current_garment
+            & (cv2.distanceTransform(
+                (~current_garment).astype(np.uint8), cv2.DIST_L2, 3)
+               <= float(band))
+            & (np.indices(shape)[0] >= max(0, int(garment_ys.min()) - band))
+            & (original[..., 3] > alpha_threshold)
+        )
+        neck_rank = rank.get(neck_tag, -1)
+        higher = np.zeros(shape, np.float32)
+        for tag, layer in working.items():
+            if rank.get(tag, -1) > neck_rank:
+                higher = np.maximum(higher, np.asarray(layer)[..., 3] / 255.0)
+        trim_contact &= higher <= 0.10
+        neck_ordered = {
+            tag: np.asarray(working[tag]) for tag in ordered
+            if rank.get(tag, -1) < neck_rank
+        }
+        neck_beneath = composite_layers(neck_ordered, shape, order=order)
+        nb = neck_beneath[..., :3].astype(np.float32)
+        nf = current_neck[..., :3].astype(np.float32)
+        no = original[..., :3].astype(np.float32)
+        ns_error = np.abs(no - nf).sum(axis=2)
+        nb_error = np.abs(no - nb).sum(axis=2)
+        ndelta = nf - nb
+        nden = (ndelta * ndelta).sum(axis=2)
+        ndesired = np.clip(((no - nb) * ndelta).sum(axis=2)
+                           / np.maximum(nden, 1.0), 0.0, 1.0)
+        ncurrent = current_neck[..., 3].astype(np.float32) / 255.0
+        nsolved = nf * ndesired[..., None] + nb * (1.0 - ndesired[..., None])
+        nsolved_error = np.abs(no - nsolved).sum(axis=2)
+        trim_evidence = (
+            trim_contact
+            & (nden >= float(min_contrast * min_contrast))
+            & (nb_error + float(color_margin) < ns_error)
+            & (ndesired < ncurrent - float(min_alpha_delta))
+            & (nsolved_error + float(NECKLINE_CONTACT_MIN_IMPROVEMENT)
+               < ns_error)
+        )
+        if trim_evidence.any():
+            trim_falloff = np.clip(
+                1.0 - cv2.distanceTransform(
+                    (~current_garment).astype(np.uint8), cv2.DIST_L2, 3)
+                / float(band), 0.0, 1.0)
+            trim_falloff = trim_falloff * trim_falloff * (3.0 - 2.0 * trim_falloff)
+            nproposal = ncurrent - np.minimum(
+                ncurrent - ndesired, float(max_alpha_step)) * trim_falloff
+            trim_changed = trim_evidence & (
+                np.abs(nproposal - ncurrent) >= 1.0 / 255.0)
+            if trim_changed.any():
+                trim_layer = np.array(current_neck, copy=True)
+                trim_alpha = ncurrent.copy()
+                trim_alpha[trim_changed] = nproposal[trim_changed]
+                trim_layer[..., 3] = np.rint(
+                    np.clip(trim_alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
+                trim_tentative = dict(working)
+                trim_tentative[neck_tag] = trim_layer
+                trim_score = _static_reconstruction_score(
+                    trim_tentative, original, order)
+                if trim_score <= current_score:
+                    working = trim_tentative
+                    trim_accepted = trim_changed
+                    current_score = trim_score
+                else:
+                    count, labels, _, _ = cv2.connectedComponentsWithStats(
+                        trim_changed.astype(np.uint8), 8)
+                    for index in range(1, count):
+                        component = labels == index
+                        tentative = dict(working)
+                        patched = np.array(working[neck_tag], copy=True)
+                        alpha = patched[..., 3].astype(np.float32) / 255.0
+                        alpha[component] = nproposal[component]
+                        patched[..., 3] = np.rint(
+                            np.clip(alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
+                        tentative[neck_tag] = patched
+                        score = _static_reconstruction_score(
+                            tentative, original, order)
+                        if score <= current_score:
+                            working = tentative
+                            current_score = score
+                            trim_accepted |= component
+                        else:
+                            trim_rejected |= component
+
+            report_trim = {
+                "candidate_px": int(trim_evidence.sum()),
+                "changed_px": int(trim_changed.sum()) if 'trim_changed' in locals() else 0,
+                "accepted_px": int(trim_accepted.sum()),
+                "rejected_px": int(trim_rejected.sum()),
+            }
+        else:
+            report_trim = {"candidate_px": 0, "changed_px": 0,
+                           "accepted_px": 0, "rejected_px": 0}
+    else:
+        report_trim = {"candidate_px": 0, "changed_px": 0,
+                       "accepted_px": 0, "rejected_px": 0}
+
+    after_score = current_score
     report: dict[str, Any] = {
         "band_px": int(contact.sum()),
         "candidate_px": int(evidence.sum()),
         "changed_px": int(changed.sum()),
         "accepted_px": int(accepted.sum()),
         "rejected_px": int(rejected.sum()),
+        "neck_trim": report_trim,
         "rgb_error_delta": int(after_score[0] - before_score[0]),
         "bad_px_delta": int(after_score[1] - before_score[1]),
         "band_px_at_reference": NECKLINE_CONTACT_BAND_PX,
@@ -784,7 +891,7 @@ def fit_neckline_contact(
             "contact_bad_ratio_after": round(
                 float((after_error > 60).mean()), 6),
         })
-    report["status"] = "applied" if accepted.any() else "ambiguous"
+    report["status"] = "applied" if (accepted.any() or trim_accepted.any()) else "kept"
     if rejected.any():
         report["warning"] = "some contact components failed static non-regression gate"
     return working, report
