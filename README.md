@@ -92,7 +92,13 @@ pip install -r requirements.txt
 block streaming**으로 전환합니다. 따라서 8GB급 GPU에서도 실행할 수 있습니다.
 이는 단순히 `resolution`이나 `steps`를 낮추는 방식이 아닙니다. 이 모델의 UNet은
 bf16에서도 약 7.58 GiB이므로, 가중치가 통째로 들어가지 않는 카드에서는 연산 전에
-OOM이 날 수 있기 때문입니다. VAE는 512px 초과 해상도에서 타일링됩니다.
+OOM이 날 수 있기 때문입니다. VAE 타일링은 모델 로드 시 고정하지 않습니다. body/head
+각 diffusion 직전에 해상도와 실제 여유 VRAM으로 untiled를 우선 선택하고, CUDA OOM이면
+tiled로 정확히 한 번 재시도합니다. 512px VAE tile 기준으로 768은 2×2, 1024는 3×3
+serial decode가 되므로 여유가 있을 때 untiled가 기본입니다.
+
+측정 방식과 A002 768/1024 tiled-vs-untiled 결과는
+[VAE runtime policy](docs/VAE_RUNTIME_POLICY.md)에 기록합니다.
 
 다음은 RTX 5060 Laptop 8GB (A-001, seed 42, 30 steps)에서 기록한 단일 생성
 패스의 참고 측정치입니다. 실제 시간은 GPU, 여유 VRAM, 입력과 Portrait Mode의

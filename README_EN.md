@@ -92,7 +92,13 @@ block streaming** when the UNet cannot reside on the GPU as a whole, allowing
 it to run on an 8GB-class GPU. This is not something that lowering
 `resolution` or `steps` alone can solve: this model's UNet is about 7.58 GiB
 even in bf16, so a card that cannot hold all weights can fail before inference
-begins. The VAE is tiled above 512px.
+begins. VAE tiling is not fixed at model load: immediately before each body or
+head diffusion call, the runtime prefers untiled from the stage resolution and
+live free VRAM, then retries exactly once with tiling on CUDA OOM. With the
+512px VAE tile, 768 becomes a serial 2×2 decode and 1024 a 3×3 decode.
+
+The measurement protocol and A002 768/1024 tiled-vs-untiled results are in
+[VAE runtime policy](docs/VAE_RUNTIME_POLICY.md).
 
 These are reference measurements for a single generation pass on an RTX 5060
 Laptop 8GB (A-001, seed 42, 30 steps). Actual time varies with the GPU,

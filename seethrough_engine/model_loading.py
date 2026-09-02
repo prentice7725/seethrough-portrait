@@ -54,7 +54,7 @@ def assert_text_encoder_loaded(text_encoder, name: str, pretrained: str) -> None
 
 
 def load_layerdiff_model(pretrained: str, vae_ckpt: str = "", unet_ckpt: str = "",
-                          dtype: torch.dtype = torch.bfloat16, vae_tiling: bool = True):
+                          dtype: torch.dtype = torch.bfloat16):
     """Load the LayerDiff SDXL pipeline from a resolved local path. `pretrained`
     should already be the output of `resolve_model_path`.
 
@@ -69,12 +69,11 @@ def load_layerdiff_model(pretrained: str, vae_ckpt: str = "", unet_ckpt: str = "
     used to end with redundant, so only the custom-`vae_ckpt` path still
     normalizes.
 
-    `vae_tiling` runs the SDXL VAE's encode/decode in overlapping 512px tiles
-    rather than across the whole canvas, which is where its activation peak
-    otherwise lands (the VAE is called once to encode `fullpage` and once per
-    layer to decode, both at full resolution). It is not bit-identical to the
-    untiled path -- tiles are blended over a 25% overlap -- so it is the one
-    flag to turn off if a run has to match an untiled baseline exactly.
+    VAE tiling deliberately is not a load-time option.  It is selected before
+    each body/head diffusion call from that stage's resolution and current
+    available VRAM, and an untiled CUDA OOM retries once with tiling.  Keeping
+    the VAE untiled here prevents a 768px run from paying serial 2 x 2 decode
+    overhead merely because a later, larger run might need tiles.
     """
     vendor.ensure_seethrough_importable()
 
@@ -121,9 +120,6 @@ def load_layerdiff_model(pretrained: str, vae_ckpt: str = "", unet_ckpt: str = "
         # but normalize in case a ckpt brings buffers those copies miss.
         pipeline.vae.to(dtype=dtype)
         pipeline.trans_vae.to(dtype=dtype)
-
-    if vae_tiling:
-        pipeline.vae.enable_tiling()
 
     print("[SeeThrough] LayerDiff model loaded to CPU (will move to GPU on demand)", flush=True)
     return pipeline

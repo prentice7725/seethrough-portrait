@@ -198,11 +198,11 @@ below is a real run added after the fact. What was actually verified:
        the way in, only for `.to(dtype=...)` to halve it again: peak system
        RAM for a UNet load fell from 17.51 GiB to 0.82 GiB (the bf16 file is
        now mmap-aliased rather than copied) and load time from 20.2s to 8.0s.
-     - `load_layerdiff_model(vae_tiling=True)` runs the SDXL VAE in 512px
-       tiles. This is a no-op at or below `resolution=512` -- including for
-       item 5's recorded run, so that baseline is unaffected -- and only
-       engages above it, where the VAE's activation peak would otherwise be
-       taken across the whole canvas.
+     - VAE tiling is selected at each body/head diffusion call rather than at
+       `load_layerdiff_model()` time. The runtime prefers untiled from live
+       available VRAM and the stage resolution, then retries once tiled after
+       an untiled CUDA OOM. This avoids serial 2×2 decode at 768 and 3×3
+       decode at 1024 when the current stage can safely remain untiled.
 
    Measured on the same card and asset (A-001, seed 42, 30 steps), all `PASS`:
 
