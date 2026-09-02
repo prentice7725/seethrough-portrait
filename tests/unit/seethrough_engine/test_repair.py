@@ -12,7 +12,6 @@ from seethrough_engine.repair import (
     clean_garment_orphans,
     fit_edge_alpha,
     fit_layer_tone,
-    fit_neckline_contact,
     fit_seam_residual,
     reclaim_occluded,
     repair_portrait_layers,
@@ -583,61 +582,3 @@ class GarmentOrphanCleanupTests(unittest.TestCase):
         result = repair_portrait_layers(layers, original)
         self.assertEqual(result.report["version"], REPAIR_VERSION)
         self.assertEqual(result.report["order"], list(REPAIR_ORDER))
-
-    def test_neckline_contact_adds_only_local_garment_underlap(self):
-        """A collar edge may be present but too transparent over the neck."""
-        body = rgba([(10, 70, 118, 110)], value=(60, 70, 90))
-        neck = rgba([(42, 30, 86, 80)], value=(210, 170, 150))
-        topwear = rgba([(20, 70, 108, 110)], value=(80, 100, 130))
-        topwear[68:73, 46:82, :3] = (80, 100, 130)
-        topwear[68:73, 46:82, 3] = 80
-        layers = {"body_remainder": body, "neck": neck, "topwear": topwear}
-        original = composite_layers(layers, (CANVAS, CANVAS))
-        original[68:73, 46:82, :3] = (80, 100, 130)
-        original[68:73, 46:82, 3] = 255
-
-        out, report = fit_neckline_contact(layers, original)
-
-        assert report["status"] == "applied"
-        assert report["accepted_px"] > 0
-        assert report["contact_mae_after"] <= report["contact_mae_before"]
-        assert report["contact_bad_ratio_after"] <= report["contact_bad_ratio_before"]
-        assert int(out["topwear"][70, 50, 3]) > int(topwear[70, 50, 3])
-        np.testing.assert_array_equal(out["neck"], neck)
-        # The main garment and its collar remain untouched outside the contact
-        # neighbourhood; this is not a global dilation.
-        np.testing.assert_array_equal(out["topwear"][90:, 20:108], topwear[90:, 20:108])
-
-    def test_neckline_contact_preserves_a_low_neckline(self):
-        """Skin wins in the opening, so no garment alpha is invented."""
-        body = rgba([(10, 70, 118, 110)], value=(60, 70, 90))
-        neck = rgba([(42, 30, 86, 80)], value=(210, 170, 150))
-        topwear = rgba([(20, 70, 108, 110)], value=(80, 100, 130))
-        topwear[68:73, 46:82, :3] = (80, 100, 130)
-        topwear[68:73, 46:82, 3] = 80
-        layers = {"body_remainder": body, "neck": neck, "topwear": topwear}
-        original = composite_layers(layers, (CANVAS, CANVAS))
-        original[68:73, 46:82, :3] = (210, 170, 150)
-        original[68:73, 46:82, 3] = 255
-
-        out, report = fit_neckline_contact(layers, original)
-
-        assert report["status"] == "kept"
-        np.testing.assert_array_equal(out["topwear"], topwear)
-
-    def test_neckline_contact_trims_only_a_lower_neck_matte_when_garment_wins(self):
-        body = rgba([(10, 70, 118, 110)], value=(60, 70, 90))
-        neck = rgba([(42, 30, 86, 80)], value=(210, 170, 150))
-        topwear = rgba([(20, 76, 108, 110)], value=(80, 100, 130))
-        layers = {"body_remainder": body, "neck": neck, "topwear": topwear}
-        original = composite_layers(layers, (CANVAS, CANVAS))
-        # The source has garment pixels in the six-pixel lower-neck contact,
-        # while the generated neck matte still claims those pixels.
-        original[70:76, 42:86, :3] = (60, 70, 90)
-        original[70:76, 42:86, 3] = 255
-
-        out, report = fit_neckline_contact(layers, original)
-
-        assert report["neck_trim"]["accepted_px"] > 0
-        assert int(out["neck"][72, 50, 3]) < int(neck[72, 50, 3])
-        np.testing.assert_array_equal(out["topwear"], topwear)

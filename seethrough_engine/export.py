@@ -112,13 +112,6 @@ def save_portrait_bundle(output_dir: str, result: PortraitPipelineResult, *,
     _write_json(os.path.join(output_dir, *fidelity_relative.split("/")), fidelity)
     diagnostic_paths["fidelity"] = fidelity_relative
 
-    neckline_relative = "diagnostics/neckline_contact.json"
-    _write_json(
-        os.path.join(output_dir, *neckline_relative.split("/")),
-        dict(result.repair_report.get("fit_neckline_contact") or {}),
-    )
-    diagnostic_paths["neckline_contact"] = neckline_relative
-
     ownership_relative = "diagnostics/semantic_ownership.json"
     _write_json(
         os.path.join(output_dir, *ownership_relative.split("/")),
