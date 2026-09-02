@@ -38,8 +38,8 @@ Spine exporter와 브라우저 runtime은 별도
   5회 실행 중 최선의 레이어 조합을 선택합니다.
 - **Fidelity repair** — `reclaim_occluded → fit_layer_tone → fit_edge_alpha →
   clean_garment_orphans → fit_edge_alpha_final → fit_seam_residual` 순서로
-  정지화면을 원본과 맞추고,
-  garment의 고립 semantic contamination을 보수적으로 제거합니다.
+  정지화면을 원본과 맞추고, garment의 고립 semantic contamination을
+  보수적으로 제거합니다.
 - **Static validation** — 전체 composite fidelity와 가늘고 긴 seam을 별도로
   측정합니다.
 - **Semantic ownership recovery** — 누락 픽셀을 곧바로
@@ -133,10 +133,15 @@ Portrait Mode에서는 투명 PNG를 **Load Source**로 읽고 `subject_mask`를
 ## 독립 실행 WebUI
 
 ```bash
-pip install -r webui/requirements.txt
+python -m pip install -r webui/requirements.txt
 python webui/app.py
 # http://127.0.0.1:7860
 ```
+
+명령을 실행하는 Python과 같은 환경에 의존성을 설치하세요. Windows에서
+다른 프로젝트의 가상환경으로 실행한다면 그 환경에서
+`python -m pip install -r C:\workspace\seethrough-portrait\webui\requirements.txt`
+를 먼저 실행해야 합니다 (`cv2` import는 `opencv-python` 패키지에서 옵니다).
 
 이미지 한 장을 업로드해 Portrait Mode를 실행하고 verdict, canonical layers와
 diagnostics가 담긴 Portrait Bundle zip을 받습니다. 자세한 내용은

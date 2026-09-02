@@ -7,7 +7,7 @@ report. This is the M2 exit-condition tool: "A-001 can be run and exported
 from the UI" (see docs/M2_IMPLEMENTATION_SPEC.md).
 
 Usage:
-    pip install -r webui/requirements.txt
+    python -m pip install -r webui/requirements.txt
     python webui/app.py
     # then open http://127.0.0.1:7860
 
@@ -49,6 +49,17 @@ VERDICT_COLORS = {
 # Cleared whenever a different model is selected, since we only keep one
 # checkpoint's worth of VRAM/RAM resident at a time.
 _pipeline_cache: dict[str, object] = {}
+
+
+def _dependency_error_message(error: ModuleNotFoundError) -> str | None:
+    """Return an actionable message for a missing runtime dependency."""
+    if error.name == "cv2":
+        return (
+            "OpenCV가 현재 실행 중인 Python 환경에 없습니다.\n"
+            f"현재 Python: {sys.executable}\n"
+            f"설치 명령: \"{sys.executable}\" -m pip install opencv-python"
+        )
+    return None
 
 
 def _get_pipeline(model_name: str):
@@ -193,9 +204,15 @@ def run_a001(
     if image is None:
         raise gr.Error("Upload an image first.")
 
-    from portrait_core import PortraitConfig
-    from seethrough_engine.export import save_portrait_bundle
-    from seethrough_engine.generation import run_portrait_pipeline
+    try:
+        from portrait_core import PortraitConfig
+        from seethrough_engine.export import save_portrait_bundle
+        from seethrough_engine.generation import run_portrait_pipeline
+    except ModuleNotFoundError as error:
+        message = _dependency_error_message(error)
+        if message is not None:
+            raise gr.Error(message) from error
+        raise
 
     log_lines: list[str] = []
     # run_portrait_pipeline only calls log() at a handful of checkpoints
@@ -354,22 +371,21 @@ def build_app() -> gr.Blocks:
                 with gr.Row():
                     seed_in = gr.Number(label="시드", value=42, precision=0)
                     resolution_in = gr.Slider(
-                        label="Resolution", minimum=512, maximum=2048, step=64, value=768
+                        label="해상도", minimum=512, maximum=2048, step=64, value=768
                     )
                 head_res_in = gr.Dropdown(
                     label="얼굴 디테일 해상도",
                     choices=[HEAD_RES_MATCH, "640", "768", "1024", "1280"],
                     value="768",
                     info=(
-                        "The v3 head pass re-diffuses a crop of the head on its own "
-                        "square canvas, and its size is what decides whether the fine "
-                        "facial layers resolve: on A-001, 512 returns no eyewhite and "
-                        "the layers composite to mae 15.1, while 768 returns it at "
-                        "11.9. Set this to 768 with a 512 body to keep the detail "
-                        "without paying for a full-resolution body pass. Peak VRAM "
-                        "follows the larger of the two. A002 currently regresses "
-                        "at a 1024 head pass, so 768 is the validated safe profile; "
-                        "local eye fidelity will flag a visible loss."
+                        "v3 얼굴 단계는 머리 영역을 별도 정사각형 캔버스에서 다시 "
+                        "확산합니다. 이 값이 작은 얼굴 semantic 레이어의 생성 여부를 "
+                        "결정합니다. A-001에서는 512에서 eyewhite가 누락되고 composite "
+                        "MAE가 15.1이지만, 768에서는 11.9로 생성됩니다. 본문 해상도는 "
+                        "512로 두고 얼굴만 768로 설정하면 전체 본문 비용 없이 디테일을 "
+                        "확보할 수 있습니다. 피크 VRAM은 둘 중 큰 해상도를 따릅니다. "
+                        "A002는 1024 얼굴 단계에서 회귀가 확인되어 768을 검증된 안전 "
+                        "프로필로 사용하며, 눈 로컬 fidelity가 소실을 표시합니다."
                     ),
                 )
                 steps_in = gr.Slider(
