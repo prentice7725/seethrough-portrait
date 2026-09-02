@@ -7,7 +7,7 @@ report. This is the M2 exit-condition tool: "A-001 can be run and exported
 from the UI" (see docs/M2_IMPLEMENTATION_SPEC.md).
 
 Usage:
-    pip install -r webui/requirements.txt
+    python -m pip install -r webui/requirements.txt
     python webui/app.py
     # then open http://127.0.0.1:7860
 
@@ -49,6 +49,17 @@ VERDICT_COLORS = {
 # Cleared whenever a different model is selected, since we only keep one
 # checkpoint's worth of VRAM/RAM resident at a time.
 _pipeline_cache: dict[str, object] = {}
+
+
+def _dependency_error_message(error: ModuleNotFoundError) -> str | None:
+    """Return an actionable message for a missing runtime dependency."""
+    if error.name == "cv2":
+        return (
+            "OpenCV가 현재 실행 중인 Python 환경에 없습니다.\n"
+            f"현재 Python: {sys.executable}\n"
+            f"설치 명령: \"{sys.executable}\" -m pip install opencv-python"
+        )
+    return None
 
 
 def _get_pipeline(model_name: str):
@@ -193,9 +204,15 @@ def run_a001(
     if image is None:
         raise gr.Error("Upload an image first.")
 
-    from portrait_core import PortraitConfig
-    from seethrough_engine.export import save_portrait_bundle
-    from seethrough_engine.generation import run_portrait_pipeline
+    try:
+        from portrait_core import PortraitConfig
+        from seethrough_engine.export import save_portrait_bundle
+        from seethrough_engine.generation import run_portrait_pipeline
+    except ModuleNotFoundError as error:
+        message = _dependency_error_message(error)
+        if message is not None:
+            raise gr.Error(message) from error
+        raise
 
     log_lines: list[str] = []
     # run_portrait_pipeline only calls log() at a handful of checkpoints

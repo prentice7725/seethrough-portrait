@@ -17,8 +17,8 @@ limitations.
 # 1. Install a CUDA-matched torch + torchvision build first (both from the
 #    same command, so their CUDA builds match):
 #    https://pytorch.org/get-started/locally/
-# 2. Then everything else:
-pip install -r webui/requirements.txt
+# 2. Then everything else, using the same Python that will launch the UI:
+python -m pip install -r webui/requirements.txt
 ```
 
 Models download automatically from HuggingFace on first use, into
@@ -31,6 +31,19 @@ folder there yourself -- see the main [README](../README_EN.md#models)).
 python webui/app.py
 ```
 
+On Windows, make the interpreter explicit when another project is open (for
+example, Sprite Studio):
+
+```powershell
+cd C:\workspace\seethrough-portrait
+.\.venv\Scripts\python.exe -m pip install -r webui\requirements.txt
+.\.venv\Scripts\python.exe webui\app.py
+```
+
+If you intentionally launch with another environment, install the same
+requirements into that environment first. The Python package is
+`opencv-python`, although the import name shown in errors is `cv2`.
+
 Opens `http://127.0.0.1:7860`.
 
 1. Upload a portrait. A transparent-background PNG is strongly recommended --
@@ -39,7 +52,7 @@ Opens `http://127.0.0.1:7860`.
    opaque-background image, also upload a **subject mask** (white = subject).
 2. Pick resolution / steps / seed, and whether to enable head detail,
    Silhouette Guard, and auto-fill.
-3. Click **Run A-001**.
+3. Click **Run**.
 4. Read the verdict badge and reasons, browse the layer/diagnostic thumbnails,
    and download the `.portrait` bundle zip.
 

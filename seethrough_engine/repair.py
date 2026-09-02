@@ -17,12 +17,13 @@ from .image import composite_fidelity, composite_layers
 from .scale import canvas_scale, odd_kernel, scale_area, scale_length
 from .semantic import SEMANTIC_Z_ORDER
 
-REPAIR_VERSION = "1.6"
+REPAIR_VERSION = "1.7"
 REPAIR_ORDER = (
     "reclaim_occluded",
     "fit_layer_tone",
     "fit_edge_alpha",
     "clean_garment_orphans",
+    "fit_neckline_contact",
     "fit_edge_alpha_final",
     "fit_seam_residual",
 )
@@ -126,6 +127,18 @@ ORPHAN_ERROR_MARGIN = 12
 ORPHAN_REDUNDANT_MAX_ERROR = 18
 ORPHAN_REDUNDANT_RATIO = 0.70
 ORPHAN_FRINGE_PX = 2
+
+# The collar opening is a special ownership boundary.  A garment can be
+# connected to its main mass while still carrying a skin-coloured inner band,
+# and a neck can carry a lower matte that should be hidden by the collar.  This
+# pass is deliberately a narrow, source-guided alpha solve; it does not grow
+# the whole garment or trim the whole neck.
+NECKLINE_CONTACT_BAND_PX = 6
+NECKLINE_CONTACT_COLOR_MARGIN = 12
+NECKLINE_CONTACT_MIN_CONTRAST = 18
+NECKLINE_CONTACT_MIN_ALPHA_DELTA = 0.04
+NECKLINE_CONTACT_MAX_ALPHA_STEP = 0.45
+NECKLINE_CONTACT_MIN_IMPROVEMENT = 2
 
 def reclaim_occluded(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarray, *,
                      pairs: tuple[tuple[str, str], ...] = RECLAIM_PAIRS,
@@ -568,6 +581,215 @@ def clean_garment_orphans(
     return out, report
 
 
+def fit_neckline_contact(
+    layer_dict: dict[str, np.ndarray],
+    original_rgba: np.ndarray,
+    *,
+    topwear_tag: str = "topwear",
+    neck_tag: str = "neck",
+    order: tuple[str, ...] = SEMANTIC_Z_ORDER,
+    band: int = NECKLINE_CONTACT_BAND_PX,
+    color_margin: int = NECKLINE_CONTACT_COLOR_MARGIN,
+    min_contrast: int = NECKLINE_CONTACT_MIN_CONTRAST,
+    min_alpha_delta: float = NECKLINE_CONTACT_MIN_ALPHA_DELTA,
+    max_alpha_step: float = NECKLINE_CONTACT_MAX_ALPHA_STEP,
+    alpha_threshold: int = ORPHAN_ALPHA_THRESHOLD,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """Repair only the static neck/inner-collar ownership contact.
+
+    The candidate band is extracted from *topwear pixels near neck alpha*;
+    pixels elsewhere in either semantic are never touched.  For each
+    candidate, the original still chooses between the garment colour (front)
+    and the already-composited layers below topwear (which include neck).
+    Solving the required front alpha handles both directions: a collar edge
+    can underlap the neck matte, while a skin-coloured garment residue can be
+    softened to reveal a genuinely low neckline.  Facial layers above the
+    garment are excluded because they cannot be affected by this pass.
+
+    Every proposed change is checked against the exact full-canvas static
+    reconstruction score.  If a collective proposal is not safe, connected
+    contact components are tried independently; ambiguous components remain
+    unchanged and are reported for inspection.
+    """
+    original = np.asarray(original_rgba)
+    if original.ndim != 3 or original.shape[-1] != 4:
+        raise ValueError("original_rgba must be HxWx4")
+    topwear = layer_dict.get(topwear_tag)
+    neck = layer_dict.get(neck_tag)
+    if topwear is None or neck is None:
+        return dict(layer_dict), {"skipped": "missing topwear or neck"}
+
+    shape = original.shape[:2]
+    topwear = np.asarray(topwear)
+    neck = np.asarray(neck)
+    garment = topwear[..., 3] > alpha_threshold
+    neck_mask = neck[..., 3] > alpha_threshold
+    if not garment.any() or not neck_mask.any():
+        return dict(layer_dict), {"skipped": "empty topwear or neck"}
+
+    band = max(1, int(band))
+    distance_to_neck = cv2.distanceTransform(
+        (~neck_mask).astype(np.uint8), cv2.DIST_L2, 3)
+    contact = garment & (distance_to_neck <= float(band))
+    contact &= original[..., 3] > alpha_threshold
+
+    # Do not let a face/head layer make a proposal appear useful when it is
+    # already the visible owner.  A tiny antialiasing tail is tolerated.
+    rank = {tag: index for index, tag in enumerate(order)}
+    top_rank = rank.get(topwear_tag, -1)
+    above_cover = np.zeros(shape, np.float32)
+    for tag, layer in layer_dict.items():
+        if rank.get(tag, -1) <= top_rank:
+            continue
+        above_cover = np.maximum(
+            above_cover, np.asarray(layer)[..., 3].astype(np.float32) / 255.0)
+    contact &= above_cover <= 0.10
+    if not contact.any():
+        return dict(layer_dict), {
+            "band_px": int(contact.sum()),
+            "skipped": "contact is covered by a higher semantic",
+        }
+
+    ordered = sorted(layer_dict, key=lambda tag: rank.get(tag, -1))
+    below = {
+        tag: np.asarray(layer_dict[tag])
+        for tag in ordered
+        if rank.get(tag, -1) < top_rank
+    }
+    beneath = composite_layers(below, shape, order=order)
+    beneath_rgb = beneath[..., :3].astype(np.float32)
+    front_rgb = topwear[..., :3].astype(np.float32)
+    source_rgb = original[..., :3].astype(np.float32)
+    source_error = np.abs(source_rgb - front_rgb).sum(axis=2)
+    beneath_error = np.abs(source_rgb - beneath_rgb).sum(axis=2)
+    current_pair = front_rgb * (topwear[..., 3:4].astype(np.float32) / 255.0)
+    current_pair += beneath_rgb * (1.0 - topwear[..., 3:4].astype(np.float32) / 255.0)
+    current_error = np.abs(source_rgb - current_pair).sum(axis=2)
+
+    delta = front_rgb - beneath_rgb
+    denominator = (delta * delta).sum(axis=2)
+    desired = ((source_rgb - beneath_rgb) * delta).sum(axis=2) / np.maximum(
+        denominator, 1.0)
+    desired = np.clip(desired, 0.0, 1.0)
+    current_alpha = topwear[..., 3].astype(np.float32) / 255.0
+    solved_pair = front_rgb * desired[..., None] + beneath_rgb * (1.0 - desired[..., None])
+    solved_error = np.abs(source_rgb - solved_pair).sum(axis=2)
+
+    # Source colour must decisively explain the original better than the neck
+    # side.  This is what protects a low neckline and valid collar ornaments;
+    # proximity or smallness alone never changes ownership.
+    evidence = (
+        contact
+        & (denominator >= float(min_contrast * min_contrast))
+        & (source_error + float(color_margin) < beneath_error)
+        & (np.abs(desired - current_alpha) >= float(min_alpha_delta))
+        & (solved_error + float(NECKLINE_CONTACT_MIN_IMPROVEMENT) < current_error)
+    )
+    if not evidence.any():
+        return dict(layer_dict), {
+            "band_px": int(contact.sum()),
+            "candidate_px": 0,
+            "status": "kept",
+            "reason": "original does not decisively prefer topwear ownership",
+        }
+
+    # Fade toward the interior edge of the local band.  This creates an
+    # underlap/soft handoff without introducing a second hard line.
+    falloff = np.clip(1.0 - distance_to_neck / float(band), 0.0, 1.0)
+    falloff = falloff * falloff * (3.0 - 2.0 * falloff)
+    proposed_alpha = current_alpha + np.clip(
+        desired - current_alpha, -float(max_alpha_step), float(max_alpha_step)
+    ) * falloff
+    changed = evidence & (np.abs(proposed_alpha - current_alpha) >= 1.0 / 255.0)
+    if not changed.any():
+        return dict(layer_dict), {
+            "band_px": int(contact.sum()),
+            "candidate_px": int(evidence.sum()),
+            "status": "kept",
+            "reason": "sub-pixel alpha proposal",
+        }
+
+    def proposal(mask: np.ndarray) -> dict[str, np.ndarray]:
+        patched = np.array(topwear, copy=True)
+        alpha = current_alpha.copy()
+        alpha[mask] = proposed_alpha[mask]
+        patched[..., 3] = np.rint(np.clip(alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
+        result = dict(layer_dict)
+        result[topwear_tag] = patched
+        return result
+
+    before_score = _static_reconstruction_score(layer_dict, original, order)
+    working = dict(layer_dict)
+    accepted = np.zeros_like(changed)
+    rejected = np.zeros_like(changed)
+
+    # First try the complete local band.  If independent collar pieces have
+    # opposing evidence, fall back to exact connected-component gates.
+    collective = proposal(changed)
+    collective_score = _static_reconstruction_score(collective, original, order)
+    if collective_score <= before_score:
+        working = collective
+        accepted = changed
+        after_score = collective_score
+    else:
+        count, labels, _, _ = cv2.connectedComponentsWithStats(
+            changed.astype(np.uint8), 8)
+        after_score = before_score
+        for index in range(1, count):
+            component = labels == index
+            tentative = dict(working)
+            current_component = np.asarray(working[topwear_tag])
+            patched = np.array(current_component, copy=True)
+            alpha = patched[..., 3].astype(np.float32) / 255.0
+            alpha[component] = proposed_alpha[component]
+            patched[..., 3] = np.rint(np.clip(alpha, 0.0, 1.0) * 255.0).astype(np.uint8)
+            tentative[topwear_tag] = patched
+            score = _static_reconstruction_score(tentative, original, order)
+            if score <= after_score:
+                working = tentative
+                after_score = score
+                accepted |= component
+            else:
+                rejected |= component
+
+    report: dict[str, Any] = {
+        "band_px": int(contact.sum()),
+        "candidate_px": int(evidence.sum()),
+        "changed_px": int(changed.sum()),
+        "accepted_px": int(accepted.sum()),
+        "rejected_px": int(rejected.sum()),
+        "rgb_error_delta": int(after_score[0] - before_score[0]),
+        "bad_px_delta": int(after_score[1] - before_score[1]),
+        "band_px_at_reference": NECKLINE_CONTACT_BAND_PX,
+    }
+    # Keep a narrow before/after comparison alongside the global exact gate so
+    # a long horizontal neckline seam remains auditable even when its pixels
+    # are diluted by the rest of the portrait.
+    before_composite = composite_layers(layer_dict, shape, order=order)
+    after_composite = composite_layers(working, shape, order=order)
+    before_error = np.abs(
+        original[..., :3].astype(np.int32)
+        - before_composite[..., :3].astype(np.int32)
+    ).sum(axis=2)[contact]
+    after_error = np.abs(
+        original[..., :3].astype(np.int32)
+        - after_composite[..., :3].astype(np.int32)
+    ).sum(axis=2)[contact]
+    if before_error.size:
+        report.update({
+            "contact_mae_before": round(float(before_error.mean()), 3),
+            "contact_mae_after": round(float(after_error.mean()), 3),
+            "contact_bad_ratio_before": round(
+                float((before_error > 60).mean()), 6),
+            "contact_bad_ratio_after": round(
+                float((after_error > 60).mean()), 6),
+        })
+    report["status"] = "applied" if accepted.any() else "ambiguous"
+    if rejected.any():
+        report["warning"] = "some contact components failed static non-regression gate"
+    return working, report
+
+
 def fit_edge_alpha(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarray, *,
                    order: tuple[str, ...] = SEMANTIC_Z_ORDER,
                    alpha_threshold: int = 10, band: int = EDGE_BAND_PX,
@@ -784,6 +1006,10 @@ def repair_portrait_layers(layer_dict: dict[str, np.ndarray],
         outside=scale_length(EDGE_OUTSIDE_PX, shape),
     )
     working, orphan_cleanup = clean_garment_orphans(working, original_rgba)
+    working, neckline_contact = fit_neckline_contact(
+        working, original_rgba,
+        band=scale_length(NECKLINE_CONTACT_BAND_PX, shape),
+    )
     # Cleanup can alter an ownership edge. Refit edge coverage against the
     # final owner set, then fit its colour residual. This is deliberately a
     # second narrow-band solve, not a broad re-application of tone fitting.
@@ -806,6 +1032,7 @@ def repair_portrait_layers(layer_dict: dict[str, np.ndarray],
             "fit_layer_tone": tone_fit,
             "fit_edge_alpha": edge_fit,
             "clean_garment_orphans": orphan_cleanup,
+            "fit_neckline_contact": neckline_contact,
             "fit_edge_alpha_final": final_edge_fit,
             "fit_seam_residual": seam_fit,
         },
