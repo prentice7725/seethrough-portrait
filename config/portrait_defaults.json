@@ -30,5 +30,11 @@
     "soft_pass_post_coverage_min": 0.999,
     "soft_pass_remainder_max": 0.2,
     "post_spill_max": 0.002
+  },
+  "head_rescue": {
+    "enabled": true,
+    "ladder": [896, 1024],
+    "max_escalations": 2,
+    "sclera_warning": "missing_visible_eyewhite"
   }
 }

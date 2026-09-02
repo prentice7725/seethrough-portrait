@@ -11,6 +11,7 @@ from PIL import Image
 
 from .generation import PortraitPipelineResult
 from .image import composite_fidelity, composite_layers
+from .occlusion_graph import compute_occlusion_graph
 from .repair import REPAIR_ORDER, REPAIR_VERSION
 from .ownership import OWNERSHIP_VERSION
 from .seams import RUN_SLACK_PX, seam_report_layers
@@ -123,6 +124,13 @@ def save_portrait_bundle(output_dir: str, result: PortraitPipelineResult, *,
     local_report = dict(result.report.get("local_fidelity") or {})
     _write_json(os.path.join(output_dir, *local_relative.split("/")), local_report)
     diagnostic_paths["local_fidelity"] = local_relative
+
+    # Diagnostic-only and purely additive: no inference model, no effect on
+    # `layers/`, repair order, or any existing diagnostics file.
+    occlusion_relative = "diagnostics/occlusion_graph.json"
+    occlusion_graph = compute_occlusion_graph(canonical)
+    _write_json(os.path.join(output_dir, *occlusion_relative.split("/")), occlusion_graph)
+    diagnostic_paths["occlusion_graph"] = occlusion_relative
 
     error = np.abs(result.fullpage[..., :3].astype(np.int32)
                    - composite[..., :3].astype(np.int32)).sum(axis=2)
