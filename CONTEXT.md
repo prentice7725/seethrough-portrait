@@ -45,6 +45,13 @@ The downstream transformation from a Portrait Bundle into derived motion
 parts, anchors, depth, meshes, weights, expressions, and a Rig Bundle. It never
 modifies canonical Portrait Bundle layers and never performs fidelity repair.
 
+## Research absorption
+
+External research and tooling ideas are only ever absorbed as proposal/critic
+backends behind a deterministic validator, never as a replacement for
+See-through or canonical repair order. Status of that effort:
+[`docs/RESEARCH_ABSORPTION_STATUS.md`](docs/RESEARCH_ABSORPTION_STATUS.md).
+
 ## Legacy run
 
 The flat directory format emitted before Portrait Bundle v1. A legacy adapter

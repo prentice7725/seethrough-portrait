@@ -26,7 +26,8 @@ downstream consumer such as `portrait-autorig`.
    ├─ spill_mask.png
    ├─ reconstruction.png
    ├─ layer_composite.png
-   └─ composite_error.png
+   ├─ composite_error.png
+   └─ occlusion_graph.json    # optional
 ```
 
 ## Invariants
@@ -49,6 +50,11 @@ downstream consumer such as `portrait-autorig`.
   evidence; it is not a motion or rig-readiness policy.
 - `semantics.warnings` records observable producer-side semantic omissions,
   such as `missing_eyewhite`. It is not a rig-readiness or motion verdict.
+- `diagnostics/occlusion_graph.json`, when present, records which canonical
+  layers touch, how much one hides of the other, and a static
+  `disocclusion_risk` score derived only from measured alpha overlap and
+  z-order (no rig, motion, or deformation-safety verdict). A consumer must
+  treat its absence as "not computed", never as "no occlusion".
 - A consumer must reject an unknown major format version.
 - A consumer must never run fidelity repair when
   `layer_contract.canonical_stage` is `production_repaired`.

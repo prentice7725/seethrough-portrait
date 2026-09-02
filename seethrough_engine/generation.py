@@ -66,6 +66,7 @@ from .layers import (
     layer_similarity,
     make_preview,
 )
+from .eyewhite_derivation import derive_missing_eyewhite
 from .repair import repair_portrait_layers
 from .semantic import semantic_warnings
 from .image import composite_layers
@@ -130,6 +131,65 @@ def fit_unet_on(unet, device, offload_device, *,
     return True
 
 
+def diffuse_head_stage(pipeline, device, rng, run_layer_dict, input_img, scale, pad_pos,
+                       resolution, head_resolution, head_embeds, head_pooled,
+                       num_inference_steps, *, vae_mode_override: str | None = None,
+                       vae_runtime_events: list[dict[str, Any]] | None = None,
+                       log: Callable[[str], None] = _NOOP_LOG) -> dict[str, np.ndarray]:
+    """Re-diffuse only the v3 head crop on its own `head_resolution` square
+    canvas, and paste the result back onto the body `resolution` canvas.
+
+    Extracted from `run_diffusion_stage`'s v3 head branch so a caller that
+    already has a body pass's `run_layer_dict` (for the `head` layer's bbox)
+    can re-run just this stage without repeating the body pass -- e.g. the
+    head-only semantic rescue ladder in `run_portrait_pipeline`, which never
+    re-diffuses the body just to try the head at a different resolution.
+    Returns `{}` if the body pass's `head` layer has no visible pixels to
+    crop around (mirrors the original inline guard exactly).
+    """
+    head_resolution = int(head_resolution)
+    head_img = run_layer_dict.get("head")
+    if head_img is None:
+        return {}
+    nz = cv2.findNonZero((head_img[..., -1] > 15).astype(np.uint8))
+    if nz is None:
+        return {}
+    hx0, hy0, hw, hh = cv2.boundingRect(nz)
+    hx = int(hx0 * scale) - pad_pos[0]
+    hy = int(hy0 * scale) - pad_pos[1]
+    input_head, (hx1, hy1, hx2, hy2) = crop_head(input_img, [hx, hy, int(hw * scale), int(hh * scale)])
+    hx1 = int(hx1 / scale + pad_pos[0] / scale)
+    hy1 = int(hy1 / scale + pad_pos[1] / scale)
+    ih, iw = input_head.shape[:2]
+    input_head, head_pad_size, head_pad_pos = vendor.center_square_pad_resize(
+        input_head, head_resolution, return_pad_info=True)
+
+    out = run_with_vae_runtime(
+        pipeline, device, head_resolution, "head",
+        lambda: pipeline(
+            strength=1.0, num_inference_steps=num_inference_steps, batch_size=1,
+            generator=rng, guidance_scale=1.0,
+            prompt_embeds=head_embeds, pooled_prompt_embeds=head_pooled,
+            fullpage=input_head, group_index=1,
+        ),
+        force_mode=vae_mode_override, telemetry=vae_runtime_events, log=log,
+    )
+    log(f"v3 head diffusion complete ({head_resolution}px head canvas)")
+
+    canvas = np.zeros((resolution, resolution, 4), dtype=np.uint8)
+    coords = np.array([head_pad_pos[1], head_pad_pos[1] + ih, head_pad_pos[0], head_pad_pos[0] + iw])
+    py1, py2, px1, px2 = (coords / scale).astype(np.int64)
+    scale_size = (int(head_pad_size[0] / scale), int(head_pad_size[1] / scale))
+
+    head_layer_dict: dict[str, np.ndarray] = {}
+    for rst, tag in zip(out.images, VALID_BODY_PARTS_V3_HEAD):
+        rst = vendor.smart_resize(rst, scale_size)[py1:py2, px1:px2]
+        full = canvas.copy()
+        full[hy1:hy1 + rst.shape[0], hx1:hx1 + rst.shape[1]] = rst
+        head_layer_dict[tag] = full
+    return head_layer_dict
+
+
 def run_diffusion_stage(pipeline, device, rng, tag_version, num_inference_steps, fullpage,
                          *, prompt_embeds=None, pooled_prompt_embeds=None,
                          body_embeds=None, body_pooled=None, head_embeds=None, head_pooled=None,
@@ -189,42 +249,12 @@ def run_diffusion_stage(pipeline, device, rng, tag_version, num_inference_steps,
         for rst, tag in zip(out.images, VALID_BODY_PARTS_V3_BODY):
             run_layer_dict[tag] = rst
 
-        if enable_head_detail and "head" in run_layer_dict:
-            head_img = run_layer_dict["head"]
-            nz = cv2.findNonZero((head_img[..., -1] > 15).astype(np.uint8))
-            if nz is not None:
-                hx0, hy0, hw, hh = cv2.boundingRect(nz)
-                hx = int(hx0 * scale) - pad_pos[0]
-                hy = int(hy0 * scale) - pad_pos[1]
-                input_head, (hx1, hy1, hx2, hy2) = crop_head(input_img, [hx, hy, int(hw * scale), int(hh * scale)])
-                hx1 = int(hx1 / scale + pad_pos[0] / scale)
-                hy1 = int(hy1 / scale + pad_pos[1] / scale)
-                ih, iw = input_head.shape[:2]
-                input_head, head_pad_size, head_pad_pos = vendor.center_square_pad_resize(
-                    input_head, head_resolution, return_pad_info=True)
-
-                out = run_with_vae_runtime(
-                    pipeline, device, head_resolution, "head",
-                    lambda: pipeline(
-                        strength=1.0, num_inference_steps=num_inference_steps, batch_size=1,
-                        generator=rng, guidance_scale=1.0,
-                        prompt_embeds=head_embeds, pooled_prompt_embeds=head_pooled,
-                        fullpage=input_head, group_index=1,
-                    ),
-                    force_mode=vae_mode_override, telemetry=vae_runtime_events, log=log,
-                )
-                log(f"v3 head diffusion complete ({head_resolution}px head canvas)")
-
-                canvas = np.zeros((resolution, resolution, 4), dtype=np.uint8)
-                coords = np.array([head_pad_pos[1], head_pad_pos[1] + ih, head_pad_pos[0], head_pad_pos[0] + iw])
-                py1, py2, px1, px2 = (coords / scale).astype(np.int64)
-                scale_size = (int(head_pad_size[0] / scale), int(head_pad_size[1] / scale))
-
-                for rst, tag in zip(out.images, VALID_BODY_PARTS_V3_HEAD):
-                    rst = vendor.smart_resize(rst, scale_size)[py1:py2, px1:px2]
-                    full = canvas.copy()
-                    full[hy1:hy1 + rst.shape[0], hx1:hx1 + rst.shape[1]] = rst
-                    run_layer_dict[tag] = full
+        if enable_head_detail:
+            run_layer_dict.update(diffuse_head_stage(
+                pipeline, device, rng, run_layer_dict, input_img, scale, pad_pos,
+                resolution, head_resolution, head_embeds, head_pooled, num_inference_steps,
+                vae_mode_override=vae_mode_override, vae_runtime_events=vae_runtime_events, log=log,
+            ))
 
     return run_layer_dict
 
@@ -246,6 +276,169 @@ class PortraitPipelineResult:
     ownership_report: dict[str, Any] = field(default_factory=dict)
     all_runs_layers: list[dict[str, Any]] = field(default_factory=list)
     selection_trace: tuple = ()
+
+
+# Default ladder for the head-only semantic rescue below. Overridable via
+# `portrait_defaults.json`'s `head_rescue.ladder` -- if a future corpus shows
+# 896 buys nothing, drop it there without touching code.
+HEAD_RESCUE_DEFAULT_LADDER: tuple[int, ...] = (896, 1024)
+HEAD_RESCUE_DEFAULT_MAX_ESCALATIONS = 2
+HEAD_RESCUE_DEFAULT_SCLERA_WARNING = "missing_visible_eyewhite"
+
+
+def _head_rescue_ladder(requested_head_resolution: int, ladder: list[int],
+                        max_escalations: int) -> list[int]:
+    """Profiles from `ladder` strictly larger than what was already tried,
+    ascending, capped at `max_escalations`. Pure and GPU-free on purpose --
+    this is the one piece of the rescue policy worth unit-testing directly."""
+    candidates = sorted(r for r in ladder if r > requested_head_resolution)
+    return candidates[:max_escalations]
+
+
+def _mean_eye_bad_ratio(local_report: dict[str, Any]) -> float:
+    eyes = local_report.get("eyes") or []
+    if not eyes:
+        return 1.0
+    return sum(float(eye["bad_ratio"]) for eye in eyes) / len(eyes)
+
+
+def _better_head_local_fidelity(current: dict[str, Any], candidate: dict[str, Any], *,
+                                sclera_warning: str) -> bool:
+    """Compare two `local_fidelity_report()` results for the rescue ladder.
+
+    A result where the sclera-loss warning is gone always beats one where it
+    persists, regardless of eye MAE; between two results that agree on that,
+    the lower mean eye `bad_ratio` wins. Mouth/neckline never enter this
+    decision -- the ladder only ever re-diffuses head/face tags, so a
+    mouth-only fluctuation between attempts is not this decision's business.
+    """
+    current_bad = sclera_warning in (current.get("warnings") or [])
+    candidate_bad = sclera_warning in (candidate.get("warnings") or [])
+    if current_bad != candidate_bad:
+        return not candidate_bad
+    return _mean_eye_bad_ratio(candidate) < _mean_eye_bad_ratio(current)
+
+
+@dataclass(frozen=True)
+class HeadRescueOutcome:
+    layers: dict[str, np.ndarray]
+    report: dict[str, Any]
+
+
+def _rescue_head_semantic(
+    layer_dict: dict[str, np.ndarray],
+    fullpage: np.ndarray,
+    *,
+    pipeline, device, input_img: np.ndarray, scale: float, pad_pos,
+    resolution: int, requested_head_resolution: int,
+    head_embeds, head_pooled, num_inference_steps: int, seed: int,
+    vae_mode_override: str | None, vae_runtime_events: list[dict[str, Any]] | None,
+    config: PortraitConfig, log: Callable[[str], None],
+) -> HeadRescueOutcome:
+    """Escalate head-only re-diffusion only when the original visibly shows a
+    sclera the model failed to draw, and keep whichever head result actually
+    reconstructs the eyes best.
+
+    No head resolution is "safe" in general: measured on real portraits, the
+    model can skip `eyewhite` at 768 on one character and draw it fine at the
+    same resolution on another, or need 1024 where 768 failed. Resolution
+    alone buys nothing; what decides is whether *this* head result, judged
+    against the original, still shows the loss `local_fidelity`'s sclera
+    check already knows how to see (`_sclera_observation` in
+    `local_fidelity.py`: visible in the original around the iris, absent from
+    the composite -- a closed or stylised-shut eye never triggers this, so
+    those portraits never pay for a retry). Only the head crop re-diffuses;
+    the body pass, already ~half the run's total time, never repeats.
+    """
+    cfg = config.raw.get("head_rescue")
+    cfg = cfg if isinstance(cfg, dict) else {}
+    if not cfg.get("enabled", True):
+        return HeadRescueOutcome(layer_dict, {"enabled": False})
+
+    sclera_warning = str(cfg.get("sclera_warning", HEAD_RESCUE_DEFAULT_SCLERA_WARNING))
+    shape = fullpage.shape[:2]
+    best_layers = layer_dict
+    best_report = local_fidelity_report(fullpage, composite_layers(best_layers, shape), best_layers)
+    attempts: list[dict[str, Any]] = []
+
+    derived_info: dict[str, Any] = {"attempted": False, "used": False, "derived_px": 0, "reason": "not_needed"}
+    if sclera_warning not in (best_report.get("warnings") or []):
+        return HeadRescueOutcome(best_layers, {
+            "enabled": True, "requested_head_resolution": requested_head_resolution,
+            "derived_eyewhite": derived_info, "attempts": attempts, "resolved": True,
+            "final_head_resolution": requested_head_resolution,
+        })
+
+    # Attempt 0: cheap (no GPU call) and, when it succeeds, exact rather than
+    # another generative guess -- copy the sclera straight from the original
+    # wherever the evidence around the existing `irides` layer is decisive.
+    # Tried before any resolution escalation, never instead of the fidelity
+    # gate below: a derived patch only survives if it actually helps.
+    derive_result = derive_missing_eyewhite(best_layers, fullpage)
+    derived_info = {
+        "attempted": True, "used": False,
+        "derived_px": derive_result.derived_px, "reason": derive_result.reason,
+    }
+    if derive_result.layer is not None:
+        candidate_layers = {**best_layers, "eyewhite": derive_result.layer}
+        candidate_report = local_fidelity_report(
+            fullpage, composite_layers(candidate_layers, shape), candidate_layers)
+        if _better_head_local_fidelity(best_report, candidate_report, sclera_warning=sclera_warning):
+            best_layers, best_report = candidate_layers, candidate_report
+            derived_info["used"] = True
+        resolved = sclera_warning not in (best_report.get("warnings") or [])
+        log(f"Head rescue: derived eyewhite from ground truth ({derive_result.derived_px}px) -- "
+            f"{'resolved' if resolved else 'used but not enough' if derived_info['used'] else 'rejected, no improvement'}")
+        if resolved:
+            return HeadRescueOutcome(best_layers, {
+                "enabled": True, "requested_head_resolution": requested_head_resolution,
+                "derived_eyewhite": derived_info, "attempts": attempts, "resolved": True,
+                "final_head_resolution": requested_head_resolution,
+            })
+
+    ladder = _head_rescue_ladder(
+        requested_head_resolution,
+        [int(r) for r in cfg.get("ladder", HEAD_RESCUE_DEFAULT_LADDER)],
+        int(cfg.get("max_escalations", HEAD_RESCUE_DEFAULT_MAX_ESCALATIONS)),
+    )
+    final_resolution = requested_head_resolution
+    for candidate_resolution in ladder:
+        log(f"Head rescue: {sclera_warning} at {final_resolution}px, "
+            f"retrying head only at {candidate_resolution}px")
+        # Same seed at every rung: resolution is the only variable this
+        # ladder is testing, not luck from a fresh draw.
+        rng = torch.Generator(device=device).manual_seed(seed)
+        head_layers = diffuse_head_stage(
+            pipeline, device, rng, layer_dict, input_img, scale, pad_pos,
+            resolution, candidate_resolution, head_embeds, head_pooled, num_inference_steps,
+            vae_mode_override=vae_mode_override, vae_runtime_events=vae_runtime_events, log=log,
+        )
+        candidate_layers = {**best_layers, **head_layers}
+        candidate_report = local_fidelity_report(
+            fullpage, composite_layers(candidate_layers, shape), candidate_layers)
+        candidate_bad = sclera_warning in (candidate_report.get("warnings") or [])
+        attempts.append({
+            "head_resolution": candidate_resolution,
+            "missing_visible_eyewhite": candidate_bad,
+            "eyes_bad_ratio_mean": round(_mean_eye_bad_ratio(candidate_report), 6),
+        })
+        if _better_head_local_fidelity(best_report, candidate_report, sclera_warning=sclera_warning):
+            best_layers, best_report, final_resolution = candidate_layers, candidate_report, candidate_resolution
+        resolved = sclera_warning not in (best_report.get("warnings") or [])
+        log(f"Head rescue at {candidate_resolution}px: "
+            f"{'resolved' if not candidate_bad else 'still missing'}, "
+            f"adopted={final_resolution == candidate_resolution}")
+        if resolved:
+            break
+
+    return HeadRescueOutcome(best_layers, {
+        "enabled": True,
+        "requested_head_resolution": requested_head_resolution,
+        "derived_eyewhite": derived_info,
+        "attempts": attempts,
+        "resolved": sclera_warning not in (best_report.get("warnings") or []),
+        "final_head_resolution": final_resolution,
+    })
 
 
 def run_portrait_pipeline(
@@ -351,6 +544,25 @@ def run_portrait_pipeline(
 
     layer_dict = _diffuse(seed)
     all_runs_layers = [{"run": 1, "seed": seed, "layer_dict": dict(layer_dict)}] if auto_fill else []
+
+    # No head resolution is "safe" on its own -- see `_rescue_head_semantic`.
+    # Runs before mask/coverage resolution so everything downstream (guard,
+    # repair, auto-fill) sees whichever head result actually reconstructed
+    # the eyes best.
+    head_rescue_outcome: HeadRescueOutcome | None = None
+    if tag_version == "v3" and enable_head_detail:
+        head_rescue_outcome = _rescue_head_semantic(
+            layer_dict, fullpage,
+            pipeline=pipeline, device=device, input_img=input_img, scale=scale, pad_pos=pad_pos,
+            resolution=resolution, requested_head_resolution=int(head_resolution or resolution),
+            head_embeds=head_embeds, head_pooled=head_pooled,
+            num_inference_steps=num_inference_steps, seed=seed,
+            vae_mode_override=vae_mode_override, vae_runtime_events=vae_runtime_events,
+            config=portrait_config, log=log,
+        )
+        layer_dict = head_rescue_outcome.layers
+        if all_runs_layers:
+            all_runs_layers[0]["layer_dict"] = dict(layer_dict)
 
     # Unlike nodes.py's portrait branch, `fullpage` here can carry a real
     # source alpha channel: ComfyUI's IMAGE type is RGB-only (which is why
@@ -475,6 +687,9 @@ def run_portrait_pipeline(
     )
     report["semantic"]["warnings"] = semantic_warnings(layer_dict, fullpage)
     report["run"]["vae_runtime"] = vae_runtime_events
+    report["run"]["head_rescue"] = (
+        head_rescue_outcome.report if head_rescue_outcome is not None else {"enabled": False}
+    )
     ownership_report = ownership_result.report if ownership_result is not None else {
         "version": "disabled",
         "initial_missing_px": int(final_guard.metrics.missing_area_px),

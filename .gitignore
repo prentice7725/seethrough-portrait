@@ -44,6 +44,8 @@ docs/*
 !docs/TEST_PROTOCOL_A001.md
 !docs/M2_IMPLEMENTATION_SPEC.md
 !docs/PORTRAIT_AUTO_RIG_FEASIBILITY_v0.1.md
+!docs/RESEARCH_ABSORPTION_STATUS.md
+!docs/RESOLUTION_HEURISTICS_AUDIT.md
 # The seam guard compares against this; without it in the repo there is nothing
 # for a change to be measured against on a fresh clone.
 !docs/seam_baseline.json

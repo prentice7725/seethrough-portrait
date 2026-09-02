@@ -370,22 +370,39 @@ def build_app() -> gr.Blocks:
                 )
                 with gr.Row():
                     seed_in = gr.Number(label="시드", value=42, precision=0)
-                    resolution_in = gr.Slider(
-                        label="해상도", minimum=512, maximum=2048, step=64, value=768
+                    resolution_in = gr.Dropdown(
+                        label="해상도",
+                        choices=[
+                            ("512 · Fast", "512"),
+                            ("640 · Faster", "640"),
+                            ("768 · Standard", "768"),
+                            ("896 · High", "896"),
+                            ("1024 · Very High", "1024"),
+                        ],
+                        value="768",
                     )
                 head_res_in = gr.Dropdown(
                     label="얼굴 디테일 해상도",
-                    choices=[HEAD_RES_MATCH, "640", "768", "1024", "1280"],
+                    choices=[
+                        (HEAD_RES_MATCH, HEAD_RES_MATCH),
+                        ("640 · Fast", "640"),
+                        ("768 · Standard", "768"),
+                        ("896 · High", "896"),
+                        ("1024 · Very High", "1024"),
+                        ("1280", "1280"),
+                    ],
                     value="768",
                     info=(
                         "v3 얼굴 단계는 머리 영역을 별도 정사각형 캔버스에서 다시 "
-                        "확산합니다. 이 값이 작은 얼굴 semantic 레이어의 생성 여부를 "
-                        "결정합니다. A-001에서는 512에서 eyewhite가 누락되고 composite "
-                        "MAE가 15.1이지만, 768에서는 11.9로 생성됩니다. 본문 해상도는 "
-                        "512로 두고 얼굴만 768로 설정하면 전체 본문 비용 없이 디테일을 "
-                        "확보할 수 있습니다. 피크 VRAM은 둘 중 큰 해상도를 따릅니다. "
-                        "A002는 1024 얼굴 단계에서 회귀가 확인되어 768을 검증된 안전 "
-                        "프로필로 사용하며, 눈 로컬 fidelity가 소실을 표시합니다."
+                        "확산합니다. 이 값이 작은 얼굴 semantic 레이어(눈·코·입 등)의 "
+                        "생성 여부를 좌우합니다. 다만 어떤 해상도가 안전한지는 캐릭터마다 "
+                        "다릅니다 — 특정 해상도가 항상 잘 되는 게 아니라, 매 생성마다 원본과 "
+                        "비교해 판정합니다. 여기서 고른 값은 시작점일 뿐이고, 원본에는 흰자위가 "
+                        "보이는데 생성 결과에서 소실된 경우 먼저 원본 픽셀에서 직접 채워보고 "
+                        "(GPU 재확산 없음), 그래도 안 되면 이 값보다 높은 해상도로 얼굴만 "
+                        "(본문은 다시 돌리지 않고) 자동으로 최대 2단계 재시도합니다 — "
+                        "config/portrait_defaults.json의 head_rescue로 끄거나 사다리를 "
+                        "바꿀 수 있습니다. 피크 VRAM은 본문·얼굴 중 큰 해상도를 따릅니다."
                     ),
                 )
                 steps_in = gr.Slider(
