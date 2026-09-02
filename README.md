@@ -37,9 +37,11 @@ Spine exporter와 브라우저 runtime은 별도
 - **Portrait-aware auto-fill** — coverage와 필수 semantic group을 기준으로 최대
   5회 실행 중 최선의 레이어 조합을 선택합니다.
 - **Fidelity repair** — `reclaim_occluded → fit_layer_tone → fit_edge_alpha →
-  clean_garment_orphans → fit_edge_alpha_final → fit_seam_residual` 순서로
+  clean_garment_orphans → fit_edge_alpha_final → fit_mouth_contact →
+  fit_seam_residual` 순서로
   정지화면을 원본과 맞추고, garment의 고립 semantic contamination을
-  보수적으로 제거합니다.
+  보수적으로 제거합니다. `fit_mouth_contact`는 입 주변의 국소 skin matte를
+  face 쪽으로 정리하거나 원본 기준 alpha를 다시 풀어 halo를 줄입니다.
 - **Static validation** — 전체 composite fidelity와 가늘고 긴 seam을 별도로
   측정합니다.
 - **Semantic ownership recovery** — 누락 픽셀을 곧바로

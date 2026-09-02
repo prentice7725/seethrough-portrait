@@ -12,6 +12,7 @@ from seethrough_engine.repair import (
     clean_garment_orphans,
     fit_edge_alpha,
     fit_layer_tone,
+    fit_mouth_contact,
     fit_seam_residual,
     reclaim_occluded,
     repair_portrait_layers,
@@ -128,6 +129,54 @@ class ToneFitTests(unittest.TestCase):
         out, _ = fit_layer_tone(layers, original)
         for tag in layers:
             self.assertTrue(np.array_equal(out[tag][..., 3], layers[tag][..., 3]))
+
+
+class MouthContactTests(unittest.TestCase):
+    """A mouth matte may surround the drawing, but the face owns the skin."""
+
+    def scene(self):
+        original = np.zeros((CANVAS, CANVAS, 4), dtype=np.uint8)
+        original[20:100, 20:108, :3] = (224, 178, 158)
+        original[20:100, 20:108, 3] = 255
+        face = np.array(original, copy=True)
+        mouth = np.zeros_like(original)
+        # Deliberately oversized skin-coloured matte around the real drawing.
+        cv2 = __import__("cv2")
+        mask = np.zeros((CANVAS, CANVAS), np.uint8)
+        cv2.ellipse(mask, (64, 54), (15, 10), 0, 0, 360, 255, -1)
+        mouth[..., :3] = (196, 142, 126)
+        mouth[..., 3] = mask
+        # The actual mouth drawing is valid and matches the original exactly.
+        original[50:54, 54:74, :3] = (72, 42, 45)
+        original[54:59, 55:73, :3] = (190, 112, 108)
+        mouth[50:54, 54:74, :3] = original[50:54, 54:74, :3]
+        mouth[54:59, 55:73, :3] = original[54:59, 55:73, :3]
+        return original, {"face": face, "mouth": mouth}
+
+    def test_only_local_matte_is_reduced_and_core_is_preserved(self):
+        original, layers = self.scene()
+        raw_snapshot = {tag: image.copy() for tag, image in layers.items()}
+        before = composite_layers(layers, (CANVAS, CANVAS))
+        out, report = fit_mouth_contact(layers, original, band=5)
+        after = composite_layers(out, (CANVAS, CANVAS))
+        self.assertEqual(report["status"], "applied")
+        self.assertLess(int((out["mouth"][..., 3] < layers["mouth"][..., 3]).sum()), 500)
+        self.assertTrue((out["mouth"][51:57, 57:71, 3] > 200).all())
+        self.assertLessEqual(
+            int(np.abs(original[..., :3].astype(int) - after[..., :3].astype(int)).sum()),
+            int(np.abs(original[..., :3].astype(int) - before[..., :3].astype(int)).sum()),
+        )
+        for tag, image in layers.items():
+            np.testing.assert_array_equal(image, raw_snapshot[tag])
+
+    def test_ambiguous_feature_is_left_untouched(self):
+        original, layers = self.scene()
+        # If the original agrees with the matte, no ownership change is needed.
+        mask = layers["mouth"][..., 3] > 10
+        original[mask, :3] = layers["mouth"][mask, :3]
+        out, report = fit_mouth_contact(layers, original, band=5)
+        self.assertEqual(report["status"], "unchanged")
+        np.testing.assert_array_equal(out["mouth"], layers["mouth"])
 
 
 class SeamResidualTests(unittest.TestCase):

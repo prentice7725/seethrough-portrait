@@ -17,13 +17,14 @@ from .image import composite_fidelity, composite_layers
 from .scale import canvas_scale, odd_kernel, scale_area, scale_length
 from .semantic import SEMANTIC_Z_ORDER
 
-REPAIR_VERSION = "1.6"
+REPAIR_VERSION = "1.7"
 REPAIR_ORDER = (
     "reclaim_occluded",
     "fit_layer_tone",
     "fit_edge_alpha",
     "clean_garment_orphans",
     "fit_edge_alpha_final",
+    "fit_mouth_contact",
     "fit_seam_residual",
 )
 
@@ -126,6 +127,17 @@ ORPHAN_ERROR_MARGIN = 12
 ORPHAN_REDUNDANT_MAX_ERROR = 18
 ORPHAN_REDUNDANT_RATIO = 0.70
 ORPHAN_FRINGE_PX = 2
+
+# Mouth is a feature layer, but model output can include a soft skin-coloured
+# matte around the drawing.  Only the narrow raster contact band is eligible;
+# the interior (lip/teeth/outline) is never globally trimmed.
+MOUTH_CONTACT_BAND_PX = 5
+MOUTH_ALPHA_DROP = 0.08
+MOUTH_ORIGINAL_MARGIN = 8
+MOUTH_MIN_CONTRAST = 12
+MOUTH_HALO_ERROR_MIN = 15
+MOUTH_HALO_MIN_LUMA = 110
+MOUTH_HALO_MAX_CHROMA = 100
 
 def reclaim_occluded(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarray, *,
                      pairs: tuple[tuple[str, str], ...] = RECLAIM_PAIRS,
@@ -568,6 +580,191 @@ def clean_garment_orphans(
     return out, report
 
 
+def fit_mouth_contact(
+    layer_dict: dict[str, np.ndarray],
+    original_rgba: np.ndarray,
+    *,
+    mouth_tag: str = "mouth",
+    order: tuple[str, ...] = SEMANTIC_Z_ORDER,
+    band: int = MOUTH_CONTACT_BAND_PX,
+    alpha_threshold: int = ORPHAN_ALPHA_THRESHOLD,
+    alpha_drop: float = MOUTH_ALPHA_DROP,
+    original_margin: int = MOUTH_ORIGINAL_MARGIN,
+    min_contrast: int = MOUTH_MIN_CONTRAST,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """Remove a skin-coloured matte from the mouth's local contact band.
+
+    The raw mouth layer is allowed to contain the complete drawing, including
+    antialiasing.  What is not production-safe is an opaque skin patch around
+    that drawing: because ``mouth`` is in front of ``face``, it becomes a
+    visible oval in the canonical composite.  The original still is the
+    ground truth.  For each boundary pixel we solve the alpha that blends the
+    mouth colour over the stack beneath it to reproduce the original, and only
+    accept decreases that make the underlying stack explain the pixel better.
+
+    This is deliberately local and feature-agnostic: no rig/depth knowledge,
+    no global trim, and no connected-component deletion.  A full-canvas exact
+    reconstruction gate rejects any ambiguous proposal.
+    """
+    out = dict(layer_dict)
+    mouth = out.get(mouth_tag)
+    if mouth is None:
+        return out, {"status": "missing"}
+    original = np.asarray(original_rgba)
+    if original.ndim != 3 or original.shape[-1] != 4:
+        raise ValueError("original_rgba must be an HxWx4 canvas")
+    arr = np.asarray(mouth)
+    if arr.shape != original.shape:
+        raise ValueError("mouth layer and original must share an HxWx4 canvas")
+
+    strong = arr[..., 3] > alpha_threshold
+    if not strong.any():
+        return out, {"status": "empty"}
+    ys, xs = np.where(strong)
+    band = max(1, int(band))
+    # Estimate the actual drawing from original-vs-underlay contrast. A
+    # percentile keeps this independent of canvas resolution and avoids a
+    # fixed RGB cutoff. The remaining connected matte is eligible only in a
+    # narrow neighbourhood of that drawing.
+    beneath_for_core = dict(out)
+    beneath_for_core.pop(mouth_tag, None)
+    core_base = composite_layers(
+        beneath_for_core, original.shape[:2], order=order,
+        alpha_threshold=alpha_threshold)[..., :3].astype(np.float32)
+    core_score = np.abs(
+        original[..., :3].astype(np.float32) - core_base
+    ).sum(axis=2)
+    core_cut = float(np.percentile(core_score[strong], 75.0))
+    drawing_core = strong & (core_score >= core_cut)
+    if not drawing_core.any():
+        drawing_core = strong
+    core_neighbourhood = cv2.dilate(
+        drawing_core.astype(np.uint8),
+        cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * band + 1,) * 2),
+    ).astype(bool) & strong
+    contact = core_neighbourhood & ~drawing_core
+
+    # Pixels hidden by a semantic later in the z-order cannot be explained by
+    # the mouth and are not safe to edit.
+    rank = {tag: index for index, tag in enumerate(order)}
+    mouth_rank = rank.get(mouth_tag, -1)
+    visible_owner = np.asarray(arr)[..., 3] > 128
+    for tag, image in out.items():
+        if rank.get(tag, -1) > mouth_rank:
+            visible_owner &= ~(np.asarray(image)[..., 3] > 128)
+    contact &= visible_owner
+    if not contact.any():
+        return out, {"status": "no_visible_contact"}
+
+    beneath = dict(out)
+    beneath.pop(mouth_tag, None)
+    base = composite_layers(beneath, original.shape[:2], order=order,
+                            alpha_threshold=alpha_threshold)
+    current = composite_layers(out, original.shape[:2], order=order,
+                               alpha_threshold=alpha_threshold)
+    O = original[..., :3].astype(np.float32)
+    B = base[..., :3].astype(np.float32)
+    M = arr[..., :3].astype(np.float32)
+    C = current[..., :3].astype(np.float32)
+    alpha = arr[..., 3].astype(np.float32) / 255.0
+    delta = M - B
+    denominator = (delta * delta).sum(axis=2)
+    solvable = contact & (denominator > 3.0 * float(min_contrast) ** 2)
+    desired = np.clip(((O - B) * delta).sum(axis=2)
+                      / np.maximum(denominator, 1e-6), 0.0, 1.0)
+    current_error = np.abs(O - C).sum(axis=2)
+    beneath_error = np.abs(O - B).sum(axis=2)
+    candidate = (
+        solvable
+        & (desired + float(alpha_drop) < alpha)
+        & (beneath_error + float(original_margin) < current_error)
+    )
+
+    # A skin-coloured halo can be darker than the (already imperfect) face
+    # beneath it, so simply clearing it would worsen RGB fidelity.  Transfer
+    # that narrow-band contribution into `face` instead.  The transfer is an
+    # exact semantic ownership change: the rendered pixels stay the same, but
+    # downstream consumers no longer mistake the matte for mouth artwork.
+    face = out.get("face")
+    halo = (
+        (strong & ~core_neighbourhood) & visible_owner & (face is not None)
+        & (np.abs(O - M).sum(axis=2) > float(MOUTH_HALO_ERROR_MIN))
+        & (M.mean(axis=2) >= float(MOUTH_HALO_MIN_LUMA))
+        & ((M.max(axis=2) - M.min(axis=2)) <= float(MOUTH_HALO_MAX_CHROMA))
+    )
+
+    report: dict[str, Any] = {
+        "status": "unchanged",
+        "bbox_xywh": [int(xs.min()), int(ys.min()),
+                       int(xs.max() - xs.min() + 1),
+                       int(ys.max() - ys.min() + 1)],
+        "contact_px": int(contact.sum()),
+        "drawing_core_px": int(drawing_core.sum()),
+        "core_cut_rgb_error": round(core_cut, 3),
+        "candidate_px": int(candidate.sum()),
+        "halo_candidate_px": int(halo.sum()),
+    }
+    if not candidate.any() and not halo.any():
+        return out, report
+
+    tentative = dict(out)
+    transferred_px = 0
+    if halo.any() and face is not None:
+        transferred_face = _merge_semantic_ownership(
+            np.asarray(face), arr, halo, owner_is_front=False)
+        tentative["face"] = transferred_face
+        transferred_mouth = np.array(arr, copy=True)
+        transferred_mouth[halo] = 0
+        tentative[mouth_tag] = transferred_mouth
+        transferred_px = int(halo.sum())
+
+    # Recompute the beneath stack after any ownership transfer, then apply the
+    # original-vs-composite alpha solve only to candidates not already moved.
+    remaining = candidate & ~halo
+    if remaining.any():
+        beneath_after = dict(tentative)
+        beneath_after.pop(mouth_tag, None)
+        base_after = composite_layers(
+            beneath_after, original.shape[:2], order=order,
+            alpha_threshold=alpha_threshold)[..., :3].astype(np.float32)
+        mouth_after = np.asarray(tentative[mouth_tag])
+        delta_after = mouth_after[..., :3].astype(np.float32) - base_after
+        den_after = (delta_after * delta_after).sum(axis=2)
+        desired_after = np.clip(
+            ((O - base_after) * delta_after).sum(axis=2)
+            / np.maximum(den_after, 1e-6), 0.0, 1.0)
+        alpha_after = mouth_after[..., 3].astype(np.float32) / 255.0
+        patched = np.array(mouth_after, copy=True)
+        patched[..., 3] = np.where(
+            remaining,
+            np.rint(np.minimum(alpha_after, desired_after) * 255.0),
+            mouth_after[..., 3],
+        ).astype(np.uint8)
+        tentative[mouth_tag] = patched
+
+    before_score = _static_reconstruction_score(out, original, order)
+    after_score = _static_reconstruction_score(tentative, original, order)
+    # Exact gate: a local improvement must not trade for a regression elsewhere
+    # or increase the count of visibly bad pixels.
+    if after_score[0] > before_score[0] or after_score[1] > before_score[1]:
+        report.update(status="rejected", reason="virtual ownership change worsened reconstruction",
+                      rgb_error_delta=int(after_score[0] - before_score[0]),
+                      bad_px_delta=int(after_score[1] - before_score[1]))
+        return out, report
+
+    out = tentative
+    report.update(
+        status="applied",
+        changed_px=int((candidate | halo).sum()),
+        transferred_px=transferred_px,
+        alpha_drop_mean=round(float((alpha[remaining] - desired[remaining]).mean()), 4)
+        if remaining.any() else 0.0,
+        rgb_error_delta=int(after_score[0] - before_score[0]),
+        bad_px_delta=int(after_score[1] - before_score[1]),
+    )
+    return out, report
+
+
 def fit_edge_alpha(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarray, *,
                    order: tuple[str, ...] = SEMANTIC_Z_ORDER,
                    alpha_threshold: int = 10, band: int = EDGE_BAND_PX,
@@ -792,6 +989,10 @@ def repair_portrait_layers(layer_dict: dict[str, np.ndarray],
         band=scale_length(EDGE_BAND_PX, shape),
         outside=scale_length(EDGE_OUTSIDE_PX, shape),
     )
+    working, mouth_contact = fit_mouth_contact(
+        working, original_rgba,
+        band=scale_length(MOUTH_CONTACT_BAND_PX, shape),
+    )
     working, seam_fit = fit_seam_residual(
         working, original_rgba,
         band=scale_length(SEAM_BAND_PX, shape),
@@ -807,6 +1008,7 @@ def repair_portrait_layers(layer_dict: dict[str, np.ndarray],
             "fit_edge_alpha": edge_fit,
             "clean_garment_orphans": orphan_cleanup,
             "fit_edge_alpha_final": final_edge_fit,
+            "fit_mouth_contact": mouth_contact,
             "fit_seam_residual": seam_fit,
         },
     )

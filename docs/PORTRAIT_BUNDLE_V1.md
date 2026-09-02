@@ -43,8 +43,10 @@ downstream consumer such as `portrait-autorig`.
   repair prevents newly transferred source pixels from biasing tone/seam fits.
 - The fidelity-repair order is fixed: `reclaim_occluded`, `fit_layer_tone`,
   `fit_edge_alpha`, `clean_garment_orphans`, `fit_edge_alpha_final`,
-  `fit_seam_residual`. The final narrow edge and seam fits therefore evaluate
-  the published neck/garment ownership boundary.
+  `fit_mouth_contact`, `fit_seam_residual`. The mouth stage is a local static
+  ownership/alpha solve for skin-coloured mouth mattes; it has no rig or
+  motion knowledge, and the final seam fit evaluates the published ownership
+  boundaries.
 - `diagnostics/local_fidelity.json` measures eyes, mouth, and the local
   neck/garment contact band. It reports source-visible loss and static seam
   evidence; it is not a motion or rig-readiness policy.
