@@ -33,6 +33,11 @@ a hard LayerStyle dependency are **DO NOT DO** (plan section 21/"결정 요약")
   pipeline.** Run it manually (`python -m experimental.source_reprojection
   <bundle_dir> <output_dir>`) to get a comparison report; nothing about
   production output changes until a future phase promotes this.
+- **P0 closeout contract** — [`P0_CLOSEOUT_V0.2.md`](P0_CLOSEOUT_V0.2.md)
+  freezes producer-order semantics, diagnostic-only occlusion output, the
+  regression seed `42` versus the deterministic-auto schedule, and the
+  cleanup/recovery repair priority. These policies add metadata and guards;
+  they do not add Composer or AutoRig responsibilities.
 
 ## Deferred (P1 — plan §17 Phase D–F)
 
