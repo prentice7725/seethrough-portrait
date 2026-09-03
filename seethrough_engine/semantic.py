@@ -1,8 +1,9 @@
 """Canonical semantic portrait tag policy.
 
-This module belongs to static portrait production.  Exporters and repair use
+This module belongs to static portrait production. Exporters and repair use
 the same back-to-front order, while rig-specific subdivisions are deliberately
-absent from it.
+absent from it. ``SEMANTIC_Z_ORDER`` is the producer reconstruction order for
+the source portrait, never a downstream character's final draw-order policy.
 """
 
 from __future__ import annotations

@@ -9,7 +9,7 @@ from typing import Any
 import numpy as np
 from PIL import Image
 
-from .generation import PortraitPipelineResult
+from .generation import CANONICAL_REGRESSION_SEED, PortraitPipelineResult
 from .image import composite_fidelity, composite_layers
 from .occlusion_graph import compute_occlusion_graph
 from .repair import REPAIR_ORDER, REPAIR_VERSION
@@ -163,6 +163,17 @@ def save_portrait_bundle(output_dir: str, result: PortraitPipelineResult, *,
     diagnostic_paths["seams"] = seams_relative
 
     tag_version = str(report.get("source", {}).get("tag_version", ""))
+    run_metadata = dict(report.get("run") or {})
+    generation_metadata: dict[str, Any] = {
+        "seed_mode": str(run_metadata.get("seed_mode", "regression")),
+        "attempt_index": int(run_metadata.get("attempt_index", 0)),
+        "seed": int(run_metadata.get("seed", CANONICAL_REGRESSION_SEED)),
+        "canonical_regression_seed": int(
+            run_metadata.get("canonical_regression_seed", CANONICAL_REGRESSION_SEED)
+        ),
+    }
+    if run_metadata.get("source_identity"):
+        generation_metadata["source_identity"] = str(run_metadata["source_identity"])
     manifest: dict[str, Any] = {
         "format": BUNDLE_FORMAT,
         "version": BUNDLE_VERSION,
@@ -180,6 +191,7 @@ def save_portrait_bundle(output_dir: str, result: PortraitPipelineResult, *,
             "warnings": observed_semantic_warnings,
         },
         "original": "original.png",
+        "generation": generation_metadata,
         "layers": layer_entries,
         "raw_layers": raw_entries,
         "layer_contract": {

@@ -63,6 +63,12 @@ def test_bundle_publishes_repaired_layers_and_keeps_raw_forensics(tmp_path):
     assert manifest["layer_contract"]["fidelity_repair"]["version"] == REPAIR_VERSION
     assert manifest["layer_contract"]["fidelity_repair"]["order"] == list(REPAIR_ORDER)
     assert manifest["layer_contract"]["semantic_ownership"]["stage"] == "post_repair_pre_remainder"
+    assert manifest["generation"] == {
+        "seed_mode": "regression",
+        "attempt_index": 0,
+        "seed": 42,
+        "canonical_regression_seed": 42,
+    }
     assert manifest["validation"]["local_fidelity"] == "pass"
     assert manifest["semantics"]["warnings"] == []
     assert "rig" not in manifest

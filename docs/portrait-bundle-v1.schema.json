@@ -3,7 +3,7 @@
   "$id": "https://github.com/prentice7725/seethrough-portrait/blob/main/docs/portrait-bundle-v1.schema.json",
   "title": "Portrait Bundle v1",
   "type": "object",
-  "required": ["format", "version", "canvas", "semantics", "original", "layers", "layer_contract", "diagnostics", "validation"],
+  "required": ["format", "version", "canvas", "semantics", "original", "generation", "layers", "layer_contract", "diagnostics", "validation"],
   "properties": {
     "format": {"const": "portrait-bundle"},
     "version": {"type": "string", "pattern": "^1\\.[0-9]+$"},
@@ -35,6 +35,18 @@
       "additionalProperties": false
     },
     "original": {"type": "string", "pattern": "^original\\.png$"},
+    "generation": {
+      "type": "object",
+      "required": ["seed_mode", "attempt_index", "seed", "canonical_regression_seed"],
+      "properties": {
+        "seed_mode": {"enum": ["regression", "deterministic_auto"]},
+        "attempt_index": {"type": "integer", "minimum": 0},
+        "seed": {"type": "integer", "minimum": 0},
+        "canonical_regression_seed": {"const": 42},
+        "source_identity": {"type": "string", "minLength": 1}
+      },
+      "additionalProperties": false
+    },
     "layers": {
       "type": "object",
       "additionalProperties": {
@@ -74,7 +86,7 @@
           "properties": {
             "version": {"type": "string"},
             "order": {
-              "const": ["reclaim_occluded", "fit_layer_tone", "fit_edge_alpha", "fit_seam_residual", "clean_garment_orphans"]
+              "const": ["reclaim_occluded", "fit_layer_tone", "fit_edge_alpha", "clean_garment_orphans", "fit_edge_alpha_final", "fit_mouth_contact", "fit_seam_residual"]
             },
             "report": {"type": "string", "pattern": "^diagnostics/fidelity\\.json$"}
           },

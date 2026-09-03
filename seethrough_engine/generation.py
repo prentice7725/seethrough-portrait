@@ -17,6 +17,7 @@ inference stack).
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 from typing import Any, Callable
 
 import cv2
@@ -86,8 +87,25 @@ __all__ = [
     "fit_unet_on",
     "run_diffusion_stage",
     "run_portrait_pipeline",
+    "deterministic_seed",
     "PortraitPipelineResult",
 ]
+
+CANONICAL_REGRESSION_SEED = 42
+SEED_MODE_REGRESSION = "regression"
+SEED_MODE_DETERMINISTIC_AUTO = "deterministic_auto"
+SEED_MODES = (SEED_MODE_REGRESSION, SEED_MODE_DETERMINISTIC_AUTO)
+
+
+def deterministic_seed(source_identity: str, attempt_index: int) -> int:
+    """Return a reproducible production seed for one source/attempt pair."""
+    if not isinstance(source_identity, str) or not source_identity:
+        raise ValueError("source_identity must be a non-empty string")
+    if int(attempt_index) < 0:
+        raise ValueError("attempt_index must be non-negative")
+    payload = f"{source_identity}\0{int(attempt_index)}".encode("utf-8")
+    # Keep the result in torch's portable signed 32-bit seed range.
+    return int.from_bytes(hashlib.sha256(payload).digest()[:8], "big") % (2**31 - 1)
 
 _NOOP_LOG: Callable[[str], None] = lambda msg: None
 
@@ -446,6 +464,9 @@ def run_portrait_pipeline(
     input_img_rgba: np.ndarray,
     *,
     seed: int = 42,
+    seed_mode: str = SEED_MODE_REGRESSION,
+    attempt_index: int = 0,
+    source_identity: str | None = None,
     resolution: int = 1280,
     head_resolution: int | None = None,
     num_inference_steps: int = 30,
@@ -479,10 +500,24 @@ def run_portrait_pipeline(
     offload_device = offload_device or resolve_offload_device()
     portrait_config = portrait_config or PortraitConfig.load()
 
-    seed_everything(seed)
     input_img = np.asarray(input_img_rgba)
     if input_img.ndim != 3 or input_img.shape[-1] != 4:
         raise ValueError(f"input_img_rgba must be HxWx4, got {input_img.shape}")
+    seed_mode = str(seed_mode)
+    if seed_mode not in SEED_MODES:
+        raise ValueError(f"Unknown seed_mode {seed_mode!r}; expected one of {SEED_MODES}")
+    attempt_index = int(attempt_index)
+    if attempt_index < 0:
+        raise ValueError("attempt_index must be non-negative")
+    if source_identity is None:
+        source_identity = hashlib.sha256(
+            np.ascontiguousarray(input_img).tobytes()
+        ).hexdigest()
+    if seed_mode == SEED_MODE_DETERMINISTIC_AUTO:
+        seed = deterministic_seed(source_identity, attempt_index)
+    else:
+        seed = int(seed)
+    seed_everything(seed)
 
     fullpage, pad_size, pad_pos = vendor.center_square_pad_resize(input_img, resolution, return_pad_info=True)
     scale = pad_size[0] / resolution
@@ -543,7 +578,10 @@ def run_portrait_pipeline(
         )
 
     layer_dict = _diffuse(seed)
-    all_runs_layers = [{"run": 1, "seed": seed, "layer_dict": dict(layer_dict)}] if auto_fill else []
+    all_runs_layers = [{
+        "run": 1, "seed": seed, "attempt_index": attempt_index,
+        "seed_mode": seed_mode, "layer_dict": dict(layer_dict),
+    }] if auto_fill else []
 
     # No head resolution is "safe" on its own -- see `_rescue_head_semantic`.
     # Runs before mask/coverage resolution so everything downstream (guard,
@@ -598,12 +636,22 @@ def run_portrait_pipeline(
         if needs_improvement:
             raw_runs = [dict(layer_dict)]
             for run_idx in range(2, max_runs + 1):
-                run_seed = seed + run_idx - 1
+                run_attempt_index = attempt_index + run_idx - 1
+                run_seed = (
+                    deterministic_seed(source_identity, run_attempt_index)
+                    if seed_mode == SEED_MODE_DETERMINISTIC_AUTO
+                    else seed + run_idx - 1
+                )
                 log(f"Auto-fill run {run_idx}/{max_runs} (seed={run_seed})")
                 seed_everything(run_seed)
                 run_layer_dict = _diffuse(run_seed)
                 raw_runs.append(dict(run_layer_dict))
-                all_runs_layers.append({"run": run_idx, "seed": run_seed, "layer_dict": dict(run_layer_dict)})
+                all_runs_layers.append({
+                    "run": run_idx, "seed": run_seed,
+                    "attempt_index": run_attempt_index,
+                    "seed_mode": seed_mode,
+                    "layer_dict": dict(run_layer_dict),
+                })
 
                 selected = select_best_layer_set(
                     raw_runs, fullpage, portrait_mask, config=portrait_config,
@@ -671,6 +719,10 @@ def run_portrait_pipeline(
         },
         run={
             "seed": int(seed),
+            "seed_mode": seed_mode,
+            "attempt_index": attempt_index,
+            "canonical_regression_seed": CANONICAL_REGRESSION_SEED,
+            "source_identity": source_identity,
             "resolution": int(resolution),
         "head_resolution": int(head_resolution or resolution),
             "steps": int(num_inference_steps),

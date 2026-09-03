@@ -37,6 +37,13 @@ downstream consumer such as `portrait-autorig`.
 - Coordinates use a top-left origin with Y increasing downward.
 - RGB is sRGB and alpha is straight (unpremultiplied).
 - `layers/` contains `production_repaired` canonical layers.
+- `semantics.z_order` is the producer's reconstruction order for this source
+  portrait. It is not a downstream character's final draw order; consumers may
+  adapt it for composition.
+- `generation` records the reproducibility source: `regression` keeps the
+  canonical seed (42), while `deterministic_auto` derives a stable seed from
+  `source_identity` and `attempt_index`. Recommended production modes are one
+  attempt for NORMAL, three for QUALITY, and five for HARVEST.
 - After existing semantic layers complete fidelity repair, missing subject
   pixels pass through conservative semantic ownership recovery. Only
   unresolved residual becomes `body_remainder`. Keeping recovery after fitted
@@ -64,6 +71,20 @@ downstream consumer such as `portrait-autorig`.
   for missing canonical layers.
 - Rig-specific subdivisions such as `head_remainder`, `neck_remainder`, and
   left/right eye splits are forbidden in the canonical layer set.
+
+## Repair and recovery policy
+
+Cleanup repair (edge/seam fitting, alpha fringe cleanup, and conservative
+ownership cleanup) may run on every producer result. Semantic recovery that
+invents or derives a missing tag is lower priority and follows this ladder:
+
+1. real semantic from the current attempt;
+2. real semantic from another deterministic attempt;
+3. source-backed conservative derivation;
+4. heuristic emergency fallback.
+
+The producer reports these observations but does not emit rig-readiness or
+motion policy. This is the Portrait Bundle v1 P0 freeze contract.
 
 The machine-readable schema is
 [`portrait-bundle-v1.schema.json`](portrait-bundle-v1.schema.json).

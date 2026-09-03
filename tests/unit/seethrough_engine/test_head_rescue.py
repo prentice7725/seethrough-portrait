@@ -16,10 +16,19 @@ import numpy as np
 
 from portrait_core import PortraitConfig
 from seethrough_engine.generation import (
+    deterministic_seed,
     _better_head_local_fidelity,
     _head_rescue_ladder,
     _rescue_head_semantic,
 )
+
+
+def test_deterministic_seed_schedule_is_stable_and_attempt_specific():
+    first = deterministic_seed("a002-neutral", 0)
+    assert first == deterministic_seed("a002-neutral", 0)
+    assert first != deterministic_seed("a002-neutral", 1)
+    assert first != deterministic_seed("other-source", 0)
+    assert 0 <= first < 2**31 - 1
 
 CANVAS = 32
 RING_RGB = (235, 233, 230)   # bright, low-chroma -- a visible sclera

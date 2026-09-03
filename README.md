@@ -30,6 +30,9 @@ Spine exporter와 브라우저 runtime은 별도
 있습니다. 두 프로젝트 사이에는 Python import 의존성이 없으며 파일 계약만
 공유합니다.
 
+P0 producer contract freeze는 [`docs/P0_CLOSEOUT_V0.2.md`](docs/P0_CLOSEOUT_V0.2.md)에
+기록되어 있습니다.
+
 ## Portrait Mode
 
 - **Silhouette Guard** — 피사체 밖의 spill을 자르고 누락된 원본 픽셀을
