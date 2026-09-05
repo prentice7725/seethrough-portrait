@@ -1,10 +1,8 @@
-"""Standalone single-image Portrait Mode webui (M2).
+"""Standalone SeeThrough Portrait producer WebUI.
 
 No ComfyUI required. Launches a Gradio app that runs Portrait Mode end to
-end on one uploaded image -- diffusion decomposition, the Silhouette Guard,
-and a verdict/diagnostics report -- and lets you download the layers and
-report. This is the M2 exit-condition tool: "A-001 can be run and exported
-from the UI" (see docs/M2_IMPLEMENTATION_SPEC.md).
+end on one uploaded image -- diffusion decomposition, canonical repair,
+static validation, and diagnostics -- and lets you download a Portrait Bundle.
 
 Usage:
     python -m pip install -r webui/requirements.txt
@@ -13,8 +11,8 @@ Usage:
 
 Model loading, diffusion, and export all go through `seethrough_engine`, the
 same ComfyUI-independent core `nodes.py` delegates to -- so a result from
-this webui and a result from the ComfyUI node graph, given the same seed and
-settings, come from one implementation, not two.
+this webui and a result from the ComfyUI node graph come from one producer
+implementation, not two.
 """
 
 from __future__ import annotations
@@ -121,7 +119,14 @@ def _prepare_subject_image(image_rgba: np.ndarray, has_provided_mask: bool,
     threshold = float(alpha_cfg["binary_threshold"]) * 255.0
     fill = bbox_fill_ratio(image_rgba[..., 3] > threshold)
     if fill < float(alpha_cfg["informative_bbox_fill_max"]):
-        return image_rgba  # already has a usable matte
+        # A usable alpha can still carry the original light background in its
+        # soft edge pixels (most visible around dark hair and arm/body gaps).
+        # Repair that local RGB fringe without re-keying the whole image.
+        repaired, info = matting.repair_existing_alpha_edge(image_rgba)
+        if info.get("changed_px", 0):
+            log(f"Repaired {info['changed_px']} transparent-edge pixels near "
+                f"background rgb{tuple(info['background'])}")
+        return repaired
 
     if has_provided_mask:
         return image_rgba  # the mask supplies what the alpha does not
@@ -187,18 +192,65 @@ def _zip_run(out_dir: Path) -> str:
     return archive_path
 
 
-def run_a001(
+def _profile_settings(profile: str) -> tuple[int, bool]:
+    """Map the production-facing profile to deterministic attempt policy."""
+    settings = {"NORMAL": (1, False), "QUALITY": (3, True), "HARVEST": (5, True)}
+    try:
+        return settings[str(profile).upper()]
+    except KeyError as error:
+        raise gr.Error("Production Profile must be NORMAL, QUALITY, or HARVEST.") from error
+
+
+def _validation_summary(manifest: dict, report: dict) -> str:
+    validation = manifest.get("validation") or {}
+    labels = {
+        "static_reconstruction": "Static Reconstruction",
+        "seams": "Seams",
+        "local_fidelity": "Local Fidelity",
+    }
+    rows = "\n".join(
+        f"<tr><td>{labels[key]}</td><td><strong>{str(validation.get(key, 'UNKNOWN')).upper()}</strong></td></tr>"
+        for key in labels
+    )
+    warnings = manifest.get("semantics", {}).get("warnings") or []
+    diagnostic = str(report.get("verdict", "UNKNOWN"))
+    return (
+        '<div style="padding:12px;border:1px solid #d1d5db;border-radius:8px">'
+        "<h3 style=\"margin-top:0\">PORTRAIT BUNDLE</h3>"
+        f"<table><tbody>{rows}</tbody></table>"
+        f"<p><strong>Semantic Warnings</strong> {len(warnings)}"
+        f" &nbsp; <strong>Diagnostic Summary</strong> {diagnostic}</p></div>"
+    )
+
+
+def _detail_reports(out_dir: Path, manifest: dict, report: dict) -> str:
+    validation = manifest.get("validation") or {}
+    warnings = manifest.get("semantics", {}).get("warnings") or []
+    generation = manifest.get("generation") or {}
+    lines = [
+        "### Detail Reports",
+        f"- Static Fidelity: **{str(validation.get('static_reconstruction', 'UNKNOWN')).upper()}**",
+        f"- Local Fidelity: **{str(validation.get('local_fidelity', 'UNKNOWN')).upper()}**",
+        f"- Seams: **{str(validation.get('seams', 'UNKNOWN')).upper()}**",
+        f"- Semantic Warnings: `{', '.join(warnings) if warnings else 'none'}`",
+        f"- Seed: `{generation.get('seed', 'n/a')}` · mode `{generation.get('seed_mode', 'n/a')}` · attempt `{generation.get('attempt_index', 'n/a')}`",
+    ]
+    return "\n".join(lines)
+
+
+def run_portrait(
     image,
     model_name,
-    seed,
-    resolution,
-    num_inference_steps,
-    enable_head_detail,
-    silhouette_guard,
-    auto_fill,
+    profile,
     subject_mask,
     key_background,
+    resolution,
+    num_inference_steps,
     head_resolution,
+    seed_mode,
+    manual_seed,
+    enable_head_detail,
+    disable_guard,
     progress=gr.Progress(track_tqdm=True),
 ):
     if image is None:
@@ -246,20 +298,30 @@ def run_a001(
         head_px = int(resolution) if head_resolution == HEAD_RES_MATCH else int(head_resolution)
         _log(f"Diffusing: body {int(resolution)}px, head {head_px}px")
         progress(0.15, desc="Running diffusion + Silhouette Guard (this is the slow part)...")
+        attempts, auto_fill = _profile_settings(profile)
+        resolved_seed_mode = str(seed_mode)
+        if resolved_seed_mode not in {"deterministic_auto", "regression"}:
+            raise gr.Error("Reproducibility must be Production or Regression.")
         result = run_portrait_pipeline(
             pipeline,
             image_rgba,
-            seed=int(seed),
+            seed=int(manual_seed),
+            seed_mode=resolved_seed_mode,
             resolution=int(resolution),
             head_resolution=None if head_resolution == HEAD_RES_MATCH else int(head_resolution),
             num_inference_steps=int(num_inference_steps),
             enable_head_detail=bool(enable_head_detail),
             auto_fill=bool(auto_fill),
-            silhouette_guard=bool(silhouette_guard),
+            max_runs=int(attempts),
+            silhouette_guard=not bool(disable_guard),
             provided_subject_mask=provided_mask,
             portrait_config=PortraitConfig.load(),
             seed_everything=_seed_everything,
             log=_log,
+            # Keep the 8GB-safe baseline until a fresh-pipeline A/B proves an
+            # async offload setting is both faster and memory-stable.
+            offload_non_blocking=True,
+            offload_record_stream=False,
         )
 
         progress(0.9, desc="Saving outputs...")
@@ -283,11 +345,11 @@ def run_a001(
                      "alpha-only and cannot see this.")
 
         layer_gallery = [
-            (str(out_dir / info["path"]), tag)
+            (str(out_dir / info["path"]), f"CANONICAL · {tag}")
             for tag, info in sorted(manifest["layers"].items())
         ]
         diagnostics_gallery = [
-            (str(out_dir / filename), name)
+            (str(out_dir / filename), f"DIAGNOSTIC · {name}")
             for name, filename in manifest["diagnostics"].items()
             if filename.lower().endswith(".png")
         ]
@@ -300,11 +362,12 @@ def run_a001(
 
         progress(1.0, desc="Done")
         return (
-            _verdict_badge(report["verdict"]),
+            _validation_summary(manifest, report),
             _coverage_table(report["coverage"]),
-            reasons_md,
+            "### Diagnostic Summary\n" + reasons_md,
             layer_gallery,
             diagnostics_gallery,
+            _detail_reports(out_dir, manifest, report),
             zip_path,
             "\n".join(log_lines),
         )
@@ -331,117 +394,107 @@ def build_app() -> gr.Blocks:
     with gr.Blocks(title="SeeThrough Portrait") as demo:
         gr.Markdown(
             "# SeeThrough Portrait\n"
-            "인물 이미지 한 장을 레이어로 분해하고 Silhouette Guard를 적용해 "
-            "PASS / SOFT_PASS / REWORK / FAIL 결과를 확인합니다. ComfyUI는 필요하지 않습니다."
-        )
-        gr.Markdown(
-            "다운로드 파일은 검증과 fidelity repair가 끝난 canonical 레이어를 담은 "
-            "**Portrait Bundle v1**입니다. 애니메이션 제작은 별도 `portrait-autorig` "
-            "프로젝트에서 이 Bundle을 사용합니다."
+            "Source Portrait → validated **Portrait Bundle v1**\n\n"
+            "이 화면은 정적 semantic portrait asset을 만드는 producer입니다. "
+            "Composer가 donor·variant·draw order를 조립하고, 별도 `portrait-autorig`가 "
+            "mesh·weight·deformation을 담당합니다."
         )
 
         with gr.Row():
             with gr.Column(scale=1):
                 image_in = gr.Image(
-                    label="인물 이미지 (투명 배경 PNG 권장)",
-                    type="numpy",
-                    image_mode="RGBA",
+                    label="Source Portrait (투명 배경 PNG 권장)",
+                    type="numpy", image_mode="RGBA",
+                )
+                subject_mask_in = gr.Image(
+                    label="Subject Mask (선택 · 흰색 = 피사체)",
+                    type="numpy", image_mode="L",
                 )
                 key_bg_in = gr.Checkbox(
                     label="단색 배경을 투명 처리",
                     value=True,
+                    info="불투명한 단색 배경을 피사체 alpha로 바꿉니다. 실제 RGBA나 마스크가 있으면 필요 없습니다.",
+                )
+                profile_in = gr.Radio(
+                    label="Production Profile",
+                    choices=["NORMAL", "QUALITY", "HARVEST"],
+                    value="NORMAL",
                     info=(
-                        "RGBA를 만들 수 없는 모델의 이미지용 옵션입니다. 단색 배경을 "
-                        "찾아 제거하고, 머리카락 가장자리는 반투명도로 추정해 색 테두리가 "
-                        "남지 않게 합니다. 업로드 이미지에 실제 알파 마스크가 있으면 적용하지 않습니다."
+                        "NORMAL=1회 표준 생성 · QUALITY=3회 deterministic 후보 비교 · "
+                        "HARVEST=5회 후보 생성(Composer harvest가 아님)"
                     ),
                 )
-                subject_mask_in = gr.Image(
-                    label="피사체 마스크 (선택, 흰색 = 피사체 · 불투명 배경용)",
-                    type="numpy",
-                    image_mode="L",
+                run_btn = gr.Button("Generate Portrait Bundle", variant="primary")
+
+            with gr.Column(scale=1):
+                validation_out = gr.HTML(label="Bundle validation")
+                coverage_out = gr.Markdown(label="Coverage")
+                report_zip_out = gr.File(label="Portrait Bundle 다운로드 (.zip)")
+
+        with gr.Accordion("Advanced", open=False):
+            model_in = gr.Dropdown(
+                label="Model checkpoint", choices=model_choices, value=model_choices[0],
+            )
+            with gr.Row():
+                resolution_in = gr.Dropdown(
+                    label="해상도",
+                    choices=[
+                        ("512 · Fast", "512"), ("640 · Faster", "640"),
+                        ("768 · Standard", "768"), ("896 · High", "896"),
+                        ("1024 · Very High", "1024"),
+                    ], value="768",
                 )
-                model_in = gr.Dropdown(
-                    label="모델",
-                    choices=model_choices,
-                    # First local checkpoint if there is one (no network on
-                    # launch), else the repo id, which downloads on first run.
-                    value=model_choices[0],
-                )
-                with gr.Row():
-                    seed_in = gr.Number(label="시드", value=42, precision=0)
-                    resolution_in = gr.Dropdown(
-                        label="해상도",
-                        choices=[
-                            ("512 · Fast", "512"),
-                            ("640 · Faster", "640"),
-                            ("768 · Standard", "768"),
-                            ("896 · High", "896"),
-                            ("1024 · Very High", "1024"),
-                        ],
-                        value="768",
-                    )
                 head_res_in = gr.Dropdown(
                     label="얼굴 디테일 해상도",
                     choices=[
-                        (HEAD_RES_MATCH, HEAD_RES_MATCH),
-                        ("640 · Fast", "640"),
-                        ("768 · Standard", "768"),
-                        ("896 · High", "896"),
-                        ("1024 · Very High", "1024"),
-                        ("1280", "1280"),
-                    ],
-                    value="768",
-                    info=(
-                        "v3 얼굴 단계는 머리 영역을 별도 정사각형 캔버스에서 다시 "
-                        "확산합니다. 이 값이 작은 얼굴 semantic 레이어(눈·코·입 등)의 "
-                        "생성 여부를 좌우합니다. 다만 어떤 해상도가 안전한지는 캐릭터마다 "
-                        "다릅니다 — 특정 해상도가 항상 잘 되는 게 아니라, 매 생성마다 원본과 "
-                        "비교해 판정합니다. 여기서 고른 값은 시작점일 뿐이고, 원본에는 흰자위가 "
-                        "보이는데 생성 결과에서 소실된 경우 먼저 원본 픽셀에서 직접 채워보고 "
-                        "(GPU 재확산 없음), 그래도 안 되면 이 값보다 높은 해상도로 얼굴만 "
-                        "(본문은 다시 돌리지 않고) 자동으로 최대 2단계 재시도합니다 — "
-                        "config/portrait_defaults.json의 head_rescue로 끄거나 사다리를 "
-                        "바꿀 수 있습니다. 피크 VRAM은 본문·얼굴 중 큰 해상도를 따릅니다."
-                    ),
+                        (HEAD_RES_MATCH, HEAD_RES_MATCH), ("640 · Fast", "640"),
+                        ("768 · Standard", "768"), ("896 · High", "896"),
+                        ("1024 · Very High", "1024"), ("1280", "1280"),
+                    ], value=HEAD_RES_MATCH,
+                    info="작은 눈·코·입 semantic을 위한 head canvas입니다. 최종 품질은 원본 ROI 검증으로 판정합니다.",
                 )
-                steps_in = gr.Slider(
-                    label="추론 단계", minimum=1, maximum=100, step=1, value=30
-                )
-                with gr.Row():
-                    head_detail_in = gr.Checkbox(label="얼굴 디테일 생성", value=True)
-                    guard_in = gr.Checkbox(label="실루엣 보호 (Silhouette Guard)", value=True)
-                    autofill_in = gr.Checkbox(label="자동 보완 (최대 5회 실행)", value=False)
-                run_btn = gr.Button("Run", variant="primary")
+            steps_in = gr.Slider(label="추론 단계", minimum=1, maximum=100, step=1, value=30)
 
-            with gr.Column(scale=1):
-                verdict_out = gr.HTML(label="판정")
-                coverage_out = gr.Markdown(label="커버리지")
-                reasons_out = gr.Markdown(label="판정 사유")
-                report_zip_out = gr.File(label="Portrait Bundle 다운로드 (.zip)")
+        with gr.Accordion("Reproducibility", open=False):
+            seed_mode_in = gr.Radio(
+                label="Seed mode",
+                choices=[
+                    ("Production · deterministic_auto", "deterministic_auto"),
+                    ("Regression · seed 42", "regression"),
+                ], value="deterministic_auto",
+                info="Production은 source identity 기반 seed를 사용합니다. Regression은 고정 seed 42로 비교합니다.",
+            )
+            manual_seed_in = gr.Number(label="Regression seed", value=42, precision=0)
 
-        with gr.Row():
-            layer_gallery_out = gr.Gallery(label="레이어", columns=6, height=300)
-        with gr.Row():
-            diagnostics_gallery_out = gr.Gallery(
-                label="진단 이미지 (커버리지 / 누락 / 유출 / 복원 / body_remainder)",
-                columns=5,
-                height=220,
+        with gr.Accordion("Research / Debug", open=False):
+            head_detail_in = gr.Checkbox(label="Face detail generation", value=True)
+            disable_guard_in = gr.Checkbox(
+                label="Disable Silhouette Guard", value=False,
+                info="Production에서는 켜 둔 상태를 권장합니다. 연구/디버그 용도로만 끄세요.",
             )
 
+        summary_out = gr.Markdown(label="Diagnostic Summary")
+        with gr.Row():
+            layer_gallery_out = gr.Gallery(
+                label="CANONICAL · production assets", columns=6, height=300,
+            )
+            diagnostics_gallery_out = gr.Gallery(
+                label="DIAGNOSTICS · static evidence", columns=5, height=260,
+            )
+        detail_out = gr.Markdown(label="Detail Reports")
         with gr.Accordion("실행 로그", open=False):
             log_out = gr.Textbox(label="", lines=10, max_lines=30)
 
         run_btn.click(
-            fn=run_a001,
+            fn=run_portrait,
             inputs=[
-                image_in, model_in, seed_in, resolution_in, steps_in,
-                head_detail_in, guard_in, autofill_in, subject_mask_in,
-                key_bg_in, head_res_in,
+                image_in, model_in, profile_in, subject_mask_in, key_bg_in,
+                resolution_in, steps_in, head_res_in, seed_mode_in, manual_seed_in,
+                head_detail_in, disable_guard_in,
             ],
             outputs=[
-                verdict_out, coverage_out, reasons_out,
-                layer_gallery_out, diagnostics_gallery_out, report_zip_out, log_out,
+                validation_out, coverage_out, summary_out, layer_gallery_out,
+                diagnostics_gallery_out, detail_out, report_zip_out, log_out,
             ],
         )
 

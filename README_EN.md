@@ -18,24 +18,33 @@ seethrough-portrait
     ↓
 Portrait Bundle v1
     ↓
+Portrait Composer
+    ↓
+Assembly Bundle v0.2
+    ↓
 portrait-autorig
     ↓
 Rig Bundle
 ```
 
 This repository ends at `Image → validated, production-ready semantic portrait
-bundle`. Auto-rigging, eye subdivision, anchors, meshes, weights, expression
-packs, Spine export, and the browser runtime live in the separate
+bundle`. Portrait Composer owns donor/VariantSet/ExpressionPreset selection,
+final draw order, and `RigIntent`. AutoRig owns mesh, weights, deformation, and
+runtime binding in the separate
 [`portrait-autorig`](https://github.com/prentice7725/portrait-autorig)
-repository. The projects share a file contract and no Python imports.
+repository. The projects share the Portrait Bundle file contract and no Python
+imports.
 
 ## Portrait Mode
 
 - **Silhouette Guard** clips spill and recovers unexplained original pixels as
   `body_remainder`.
-- **Portrait-aware auto-fill** selects the best layer set from up to five runs.
+- **Production profiles** map to deterministic candidate generation: `NORMAL`
+  runs once, `QUALITY` compares three attempts, and `HARVEST` compares five.
+  HARVEST is a SeeThrough producer profile, not Composer donor harvesting.
 - **Fidelity repair** runs `reclaim_occluded → fit_layer_tone → fit_edge_alpha
-  → clean_garment_orphans → fit_edge_alpha_final → fit_seam_residual` against
+  → clean_garment_orphans → fit_edge_alpha_final → fit_mouth_contact
+  → fit_seam_residual` against
   the original still
   image and conservatively removes isolated garment semantic contamination.
 - **Static validation** measures whole-composite fidelity and thin, continuous
@@ -45,7 +54,9 @@ repository. The projects share a file contract and no Python imports.
   `body_remainder`.
 - **Local fidelity** checks left/right eye, mouth, and neckline-contact ROIs so
   sclera loss or a horizontal neck/topwear seam cannot hide behind a good global MAE.
-- **Two verdicts** distinguish silhouette recovery from semantic completeness.
+- **Three validation axes** report Static Reconstruction, Seams, and Local
+  Fidelity independently; the legacy PASS/REWORK/FAIL value is shown only as a
+  Diagnostic Summary.
 
 ## Portrait Bundle v1
 
@@ -59,13 +70,21 @@ A001.portrait/
 ├─ raw_layers/             # optional forensic output
 └─ diagnostics/
    ├─ portrait_report.json
+   ├─ semantic_ownership.json
+   ├─ local_fidelity.json
    ├─ fidelity.json
    ├─ seams.json
-   └─ coverage/missing/spill/composite PNGs
+   ├─ occlusion_graph.json
+   ├─ coverage_mask.png
+   ├─ missing_mask.png
+   ├─ spill_mask.png
+   ├─ reconstruction.png
+   ├─ layer_composite.png
+   └─ composite_error.png
 ```
 
 Downstream consumers use only `layers/`. `raw_layers/` records model output for
-debugging and is not a fallback asset source. See
+forensics and is not a fallback asset source or canonical input. See
 [`docs/PORTRAIT_BUNDLE_V1.md`](docs/PORTRAIT_BUNDLE_V1.md) for the invariants
 and JSON Schema.
 
@@ -114,6 +133,20 @@ available VRAM, input, and the number of Portrait Mode auto-fill attempts.
 The head stage generates extra frames at the same resolution, so in these
 measurements it adds time rather than peak VRAM.
 
+For repeated runs, the fixed body/head semantic prompt embeddings are retained
+in a CPU cache on the pipeline instance. This skips text-encoder inference and
+GPU transfers after the first run. The engine path also skips the unused
+checkerboard previews. Per-call `input_encode_seconds`, `unet_denoise_seconds`,
+`transparent_decode_seconds`, and total time are recorded in the Bundle
+manifest under `run.pipeline_timing`.
+
+Streaming A/B knobs are available as `run_portrait_pipeline` options
+`offload_non_blocking` and `offload_record_stream`. They default to false to
+preserve the stable 8GB path; compare wall time, peak VRAM, and fidelity on a
+freshly loaded pipeline before enabling them for a host.
+On the 8GB profile, requesting both options together automatically disables
+both as a safety measure.
+
 ### ComfyUI nodes
 
 | Node | Purpose |
@@ -139,9 +172,16 @@ python webui/app.py
 # http://127.0.0.1:7860
 ```
 
-Upload one image, run Portrait Mode, inspect the verdict, and download a
+Upload one source portrait, choose a production profile, inspect the three
+validation axes (Static Reconstruction, Seams, Local Fidelity), and download a
 Portrait Bundle zip containing canonical layers and diagnostics. See
 [`webui/README.md`](webui/README.md).
+
+Transparent PNGs can still retain the former light background in their RGB
+channels. The upload path now repairs only soft-alpha edge pixels near local
+opaque foreground (hair and arm/body gaps are typical cases); it does not
+alter the alpha mask or raw layers. Existing Bundles need one regeneration to
+receive this correction.
 
 ## Tests
 
@@ -156,8 +196,8 @@ dependencies; the project migration gate is the root `tests/` suite.
 
 - [`docs/PORTRAIT_BUNDLE_V1.md`](docs/PORTRAIT_BUNDLE_V1.md) — cross-repository file contract
 - [`docs/M1_IMPLEMENTATION_SPEC.md`](docs/M1_IMPLEMENTATION_SPEC.md) — Portrait Mode contract
-- [`docs/M2_IMPLEMENTATION_SPEC.md`](docs/M2_IMPLEMENTATION_SPEC.md) — standalone webui
-- [`docs/TEST_PROTOCOL_A001.md`](docs/TEST_PROTOCOL_A001.md) — A-001 validation
+- [`webui/README.md`](webui/README.md) — standalone producer WebUI usage
+- [`docs/TEST_PROTOCOL_A001.md`](docs/TEST_PROTOCOL_A001.md) — regression protocol
 - Auto-rig design and experiment history live in
   [`portrait-autorig`](https://github.com/prentice7725/portrait-autorig).
 

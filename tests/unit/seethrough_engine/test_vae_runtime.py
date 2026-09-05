@@ -72,6 +72,17 @@ def test_untiled_cuda_oom_retries_exactly_once_with_tiling():
     assert events[0]["attempt"] == 2
 
 
+def test_runtime_timing_is_attached_to_telemetry():
+    pipeline = FakePipeline()
+    timing = {"input_encode_seconds": 0.1, "unet_denoise_seconds": 0.2}
+    events = []
+    assert run_with_vae_runtime(
+        pipeline, None, 512, "body", lambda: "ok",
+        timing=timing, telemetry=events,
+    ) == "ok"
+    assert events[0]["pipeline_timing"] == timing
+
+
 def test_load_time_vae_tiling_flag_is_removed():
     assert "vae_tiling" not in inspect.signature(
         model_loading.load_layerdiff_model).parameters

@@ -228,12 +228,16 @@ class TransparentVAEDecoder(torch.nn.Module):
             result += [eps]
             break
 
-        result = torch.stack(result, dim=0)
-        median = torch.median(result, dim=0).values
-        return median
+        # The augmentation list currently executes one pass (the loop breaks
+        # after the first transform).  Avoid a stack/median allocation in that
+        # common case; retain the reduction for future multi-pass variants.
+        if len(result) == 1:
+            return result[0]
+        return torch.median(torch.stack(result, dim=0), dim=0).values
 
     @torch.no_grad()
-    def forward(self, sd_vae, latent, return_type='numpy', rgb_cond=None, mask=None, return_rgb=False):
+    def forward(self, sd_vae, latent, return_type='numpy', rgb_cond=None, mask=None,
+                return_rgb=False, return_preview=True):
         pixel = sd_vae.decode(latent).sample
         pixel = (pixel * 0.5 + 0.5).to(self.dtype)
         latent = latent.to(self.dtype)
@@ -253,15 +257,16 @@ class TransparentVAEDecoder(torch.nn.Module):
                 alpha = alpha * mask
             fg = y[..., 1:]
 
-            B, H, W, C = fg.shape
-            cb = checkerboard(shape=(H // 64, W // 64))
-            cb = cv2.resize(cb, (W, H), interpolation=cv2.INTER_NEAREST)
-            cb = (0.5 + (cb - 0.5) * 0.1)[None, ..., None]
-            cb = torch.from_numpy(cb).to(fg)
+            if return_preview:
+                B, H, W, C = fg.shape
+                cb = checkerboard(shape=(max(1, H // 64), max(1, W // 64)))
+                cb = cv2.resize(cb, (W, H), interpolation=cv2.INTER_NEAREST)
+                cb = (0.5 + (cb - 0.5) * 0.1)[None, ..., None]
+                cb = torch.from_numpy(cb).to(fg)
 
-            vis = (fg * alpha + cb * (1 - alpha))[0]
-            vis = (vis * 255.0).detach().cpu().float().numpy().clip(0, 255).astype(np.uint8)
-            vis_list.append(vis)
+                vis = (fg * alpha + cb * (1 - alpha))[0]
+                vis = (vis * 255.0).detach().cpu().float().numpy().clip(0, 255).astype(np.uint8)
+                vis_list.append(vis)
 
             png = torch.cat([fg, alpha], dim=3)[0]
             if return_type == 'numpy':

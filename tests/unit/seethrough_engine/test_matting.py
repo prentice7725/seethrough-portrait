@@ -6,6 +6,7 @@ from seethrough_engine.matting import (
     DEFAULT_TOLERANCE,
     detect_flat_background,
     key_flat_background,
+    repair_existing_alpha_edge,
 )
 
 SIZE = 96
@@ -57,6 +58,23 @@ class DetectTests(unittest.TestCase):
 
 
 class KeyTests(unittest.TestCase):
+    def test_existing_alpha_edge_unmixes_premultiplied_background(self):
+        bg = np.array([220, 217, 215], np.float32)
+        fg = np.array([30, 32, 38], np.float32)
+        alpha = np.zeros((SIZE, SIZE), np.float32)
+        alpha[20:76, 45:51] = 1.0
+        alpha[20:76, 44] = 0.25
+        alpha[20:76, 51] = 0.25
+        # Simulate a transparent PNG that retained the light background in its
+        # soft edge RGB values.
+        rgb = np.where(alpha[..., None] > 0, bg, bg)
+        rgb[alpha == 1.0] = fg
+        rgb[alpha == 0.25] = bg
+        rgba = np.dstack([rgb.astype(np.uint8), np.rint(alpha * 255).astype(np.uint8)])
+        repaired, info = repair_existing_alpha_edge(rgba)
+        self.assertGreater(info["changed_px"], 0)
+        self.assertLess(float(np.abs(repaired[alpha == 0.25, :3].astype(np.float32) - fg).mean()), 50.0)
+
     def test_alpha_matches_the_ground_truth(self):
         opaque, truth, _ = scene()
         out, info = key_flat_background(opaque)
@@ -76,6 +94,22 @@ class KeyTests(unittest.TestCase):
         naive_err = np.abs(opaque[..., :3].astype(np.float32) - fg)[edge].mean()
         self.assertLess(keyed_err, naive_err / 3.0,
                         f"keyed {keyed_err:.1f} vs threshold-only {naive_err:.1f}")
+
+    def test_thin_strand_uses_nearby_foreground_colour_instead_of_white_halo(self):
+        """A two-pixel hair strand has no 7x7 solid interior, but its soft
+        edge must still be un-premultiplied from the surrounding background."""
+        bg = np.array([232, 231, 229], np.float32)
+        fg = np.array([35, 35, 40], np.float32)
+        alpha = np.zeros((SIZE, SIZE), np.float32)
+        alpha[:, SIZE // 2 - 1:SIZE // 2 + 1] = 1.0
+        alpha[:, SIZE // 2 - 2] = 0.25
+        alpha[:, SIZE // 2 + 1] = 0.25
+        rgb = fg * alpha[..., None] + bg * (1.0 - alpha[..., None])
+        opaque = np.dstack([np.rint(rgb).astype(np.uint8),
+                            np.full((SIZE, SIZE), 255, np.uint8)])
+        out, _ = key_flat_background(opaque)
+        edge = alpha == 0.25
+        self.assertLess(np.abs(out[..., :3].astype(np.float32) - fg)[edge].mean(), 35.0)
 
     def test_solid_interior_keeps_its_exact_colour(self):
         opaque, truth, _ = scene()

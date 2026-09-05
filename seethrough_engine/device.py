@@ -8,6 +8,7 @@ there is no such scheduler, so we fall back to plain torch device selection.
 from __future__ import annotations
 
 import itertools
+import inspect
 
 import torch
 
@@ -60,7 +61,8 @@ def is_group_offloaded(module: torch.nn.Module) -> bool:
 
 def group_offload(module: torch.nn.Module, device: torch.device,
                   offload_device: torch.device, *, offload_type: str = "leaf_level",
-                  use_stream: bool | None = None, non_blocking: bool = False) -> None:
+                  use_stream: bool | None = None, non_blocking: bool = False,
+                  record_stream: bool = False) -> None:
     """Leave `module`'s weights on `offload_device` and stream them to `device`
     one block at a time, for a model whose weights do not fit whole.
 
@@ -95,8 +97,7 @@ def group_offload(module: torch.nn.Module, device: torch.device,
         # at block level here (see above).
         use_stream = device.type == "cuda" and offload_type == "leaf_level"
 
-    apply_group_offloading(
-        module,
+    kwargs = dict(
         onload_device=device,
         offload_device=offload_device,
         offload_type=offload_type,
@@ -107,3 +108,8 @@ def group_offload(module: torch.nn.Module, device: torch.device,
         # is pageable and the copy is synchronous regardless.
         non_blocking=non_blocking and use_stream,
     )
+    # `record_stream` is not present in older diffusers releases. Forward it
+    # only when supported so the A/B knob remains backwards compatible.
+    if "record_stream" in inspect.signature(apply_group_offloading).parameters:
+        kwargs["record_stream"] = record_stream and use_stream
+    apply_group_offloading(module, **kwargs)

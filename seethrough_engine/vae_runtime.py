@@ -153,6 +153,7 @@ def run_with_vae_runtime(
     *,
     force_mode: str | None = None,
     telemetry: list[dict[str, Any]] | None = None,
+    timing: dict[str, Any] | None = None,
     log: Callable[[str], None] = lambda _message: None,
 ) -> _Result:
     """Invoke a body/head diffusion call under the current VAE policy.
@@ -198,6 +199,8 @@ def run_with_vae_runtime(
             "runtime_seconds": round(perf_counter() - started, 4),
             "peak_vram_bytes": _peak_bytes(device, baseline),
         })
+        if timing:
+            record["pipeline_timing"] = dict(timing)
         if telemetry is not None:
             telemetry.append(record)
         return output

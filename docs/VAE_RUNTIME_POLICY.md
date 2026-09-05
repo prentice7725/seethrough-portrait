@@ -20,7 +20,7 @@ body plus head enabled. “Peak” is the largest allocation above each stage's
 baseline; it is intentionally separated from the 7.58 GiB streamed UNet
 weights.
 
-| Canvas | Mode | Wall time | VAE-stage time | Peak delta | Output delta vs. other mode | Eye-local result |
+| Canvas | Mode | Wall time | Pipeline call time* | Peak delta | Output delta vs. other mode | Eye-local result |
 | --- | --- | ---: | ---: | ---: | --- | --- |
 | 768 | tiled (2×2) | 265.95s | 218.53s | 1.18 GiB | RGB MAE 0.498 | pass; eyewhite present |
 | 768 | untiled | 247.90s | 212.92s | 1.35 GiB | RGB MAE 0.498 | pass; eyewhite present |
@@ -32,6 +32,12 @@ driver-visible free VRAM and completed untiled, so a larger 3 GiB reserve would
 unnecessarily choose tiling and reproduce the A002 eye-local regression. The
 policy therefore uses the measured 1.75 GiB reserve and retains its one-time
 tiled fallback for hosts with less available memory.
+
+\* The historical “VAE-stage time” values above wrap the complete diffusion
+call (input VAE encode, UNet denoising, and transparent-layer decode), not only
+the VAE. New runs split these sections in `run.pipeline_timing` as
+`input_encode_seconds`, `unet_denoise_seconds`, and
+`transparent_decode_seconds`.
 
 The VAE's encoder samples from CUDA's global RNG, so tiled and untiled outputs
 are not bit-identical even with the same seed. The benchmark records both

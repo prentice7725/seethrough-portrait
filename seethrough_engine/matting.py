@@ -31,6 +31,7 @@ __all__ = [
     "DEFAULT_TOLERANCE",
     "detect_flat_background",
     "key_flat_background",
+    "repair_existing_alpha_edge",
 ]
 
 # Per-channel distance from the sampled background colour that still counts as
@@ -46,6 +47,66 @@ DEFAULT_MAX_BORDER_STD = 6.0
 # inside the silhouette whose alpha is estimated rather than assumed.
 BORDER_RING_PX = 2
 EDGE_BAND_PX = 3
+# A thin strand (hair, fingers, or the inside edge of an arm) may not contain
+# a fully eroded ``solid`` pixel. Use a slightly wider local neighbourhood to
+# estimate its foreground colour, but only for those unresolved edge pixels.
+THIN_EDGE_WINDOW_PX = 11
+
+
+def repair_existing_alpha_edge(image: np.ndarray, *, neighborhood: int = 11,
+                               alpha_floor: int = 8,
+                               alpha_solid: int = 245) -> tuple[np.ndarray, dict[str, Any]]:
+    """Remove a background-colour fringe from an already-transparent PNG.
+
+    Some image editors/exporters write the RGB background into semi-transparent
+    edge pixels even though the alpha channel is otherwise a valid subject
+    matte.  Re-keying such an image is unsafe (it may contain gradients), so
+    this pass estimates the background only from transparent pixels adjacent to
+    the subject and repairs only soft pixels whose RGB is demonstrably closer
+    to that background than to nearby opaque foreground colours.
+    """
+    arr = np.asarray(image)
+    if arr.ndim != 3 or arr.shape[-1] != 4:
+        raise ValueError(f"image must be HxWx4, got {arr.shape}")
+    out = np.array(arr, copy=True)
+    alpha = arr[..., 3].astype(np.float32) / 255.0
+    soft = (alpha > alpha_floor / 255.0) & (alpha < alpha_solid / 255.0)
+    if not soft.any():
+        return out, {"changed_px": 0, "reason": "no soft alpha edge"}
+
+    foreground = alpha >= alpha_solid / 255.0
+    adjacent = (cv2.dilate(foreground.astype(np.uint8), np.ones((15, 15), np.uint8)) > 0)
+    transparent_near = adjacent & (alpha <= alpha_floor / 255.0)
+    if not transparent_near.any():
+        return out, {"changed_px": 0, "reason": "no adjacent transparent background"}
+
+    bg = np.median(arr[..., :3][transparent_near].astype(np.float32), axis=0)
+    rgb = arr[..., :3].astype(np.float32)
+    contrast = np.sqrt(np.sum((rgb - bg) ** 2, axis=2))
+    known = foreground.astype(np.float32)
+    k = max(3, int(neighborhood) | 1)
+    weights = known * np.maximum(contrast, 1.0) ** 2
+    den = cv2.blur(weights, (k, k))
+    num = cv2.blur(rgb * weights[..., None], (k, k))
+    estimate = num / np.maximum(den[..., None], 1e-6)
+    estimate_dist = np.sqrt(np.sum((estimate - bg) ** 2, axis=2))
+    observed_dist = contrast
+    usable = soft & (den > 1e-3) & (observed_dist < estimate_dist * 0.8)
+    if not usable.any():
+        return out, {"changed_px": 0, "background": [round(float(v), 1) for v in bg],
+                     "reason": "no background-coloured fringe detected"}
+
+    # The problematic files keep the *background colour itself* in the soft
+    # pixel (rather than a mathematically premultiplied blend), so solving the
+    # compositing equation would simply return the same background. The local
+    # opaque-neighbour estimate is the correct straight-alpha RGB to write.
+    corrected = np.clip(estimate, 0.0, 255.0)
+    out[..., :3] = np.where(usable[..., None], np.rint(corrected), out[..., :3]).astype(np.uint8)
+    return out, {
+        "changed_px": int(usable.sum()),
+        "background": [round(float(v), 1) for v in bg],
+        "reason": "local foreground/background unmix",
+    }
 
 # An estimated alpha this close to 1 is opaque: snap it, so an essentially
 # solid pixel keeps its exact colour instead of being un-premultiplied through
@@ -210,6 +271,26 @@ def key_flat_background(image: np.ndarray, *, color: list[float] | None = None,
     num = cv2.blur(rgb * weight[..., None], (k, k))
     den = cv2.blur(weight, (k, k))[..., None]
     fore = np.where(den > 1e-4, num / np.maximum(den, 1e-6), rgb)
+
+    # Thin foregrounds can be narrower than the solid erosion kernel. Falling
+    # back to the observed edge colour in that case preserves the background
+    # contribution and creates the familiar pale halo. Borrow a colour from
+    # nearby *non-background* pixels instead; this is local and only applies
+    # where the solid estimate had no evidence, so enclosed white clothing is
+    # not trimmed by a global colour rule.
+    known = (inside & ~close).astype(np.float32)
+    thin_k = max(k, int(THIN_EDGE_WINDOW_PX) | 1)
+    # Weight by contrast from the sampled background so a pure hair/core pixel
+    # wins over its own anti-aliased fringe. The exponent is intentionally low
+    # (rather than a hard darkest-pixel pick) to avoid stealing a nearby dark
+    # outline from a pale but legitimate garment.
+    contrast = np.sqrt(np.sum((rgb - bg) ** 2, axis=2))
+    loose_weight = known * np.maximum(contrast, 1.0) ** 2
+    loose_num = cv2.blur(rgb * loose_weight[..., None], (thin_k, thin_k))
+    loose_den = cv2.blur(loose_weight, (thin_k, thin_k))[..., None]
+    loose_fore = loose_num / np.maximum(loose_den, 1e-6)
+    use_loose = (den[..., 0] <= 1e-4) & (loose_den[..., 0] > 1e-3)
+    fore = np.where(use_loose[..., None], loose_fore, fore)
 
     # C = a*F + (1-a)*Bg  =>  a = (C-Bg).(F-Bg) / |F-Bg|^2
     delta_f = fore - bg

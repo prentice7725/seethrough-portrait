@@ -74,6 +74,7 @@ from .image import composite_layers
 from .local_fidelity import local_fidelity_report
 from .ownership import recover_missing_ownership
 from .vae_runtime import run_with_vae_runtime
+from .matting import repair_existing_alpha_edge
 
 __all__ = [
     "ALL_TAGS",
@@ -115,8 +116,34 @@ _NOOP_LOG: Callable[[str], None] = lambda msg: None
 ACTIVATION_HEADROOM_BYTES = 1_500_000_000
 
 
+def _encode_prompt_cached(pipeline, prompt, *, cache_key: tuple[str, str, str]):
+    """Encode one fixed semantic prompt once and retain only CPU tensors.
+
+    Prompt text is part of the model contract, not user content in this
+    pipeline.  Keeping the cache on the pipeline instance makes invalidation
+    automatic when WebUI switches checkpoints, while CPU tensors avoid pinning
+    VRAM between runs.
+    """
+    cache = getattr(pipeline, "_seethrough_prompt_cache", None)
+    if cache is None:
+        cache = {}
+        setattr(pipeline, "_seethrough_prompt_cache", cache)
+    cached = cache.get(cache_key)
+    if cached is not None:
+        return cached[0], cached[1], True
+    embeds, pooled = pipeline.encode_cropped_prompt_77tokens(prompt)
+    cached = (
+        embeds.detach().to(device="cpu"),
+        pooled.detach().to(device="cpu"),
+    )
+    cache[cache_key] = cached
+    return cached[0], cached[1], False
+
+
 def fit_unet_on(unet, device, offload_device, *,
                 headroom_bytes: int = ACTIVATION_HEADROOM_BYTES,
+                offload_non_blocking: bool = False,
+                offload_record_stream: bool = False,
                 log: Callable[[str], None] = _NOOP_LOG) -> bool:
     """Put the UNet where the diffusion loop can reach it, and say whether it
     had to be streamed rather than moved.
@@ -133,6 +160,16 @@ def fit_unet_on(unet, device, offload_device, *,
     weights already live there, and the group offload hooks own placement from
     that point on.
     """
+    # On an 8GB card, combining async host copies with allocator stream
+    # recording can keep the body stage's staging buffers live into head/rescue
+    # calls. Treat that combination as unsafe until a host-specific benchmark
+    # proves otherwise; non-blocking alone remains available for A/B testing.
+    if offload_non_blocking and offload_record_stream:
+        log("Async offload + record_stream is unsafe on the 8GB profile; "
+            "disabling both for this run")
+        offload_non_blocking = False
+        offload_record_stream = False
+
     if is_group_offloaded(unet):
         # A pipeline kept warm across runs is already set up.
         return True
@@ -145,7 +182,11 @@ def fit_unet_on(unet, device, offload_device, *,
 
     log(f"UNet weights are {needed / 2**30:.2f} GiB and only {free / 2**30:.2f} GiB is free "
         f"on {device} -- streaming them one block at a time instead")
-    group_offload(unet, device, offload_device)
+    group_offload(
+        unet, device, offload_device,
+        non_blocking=offload_non_blocking,
+        record_stream=offload_record_stream,
+    )
     return True
 
 
@@ -153,6 +194,8 @@ def diffuse_head_stage(pipeline, device, rng, run_layer_dict, input_img, scale, 
                        resolution, head_resolution, head_embeds, head_pooled,
                        num_inference_steps, *, vae_mode_override: str | None = None,
                        vae_runtime_events: list[dict[str, Any]] | None = None,
+                       timing_events: list[dict[str, Any]] | None = None,
+                       generate_preview: bool = True,
                        log: Callable[[str], None] = _NOOP_LOG) -> dict[str, np.ndarray]:
     """Re-diffuse only the v3 head crop on its own `head_resolution` square
     canvas, and paste the result back onto the body `resolution` canvas.
@@ -182,16 +225,23 @@ def diffuse_head_stage(pipeline, device, rng, run_layer_dict, input_img, scale, 
     input_head, head_pad_size, head_pad_pos = vendor.center_square_pad_resize(
         input_head, head_resolution, return_pad_info=True)
 
+    stage_timing: dict[str, float] = {}
+    pipeline_kwargs = dict(
+        strength=1.0, num_inference_steps=num_inference_steps, batch_size=1,
+        generator=rng, guidance_scale=1.0,
+        prompt_embeds=head_embeds, pooled_prompt_embeds=head_pooled,
+        fullpage=input_head, group_index=1,
+    )
+    if timing_events is not None or not generate_preview:
+        pipeline_kwargs.update(timing=stage_timing, generate_preview=generate_preview)
     out = run_with_vae_runtime(
         pipeline, device, head_resolution, "head",
-        lambda: pipeline(
-            strength=1.0, num_inference_steps=num_inference_steps, batch_size=1,
-            generator=rng, guidance_scale=1.0,
-            prompt_embeds=head_embeds, pooled_prompt_embeds=head_pooled,
-            fullpage=input_head, group_index=1,
-        ),
-        force_mode=vae_mode_override, telemetry=vae_runtime_events, log=log,
+        lambda: pipeline(**pipeline_kwargs),
+        force_mode=vae_mode_override, telemetry=vae_runtime_events,
+        timing=stage_timing, log=log,
     )
+    if timing_events is not None:
+        timing_events.append({"stage": "head", **stage_timing})
     log(f"v3 head diffusion complete ({head_resolution}px head canvas)")
 
     canvas = np.zeros((resolution, resolution, 4), dtype=np.uint8)
@@ -215,6 +265,8 @@ def run_diffusion_stage(pipeline, device, rng, tag_version, num_inference_steps,
                          resolution=1280, head_resolution=None,
                          vae_mode_override: str | None = None,
                          vae_runtime_events: list[dict[str, Any]] | None = None,
+                         timing_events: list[dict[str, Any]] | None = None,
+                         generate_preview: bool = True,
                          log: Callable[[str], None] = _NOOP_LOG) -> dict[str, np.ndarray]:
     """Run a single diffusion pass (body stage, plus the head stage for v3
     when enabled) and return {tag: RGBA ndarray} in canvas (`fullpage`) space.
@@ -238,31 +290,45 @@ def run_diffusion_stage(pipeline, device, rng, tag_version, num_inference_steps,
     run_layer_dict: dict[str, np.ndarray] = {}
 
     if tag_version == "v2":
+        stage_timing: dict[str, float] = {}
+        pipeline_kwargs = dict(
+            strength=1.0, num_inference_steps=num_inference_steps, batch_size=1,
+            generator=rng, guidance_scale=1.0,
+            prompt_embeds=prompt_embeds, pooled_prompt_embeds=pooled_prompt_embeds,
+            fullpage=fullpage,
+        )
+        if timing_events is not None or not generate_preview:
+            pipeline_kwargs.update(timing=stage_timing, generate_preview=generate_preview)
         out = run_with_vae_runtime(
             pipeline, device, resolution, "body",
-            lambda: pipeline(
-                strength=1.0, num_inference_steps=num_inference_steps, batch_size=1,
-                generator=rng, guidance_scale=1.0,
-                prompt_embeds=prompt_embeds, pooled_prompt_embeds=pooled_prompt_embeds,
-                fullpage=fullpage,
-            ),
-            force_mode=vae_mode_override, telemetry=vae_runtime_events, log=log,
+            lambda: pipeline(**pipeline_kwargs),
+            force_mode=vae_mode_override, telemetry=vae_runtime_events,
+            timing=stage_timing, log=log,
         )
+        if timing_events is not None:
+            timing_events.append({"stage": "body", **stage_timing})
         log("v2 diffusion complete")
         for rst, tag in zip(out.images, VALID_BODY_PARTS_V2):
             run_layer_dict[tag] = rst
 
     elif tag_version == "v3":
+        stage_timing: dict[str, float] = {}
+        pipeline_kwargs = dict(
+            strength=1.0, num_inference_steps=num_inference_steps, batch_size=1,
+            generator=rng, guidance_scale=1.0,
+            prompt_embeds=body_embeds, pooled_prompt_embeds=body_pooled,
+            fullpage=fullpage, group_index=0,
+        )
+        if timing_events is not None or not generate_preview:
+            pipeline_kwargs.update(timing=stage_timing, generate_preview=generate_preview)
         out = run_with_vae_runtime(
             pipeline, device, resolution, "body",
-            lambda: pipeline(
-                strength=1.0, num_inference_steps=num_inference_steps, batch_size=1,
-                generator=rng, guidance_scale=1.0,
-                prompt_embeds=body_embeds, pooled_prompt_embeds=body_pooled,
-                fullpage=fullpage, group_index=0,
-            ),
-            force_mode=vae_mode_override, telemetry=vae_runtime_events, log=log,
+            lambda: pipeline(**pipeline_kwargs),
+            force_mode=vae_mode_override, telemetry=vae_runtime_events,
+            timing=stage_timing, log=log,
         )
+        if timing_events is not None:
+            timing_events.append({"stage": "body", **stage_timing})
         log("v3 body diffusion complete")
         for rst, tag in zip(out.images, VALID_BODY_PARTS_V3_BODY):
             run_layer_dict[tag] = rst
@@ -271,7 +337,11 @@ def run_diffusion_stage(pipeline, device, rng, tag_version, num_inference_steps,
             run_layer_dict.update(diffuse_head_stage(
                 pipeline, device, rng, run_layer_dict, input_img, scale, pad_pos,
                 resolution, head_resolution, head_embeds, head_pooled, num_inference_steps,
-                vae_mode_override=vae_mode_override, vae_runtime_events=vae_runtime_events, log=log,
+                vae_mode_override=vae_mode_override,
+                vae_runtime_events=vae_runtime_events,
+                timing_events=timing_events,
+                generate_preview=generate_preview,
+                log=log,
             ))
 
     return run_layer_dict
@@ -351,7 +421,8 @@ def _rescue_head_semantic(
     resolution: int, requested_head_resolution: int,
     head_embeds, head_pooled, num_inference_steps: int, seed: int,
     vae_mode_override: str | None, vae_runtime_events: list[dict[str, Any]] | None,
-    config: PortraitConfig, log: Callable[[str], None],
+    config: PortraitConfig, timing_events: list[dict[str, Any]] | None = None,
+    generate_preview: bool = True, log: Callable[[str], None] = _NOOP_LOG,
 ) -> HeadRescueOutcome:
     """Escalate head-only re-diffusion only when the original visibly shows a
     sclera the model failed to draw, and keep whichever head result actually
@@ -429,7 +500,8 @@ def _rescue_head_semantic(
         head_layers = diffuse_head_stage(
             pipeline, device, rng, layer_dict, input_img, scale, pad_pos,
             resolution, candidate_resolution, head_embeds, head_pooled, num_inference_steps,
-            vae_mode_override=vae_mode_override, vae_runtime_events=vae_runtime_events, log=log,
+            vae_mode_override=vae_mode_override, vae_runtime_events=vae_runtime_events,
+            timing_events=timing_events, generate_preview=generate_preview, log=log,
         )
         candidate_layers = {**best_layers, **head_layers}
         candidate_report = local_fidelity_report(
@@ -479,6 +551,8 @@ def run_portrait_pipeline(
     portrait_config: PortraitConfig | None = None,
     device: torch.device | None = None,
     offload_device: torch.device | None = None,
+    offload_non_blocking: bool = False,
+    offload_record_stream: bool = False,
     seed_everything: Callable[[int], None] = lambda seed: None,
     log: Callable[[str], None] = _NOOP_LOG,
 ) -> PortraitPipelineResult:
@@ -503,6 +577,9 @@ def run_portrait_pipeline(
     input_img = np.asarray(input_img_rgba)
     if input_img.ndim != 3 or input_img.shape[-1] != 4:
         raise ValueError(f"input_img_rgba must be HxWx4, got {input_img.shape}")
+    # Keep this upstream of diffusion so every caller (not only the WebUI's
+    # upload path) receives a decontaminated subject edge.
+    input_img, input_edge_repair = repair_existing_alpha_edge(input_img)
     seed_mode = str(seed_mode)
     if seed_mode not in SEED_MODES:
         raise ValueError(f"Unknown seed_mode {seed_mode!r}; expected one of {SEED_MODES}")
@@ -530,25 +607,52 @@ def run_portrait_pipeline(
         aligned_subject_mask = align_subject_mask_to_canvas(provided_subject_mask, resolution)
 
     tag_version = pipeline.unet.get_tag_version()
-
-    pipeline.text_encoder.to(device)
-    pipeline.text_encoder_2.to(device)
+    prompt_cache = getattr(pipeline, "_seethrough_prompt_cache", None) or {}
+    setattr(pipeline, "_seethrough_prompt_cache", prompt_cache)
+    prompt_dtype = str(getattr(pipeline.unet, "dtype", "unknown"))
+    prompt_keys = {
+        "v2": (VALID_BODY_PARTS_V2, ("\x1f".join(VALID_BODY_PARTS_V2), str(tag_version), prompt_dtype)),
+        "body": (VALID_BODY_PARTS_V3_BODY, ("\x1f".join(VALID_BODY_PARTS_V3_BODY), str(tag_version), prompt_dtype)),
+        "head": (VALID_BODY_PARTS_V3_HEAD, ("\x1f".join(VALID_BODY_PARTS_V3_HEAD), str(tag_version), prompt_dtype)),
+    }
+    required_keys = []
+    if tag_version == "v2":
+        required_keys.append(prompt_keys["v2"][1])
+    elif tag_version == "v3":
+        required_keys.append(prompt_keys["body"][1])
+        if enable_head_detail:
+            required_keys.append(prompt_keys["head"][1])
+    else:
+        raise ValueError(f"Unknown tag version: {tag_version}")
+    prompt_cache_misses = sum(key not in prompt_cache for key in required_keys)
+    if prompt_cache_misses:
+        pipeline.text_encoder.to(device)
+        pipeline.text_encoder_2.to(device)
 
     prompt_embeds, pooled_prompt_embeds = None, None
     body_embeds, body_pooled = None, None
     head_embeds, head_pooled = None, None
 
+    prompt_cache_hits = 0
     if tag_version == "v2":
-        prompt_embeds, pooled_prompt_embeds = pipeline.encode_cropped_prompt_77tokens(VALID_BODY_PARTS_V2)
+        prompt_embeds, pooled_prompt_embeds, hit = _encode_prompt_cached(
+            pipeline, VALID_BODY_PARTS_V2, cache_key=prompt_keys["v2"][1]
+        )
+        prompt_cache_hits += int(hit)
     elif tag_version == "v3":
-        body_embeds, body_pooled = pipeline.encode_cropped_prompt_77tokens(VALID_BODY_PARTS_V3_BODY)
+        body_embeds, body_pooled, hit = _encode_prompt_cached(
+            pipeline, VALID_BODY_PARTS_V3_BODY, cache_key=prompt_keys["body"][1]
+        )
+        prompt_cache_hits += int(hit)
         if enable_head_detail:
-            head_embeds, head_pooled = pipeline.encode_cropped_prompt_77tokens(VALID_BODY_PARTS_V3_HEAD)
-    else:
-        raise ValueError(f"Unknown tag version: {tag_version}")
+            head_embeds, head_pooled, hit = _encode_prompt_cached(
+                pipeline, VALID_BODY_PARTS_V3_HEAD, cache_key=prompt_keys["head"][1]
+            )
+            prompt_cache_hits += int(hit)
 
-    pipeline.text_encoder.to(offload_device)
-    pipeline.text_encoder_2.to(offload_device)
+    if prompt_cache_misses:
+        pipeline.text_encoder.to(offload_device)
+        pipeline.text_encoder_2.to(offload_device)
     # Before measuring what is free for the UNet, hand the encoders' VRAM back
     # to the driver -- until then the caching allocator still counts it as used.
     empty_cache(device)
@@ -558,10 +662,16 @@ def run_portrait_pipeline(
     # may not fit.
     pipeline.vae.to(device)
     pipeline.trans_vae.to(device)
-    unet_streamed = fit_unet_on(pipeline.unet, device, offload_device, log=log)
+    unet_streamed = fit_unet_on(
+        pipeline.unet, device, offload_device,
+        offload_non_blocking=offload_non_blocking,
+        offload_record_stream=offload_record_stream,
+        log=log,
+    )
     empty_cache(device)
 
     vae_runtime_events: list[dict[str, Any]] = []
+    timing_events: list[dict[str, Any]] = []
 
     def _diffuse(run_seed: int) -> dict[str, np.ndarray]:
         rng = torch.Generator(device=device).manual_seed(run_seed)
@@ -575,6 +685,8 @@ def run_portrait_pipeline(
             head_resolution=head_resolution, log=log,
             vae_mode_override=vae_mode_override,
             vae_runtime_events=vae_runtime_events,
+            timing_events=timing_events,
+            generate_preview=False,
         )
 
     layer_dict = _diffuse(seed)
@@ -596,6 +708,8 @@ def run_portrait_pipeline(
             head_embeds=head_embeds, head_pooled=head_pooled,
             num_inference_steps=num_inference_steps, seed=seed,
             vae_mode_override=vae_mode_override, vae_runtime_events=vae_runtime_events,
+            timing_events=timing_events,
+            generate_preview=False,
             config=portrait_config, log=log,
         )
         layer_dict = head_rescue_outcome.layers
@@ -730,6 +844,8 @@ def run_portrait_pipeline(
             "run_count": int(len(all_runs_layers) if all_runs_layers else 1),
             "enable_head_detail": bool(enable_head_detail),
             "silhouette_guard": bool(silhouette_guard),
+            "offload_non_blocking": bool(offload_non_blocking),
+            "offload_record_stream": bool(offload_record_stream),
         },
         mask=portrait_mask,
         guard=final_guard,
@@ -739,6 +855,14 @@ def run_portrait_pipeline(
     )
     report["semantic"]["warnings"] = semantic_warnings(layer_dict, fullpage)
     report["run"]["vae_runtime"] = vae_runtime_events
+    report["run"]["pipeline_timing"] = timing_events
+    report["run"]["prompt_cache"] = {
+        "hits": int(prompt_cache_hits),
+        "misses": int(prompt_cache_misses),
+        "entries": int(len(prompt_cache)),
+        "device": "cpu",
+    }
+    report["run"]["input_alpha_repair"] = input_edge_repair
     report["run"]["head_rescue"] = (
         head_rescue_outcome.report if head_rescue_outcome is not None else {"enabled": False}
     )

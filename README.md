@@ -18,17 +18,22 @@ seethrough-portrait
     ↓
 Portrait Bundle v1
     ↓
+Portrait Composer
+    ↓
+Assembly Bundle v0.2
+    ↓
 portrait-autorig
     ↓
 Rig Bundle
 ```
 
 이 저장소의 책임은 `Image → validated, production-ready semantic portrait
-bundle`에서 끝납니다. 자동 리깅, 눈 좌우 분할, anchor·mesh·weight, 표정 팩,
-Spine exporter와 브라우저 runtime은 별도
+bundle`에서 끝납니다. Composer는 donor·VariantSet·ExpressionPreset·최종 draw
+order와 `RigIntent`를 조립하고, 자동 리깅은 별도
 [`portrait-autorig`](https://github.com/prentice7725/portrait-autorig) 저장소에
-있습니다. 두 프로젝트 사이에는 Python import 의존성이 없으며 파일 계약만
-공유합니다.
+있습니다. AutoRig는 mesh·weight·deformation과 runtime binding만 담당합니다.
+두 프로젝트 사이에는 Python import 의존성이 없으며 Portrait Bundle 파일
+계약만 공유합니다.
 
 P0 producer contract freeze는 [`docs/P0_CLOSEOUT_V0.2.md`](docs/P0_CLOSEOUT_V0.2.md)에
 기록되어 있습니다.
@@ -37,8 +42,9 @@ P0 producer contract freeze는 [`docs/P0_CLOSEOUT_V0.2.md`](docs/P0_CLOSEOUT_V0.
 
 - **Silhouette Guard** — 피사체 밖의 spill을 자르고 누락된 원본 픽셀을
   `body_remainder`로 복구합니다.
-- **Portrait-aware auto-fill** — coverage와 필수 semantic group을 기준으로 최대
-  5회 실행 중 최선의 레이어 조합을 선택합니다.
+- **Production profiles** — WebUI의 `NORMAL`은 1회, `QUALITY`는 3회,
+  `HARVEST`는 5회 deterministic 후보를 비교합니다. HARVEST는 Composer의
+  donor harvest가 아니라 SeeThrough 후보 생성 프로파일입니다.
 - **Fidelity repair** — `reclaim_occluded → fit_layer_tone → fit_edge_alpha →
   clean_garment_orphans → fit_edge_alpha_final → fit_mouth_contact →
   fit_seam_residual` 순서로
@@ -52,7 +58,8 @@ P0 producer contract freeze는 [`docs/P0_CLOSEOUT_V0.2.md`](docs/P0_CLOSEOUT_V0.
   충분한 부분을 기존 canonical layer로 되돌립니다.
 - **로컬 fidelity** — 좌/우 눈·입·목선 접촉 ROI를 따로 검사하여 전체 MAE가
   놓치는 눈흰자 소실과 가로 neck/topwear seam을 verdict와 diagnostic에 반영합니다.
-- **두 verdict** — 실루엣 복구 상태와 semantic 완성도를 분리해 보고합니다.
+- **검증 축 3개** — Static Reconstruction, Seams, Local Fidelity를 독립적으로
+  보고하며 기존 PASS/REWORK/FAIL 값은 Diagnostic Summary로만 표시합니다.
 
 ## Portrait Bundle v1
 
@@ -66,9 +73,17 @@ A001.portrait/
 ├─ raw_layers/             # optional forensic output
 └─ diagnostics/
    ├─ portrait_report.json
+   ├─ semantic_ownership.json
+   ├─ local_fidelity.json
    ├─ fidelity.json
    ├─ seams.json
-   └─ coverage/missing/spill/composite PNGs
+   ├─ occlusion_graph.json
+   ├─ coverage_mask.png
+   ├─ missing_mask.png
+   ├─ spill_mask.png
+   ├─ reconstruction.png
+   ├─ layer_composite.png
+   └─ composite_error.png
 ```
 
 `layers/`만 downstream consumer가 사용합니다. `raw_layers/`는 모델 출력을 추적하기
@@ -119,6 +134,18 @@ auto-fill 횟수에 따라 달라집니다.
 head 단계는 같은 해상도에서 추가 프레임만 생성하므로 위 측정에서는 VRAM보다
 시간에 영향을 줍니다.
 
+반복 실행에서는 body/head의 고정 semantic prompt 임베딩을 pipeline 인스턴스의
+CPU 캐시에 보관해 text encoder 재실행과 GPU 왕복을 건너뜁니다. 엔진 경로는
+사용하지 않는 체크무늬 preview도 만들지 않습니다. 각 diffusion 호출의
+`input_encode_seconds`, `unet_denoise_seconds`, `transparent_decode_seconds`와
+전체 시간은 Bundle manifest의 `run.pipeline_timing`에 기록됩니다.
+
+UNet streaming의 비동기 전송 A/B는 `run_portrait_pipeline`의
+`offload_non_blocking` 및 `offload_record_stream` 옵션으로 켤 수 있습니다.
+두 옵션은 기본적으로 꺼져 있어 기존 8GB 경로의 안정성을 유지하며, 같은
+pipeline을 새로 로드한 뒤 wall time·피크 VRAM·fidelity를 비교해 선택하세요.
+8GB 프로파일에서는 두 옵션을 동시에 요청하면 안전상 둘 다 자동으로 꺼집니다.
+
 ### ComfyUI 노드
 
 | 노드 | 설명 |
@@ -152,6 +179,12 @@ python webui/app.py
 diagnostics가 담긴 Portrait Bundle zip을 받습니다. 자세한 내용은
 [`webui/README.md`](webui/README.md)를 참고하세요.
 
+투명 PNG라도 RGB 채널에 원래의 밝은 배경이 남아 있는 경우가 있습니다. 업로드
+단계에서 머리카락, 팔 안쪽처럼 얇은 경계의 soft-alpha 픽셀만 주변 불투명
+foreground와 비교해 국소 보정하며, alpha mask 자체나 raw layer는 건드리지
+않습니다. 기존 Bundle에는 이 보정이 소급되지 않으므로 해당 입력은 한 번
+다시 생성해야 합니다.
+
 ## 테스트
 
 ```bash
@@ -165,8 +198,8 @@ migration gate는 루트 `tests/`를 대상으로 합니다.
 
 - [`docs/PORTRAIT_BUNDLE_V1.md`](docs/PORTRAIT_BUNDLE_V1.md) — 두 저장소 사이 파일 계약
 - [`docs/M1_IMPLEMENTATION_SPEC.md`](docs/M1_IMPLEMENTATION_SPEC.md) — Portrait Mode 계약
-- [`docs/M2_IMPLEMENTATION_SPEC.md`](docs/M2_IMPLEMENTATION_SPEC.md) — standalone WebUI
-- [`docs/TEST_PROTOCOL_A001.md`](docs/TEST_PROTOCOL_A001.md) — A-001 검증 절차
+- [`webui/README.md`](webui/README.md) — standalone producer WebUI 사용법
+- [`docs/TEST_PROTOCOL_A001.md`](docs/TEST_PROTOCOL_A001.md) — 회귀 검증 절차
 - 자동 리깅 설계와 실험 기록은
   [`portrait-autorig`](https://github.com/prentice7725/portrait-autorig)에 있습니다.
 

@@ -169,6 +169,12 @@ class MouthContactTests(unittest.TestCase):
         for tag, image in layers.items():
             np.testing.assert_array_equal(image, raw_snapshot[tag])
 
+        # The surrounding skin belongs to face.  Mouth cleanup must not copy
+        # its matte into face, otherwise the oval returns in the canonical
+        # composite as a face-layer artifact.
+        np.testing.assert_array_equal(out["face"], layers["face"])
+        self.assertEqual(int(report.get("transferred_px", 0)), 0)
+
     def test_ambiguous_feature_is_left_untouched(self):
         original, layers = self.scene()
         # If the original agrees with the matte, no ownership change is needed.

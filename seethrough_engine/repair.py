@@ -17,7 +17,7 @@ from .image import composite_fidelity, composite_layers
 from .scale import canvas_scale, odd_kernel, scale_area, scale_length
 from .semantic import SEMANTIC_Z_ORDER
 
-REPAIR_VERSION = "1.7"
+REPAIR_VERSION = "1.8"
 REPAIR_ORDER = (
     "reclaim_occluded",
     "fit_layer_tone",
@@ -138,6 +138,8 @@ MOUTH_MIN_CONTRAST = 12
 MOUTH_HALO_ERROR_MIN = 15
 MOUTH_HALO_MIN_LUMA = 110
 MOUTH_HALO_MAX_CHROMA = 100
+MOUTH_FRINGE_BASE_ERROR_MAX = 40
+MOUTH_FRINGE_BAND_RATIO = 0.45
 
 def reclaim_occluded(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarray, *,
                      pairs: tuple[tuple[str, str], ...] = RECLAIM_PAIRS,
@@ -638,6 +640,15 @@ def fit_mouth_contact(
     drawing_core = strong & (core_score >= core_cut)
     if not drawing_core.any():
         drawing_core = strong
+    # The model's matte can sit farther from a thin lip stroke than the
+    # nominal raster band.  Scale the neighbourhood from the observed feature
+    # extent, while keeping it a mouth-local ROI (never a canvas/global trim).
+    core_y, core_x = np.where(drawing_core)
+    feature_span = max(
+        int(core_x.max() - core_x.min() + 1),
+        int(core_y.max() - core_y.min() + 1),
+    )
+    band = max(band, int(round(feature_span * 0.30)))
     core_neighbourhood = cv2.dilate(
         drawing_core.astype(np.uint8),
         cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * band + 1,) * 2),
@@ -680,18 +691,45 @@ def fit_mouth_contact(
         & (beneath_error + float(original_margin) < current_error)
     )
 
-    # A skin-coloured halo can be darker than the (already imperfect) face
-    # beneath it, so simply clearing it would worsen RGB fidelity.  Transfer
-    # that narrow-band contribution into `face` instead.  The transfer is an
-    # exact semantic ownership change: the rendered pixels stay the same, but
-    # downstream consumers no longer mistake the matte for mouth artwork.
+    # A skin-coloured halo is not mouth artwork.  Earlier versions transferred
+    # it into `face` to preserve the rendered pixels, but that merely moved the
+    # oval into the canonical face layer (and made the artifact survive every
+    # later composite).  Clear the halo from mouth instead; the existing face
+    # layer is the owner of the surrounding skin and remains untouched.
     face = out.get("face")
+    original_mouth_error = np.abs(O - M).sum(axis=2)
     halo = (
         (strong & ~core_neighbourhood) & visible_owner & (face is not None)
-        & (np.abs(O - M).sum(axis=2) > float(MOUTH_HALO_ERROR_MIN))
+        & (original_mouth_error > float(MOUTH_HALO_ERROR_MIN))
         & (M.mean(axis=2) >= float(MOUTH_HALO_MIN_LUMA))
         & ((M.max(axis=2) - M.min(axis=2)) <= float(MOUTH_HALO_MAX_CHROMA))
     )
+    # Antialiased segmentation edges can be dark even when the broad matte is
+    # skin-coloured, producing a dotted oval after compositing.  Keep this
+    # check local to the observed mouth feature and require evidence that the
+    # face already explains the original.  This catches both low-alpha dark
+    # fringes and opaque wrong-coloured matte pixels; real lip strokes normally
+    # match the original and remain untouched.
+    fringe_band = max(1, int(round(feature_span * MOUTH_FRINGE_BAND_RATIO)))
+    fringe_kernel = cv2.getStructuringElement(
+        cv2.MORPH_ELLIPSE, (2 * fringe_band + 1,) * 2,
+    )
+    fringe_region = cv2.dilate(
+        drawing_core.astype(np.uint8), fringe_kernel,
+    ).astype(bool) & strong
+    fringe_visible = strong.copy()
+    for tag, image in out.items():
+        if rank.get(tag, -1) > mouth_rank:
+            fringe_visible &= ~(np.asarray(image)[..., 3] > alpha_threshold)
+    fringe = (
+        fringe_region & ~drawing_core & fringe_visible
+        & (original_mouth_error > np.maximum(
+            float(MOUTH_HALO_ERROR_MIN),
+            beneath_error + float(MOUTH_ORIGINAL_MARGIN),
+        ))
+        & (beneath_error <= float(MOUTH_FRINGE_BASE_ERROR_MAX))
+    )
+    halo |= fringe
 
     report: dict[str, Any] = {
         "status": "unchanged",
@@ -710,13 +748,9 @@ def fit_mouth_contact(
     tentative = dict(out)
     transferred_px = 0
     if halo.any() and face is not None:
-        transferred_face = _merge_semantic_ownership(
-            np.asarray(face), arr, halo, owner_is_front=False)
-        tentative["face"] = transferred_face
         transferred_mouth = np.array(arr, copy=True)
         transferred_mouth[halo] = 0
         tentative[mouth_tag] = transferred_mouth
-        transferred_px = int(halo.sum())
 
     # Recompute the beneath stack after any ownership transfer, then apply the
     # original-vs-composite alpha solve only to candidates not already moved.

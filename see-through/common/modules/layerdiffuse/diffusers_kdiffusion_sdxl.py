@@ -1,4 +1,5 @@
 from dataclasses import dataclass
+from time import perf_counter
 from typing import Union, List, Optional
 
 import PIL.Image
@@ -243,19 +244,33 @@ class KDiffusionStableDiffusionXLPipeline(StableDiffusionXLImg2ImgPipeline):
             negative_prompt=None,
             show_progress=True,
             fullpage=None,
-            group_index=None
+            group_index=None,
+            timing=None,
+            generate_preview=True,
     ):
+
+        def _mark_sync():
+            unet_device = torch.device(self.unet.device)
+            if timing is not None and unet_device.type == "cuda":
+                torch.cuda.synchronize(unet_device)
+
+        total_started = perf_counter() if timing is not None else None
 
         device = self.unet.device
         dtype = self.unet.dtype
 
         if fullpage is not None:
+            encode_started = perf_counter() if timing is not None else None
+            _mark_sync()
             page_alpha = img2tensor(fullpage[..., -1] / 255., device=self.vae.device, dtype=self.vae.dtype)[0][..., None]
             fullpage = fullpage[..., :3]
             c_concat = np.concatenate([np.full_like(fullpage[..., :1], fill_value=255), fullpage], axis=2)
             c_concat = img2tensor(c_concat, normalize=True)
             c_concat = vae_encode(self.vae, self.trans_vae.encoder, c_concat, use_offset=False).to(device=device, dtype=dtype)
             c_concat = c_concat.to(dtype=dtype)
+            _mark_sync()
+            if timing is not None and encode_started is not None:
+                timing["input_encode_seconds"] = round(perf_counter() - encode_started, 4)
 
         assert c_concat is not None
 
@@ -328,6 +343,8 @@ class KDiffusionStableDiffusionXLPipeline(StableDiffusionXLImg2ImgPipeline):
 
         latents = noise * self.scheduler.init_noise_sigma
 
+        denoise_started = perf_counter() if timing is not None else None
+        _mark_sync()
         for i, t in enumerate(timesteps):
 
             # expand the latents if we are doing classifier free guidance
@@ -364,6 +381,10 @@ class KDiffusionStableDiffusionXLPipeline(StableDiffusionXLImg2ImgPipeline):
                     # some platforms (eg. apple mps) misbehave due to a pytorch bug: https://github.com/pytorch/pytorch/pull/99272
                     latents = latents.to(latents_dtype)
 
+        _mark_sync()
+        if timing is not None and denoise_started is not None:
+            timing["unet_denoise_seconds"] = round(perf_counter() - denoise_started, 4)
+
 
         if latents.ndim == 5:
             latents = latents[0]
@@ -375,11 +396,21 @@ class KDiffusionStableDiffusionXLPipeline(StableDiffusionXLImg2ImgPipeline):
 
         vis_list = []
         res_list = []
+        decode_started = perf_counter() if timing is not None else None
+        _mark_sync()
         for latent in latents:
             latent = latent[None]
             # latent = scheduler.add_noise(latent, torch.randn_like(latent), timesteps=torch.tensor([1], device=latent.device))
-            result_list, vis_list_batch = self.trans_vae.decoder(self.vae, latent, mask=page_alpha)
+            result_list, vis_list_batch = self.trans_vae.decoder(
+                self.vae, latent, mask=page_alpha, return_preview=generate_preview
+            )
             vis_list += vis_list_batch
             res_list += result_list
+
+        _mark_sync()
+        if timing is not None and decode_started is not None:
+            timing["transparent_decode_seconds"] = round(perf_counter() - decode_started, 4)
+            if total_started is not None:
+                timing["pipeline_total_seconds"] = round(perf_counter() - total_started, 4)
 
         return LayerdiffPipelineOutput(images=res_list, vis_list=vis_list)
