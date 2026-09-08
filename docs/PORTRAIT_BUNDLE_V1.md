@@ -13,7 +13,7 @@ downstream consumer such as `portrait-autorig`.
 │  ├─ face.png
 │  ├─ neck.png
 │  ├─ topwear.png
-│  └─ body_remainder.png   # optional when empty
+│  └─ ...                   # semantic parts only
 ├─ raw_layers/             # optional; diagnostic only
 └─ diagnostics/
    ├─ portrait_report.json
@@ -24,8 +24,10 @@ downstream consumer such as `portrait-autorig`.
    ├─ coverage_mask.png
    ├─ missing_mask.png
    ├─ spill_mask.png
+   ├─ body_remainder.png    # reconstruction fallback; diagnostic only
    ├─ reconstruction.png
    ├─ layer_composite.png
+   ├─ semantic_composite.png
    ├─ composite_error.png
    └─ occlusion_graph.json    # optional
 ```
@@ -37,6 +39,10 @@ downstream consumer such as `portrait-autorig`.
 - Coordinates use a top-left origin with Y increasing downward.
 - RGB is sRGB and alpha is straight (unpremultiplied).
 - `layers/` contains `production_repaired` canonical layers.
+- `layers/` never contains `body_remainder`; it is a reconstruction fallback,
+  not a swappable semantic owner. The fallback is written to
+  `diagnostics/body_remainder.png` and may be used only for producer-side
+  reconstruction and QC.
 - `semantics.z_order` is the producer's reconstruction order for this source
   portrait. It is not a downstream character's final draw order; consumers may
   adapt it for composition.
@@ -49,14 +55,18 @@ downstream consumer such as `portrait-autorig`.
   unresolved residual becomes `body_remainder`. Keeping recovery after fitted
   repair prevents newly transferred source pixels from biasing tone/seam fits.
 - The fidelity-repair order is fixed: `reclaim_occluded`, `fit_layer_tone`,
-  `fit_edge_alpha`, `clean_garment_orphans`, `fit_edge_alpha_final`,
-  `fit_mouth_contact`, `fit_seam_residual`. The mouth stage is a local static
+  `fit_edge_alpha`, `clean_garment_orphans`, `clean_garment_contacts`,
+  `fit_edge_alpha_final`, `fit_mouth_contact`, `fit_seam_residual`,
+  `extract_mouth_feature`. The mouth stages are local static
   ownership/alpha solve for skin-coloured mouth mattes; it has no rig or
   motion knowledge, and the final seam fit evaluates the published ownership
   boundaries.
 - `diagnostics/local_fidelity.json` measures eyes, mouth, and the local
   neck/garment contact band. It reports source-visible loss and static seam
   evidence; it is not a motion or rig-readiness policy.
+- `diagnostics/layer_composite.png` is the static reconstruction stack and may
+  include the diagnostic fallback. `diagnostics/semantic_composite.png` is the
+  swap-safe stack made only from the published `layers/`.
 - `semantics.warnings` records observable producer-side semantic omissions,
   such as `missing_eyewhite`. It is not a rig-readiness or motion verdict.
 - `diagnostics/occlusion_graph.json`, when present, records which canonical
@@ -69,6 +79,9 @@ downstream consumer such as `portrait-autorig`.
   `layer_contract.canonical_stage` is `production_repaired`.
 - `raw_layers/`, when present, is forensic data and is not a fallback source
   for missing canonical layers.
+- A legacy v1 bundle that still lists `body_remainder` under `layers/` must be
+  treated as diagnostic-only during import; it must not be harvested into a
+  Composer or AutoRig working set.
 - Rig-specific subdivisions such as `head_remainder`, `neck_remainder`, and
   left/right eye splits are forbidden in the canonical layer set.
 

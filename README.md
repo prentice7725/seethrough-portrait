@@ -46,8 +46,8 @@ P0 producer contract freeze는 [`docs/P0_CLOSEOUT_V0.2.md`](docs/P0_CLOSEOUT_V0.
   `HARVEST`는 5회 deterministic 후보를 비교합니다. HARVEST는 Composer의
   donor harvest가 아니라 SeeThrough 후보 생성 프로파일입니다.
 - **Fidelity repair** — `reclaim_occluded → fit_layer_tone → fit_edge_alpha →
-  clean_garment_orphans → fit_edge_alpha_final → fit_mouth_contact →
-  fit_seam_residual` 순서로
+  clean_garment_orphans → clean_garment_contacts → fit_edge_alpha_final → fit_mouth_contact →
+  fit_seam_residual → extract_mouth_feature` 순서로
   정지화면을 원본과 맞추고, garment의 고립 semantic contamination을
   보수적으로 제거합니다. `fit_mouth_contact`는 입 주변의 국소 skin matte를
   face 쪽으로 정리하거나 원본 기준 alpha를 다시 풀어 halo를 줄입니다.
@@ -81,14 +81,19 @@ A001.portrait/
    ├─ coverage_mask.png
    ├─ missing_mask.png
    ├─ spill_mask.png
+   ├─ body_remainder.png
    ├─ reconstruction.png
    ├─ layer_composite.png
+   ├─ semantic_composite.png
    └─ composite_error.png
 ```
 
 `layers/`만 downstream consumer가 사용합니다. `raw_layers/`는 모델 출력을 추적하기
 위한 진단 자료이며 소비 금지입니다. 전체 불변식과 JSON Schema는
 [`docs/PORTRAIT_BUNDLE_V1.md`](docs/PORTRAIT_BUNDLE_V1.md)를 참고하세요.
+`body_remainder`는 `layers/`에 넣지 않고 `diagnostics/body_remainder.png`에만
+기록하는 재구성 fallback입니다. `layer_composite.png`는 정적 재구성용이고,
+`semantic_composite.png`는 교체 가능한 semantic 파츠만 합성한 결과입니다.
 
 ## 설치 (ComfyUI)
 

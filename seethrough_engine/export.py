@@ -60,12 +60,27 @@ def save_portrait_bundle(output_dir: str, result: PortraitPipelineResult, *,
 
     _save_rgba(os.path.join(output_dir, "original.png"), result.fullpage)
 
-    canonical = dict(result.layer_dict)
+    # `layers/` is the swap-safe semantic set.  body_remainder is a source
+    # reconstruction fallback, not an owned part, so it is deliberately kept
+    # out of the published canonical mapping even when non-empty.
+    canonical = {
+        tag: arr for tag, arr in result.layer_dict.items()
+        if tag != "body_remainder"
+    }
     remainder = np.asarray(result.guard.body_remainder)
-    if remainder.ndim == 3 and remainder.shape[-1] == 4 and np.any(remainder[..., 3] > 10):
-        if "body_remainder" in canonical:
-            raise ValueError("canonical semantic layers already contain body_remainder")
-        canonical["body_remainder"] = remainder
+    # Guard implementations always return a canvas-sized RGBA array, but keep
+    # the exporter total for legacy/custom callers that leave the fallback
+    # unset.  An empty diagnostic is preferable to accidentally publishing an
+    # invalid scalar/shape as a bundle image.
+    if remainder.shape != result.fullpage.shape:
+        remainder = np.zeros_like(result.fullpage)
+    has_remainder = (
+        remainder.ndim == 3 and remainder.shape[-1] == 4
+        and np.any(remainder[..., 3] > 10)
+    )
+    reconstruction_layers = dict(canonical)
+    if has_remainder:
+        reconstruction_layers["body_remainder"] = remainder
 
     layer_entries: dict[str, dict[str, str]] = {}
     for tag, arr in _nonempty_layers(canonical):
@@ -97,15 +112,32 @@ def save_portrait_bundle(output_dir: str, result: PortraitPipelineResult, *,
                guard.reconstruction_rgba)
     diagnostic_paths["reconstruction"] = reconstruction_relative
 
-    composite = composite_layers(canonical, result.fullpage.shape[:2])
-    composite_relative = "diagnostics/layer_composite.png"
-    _save_rgba(os.path.join(output_dir, *composite_relative.split("/")), composite)
-    diagnostic_paths["layer_composite"] = composite_relative
+    remainder_relative = "diagnostics/body_remainder.png"
+    _save_rgba(os.path.join(output_dir, *remainder_relative.split("/")),
+               remainder)
+    diagnostic_paths["body_remainder"] = remainder_relative
 
-    fidelity = composite_fidelity(result.fullpage, composite, guard.subject_mask)
+    # Keep the historical layer_composite as the full static reconstruction so
+    # existing QA numbers remain comparable, and expose the swap-safe semantic
+    # stack separately for downstream readiness review.
+    reconstruction_composite = composite_layers(
+        reconstruction_layers, result.fullpage.shape[:2])
+    semantic_composite = composite_layers(canonical, result.fullpage.shape[:2])
+    composite_relative = "diagnostics/layer_composite.png"
+    _save_rgba(os.path.join(output_dir, *composite_relative.split("/")), reconstruction_composite)
+    diagnostic_paths["layer_composite"] = composite_relative
+    semantic_composite_relative = "diagnostics/semantic_composite.png"
+    _save_rgba(
+        os.path.join(output_dir, *semantic_composite_relative.split("/")),
+        semantic_composite,
+    )
+    diagnostic_paths["semantic_composite"] = semantic_composite_relative
+
+    fidelity = composite_fidelity(
+        result.fullpage, reconstruction_composite, guard.subject_mask)
     fidelity["semantic_only"] = composite_fidelity(
         result.fullpage,
-        composite_layers(result.layer_dict, result.fullpage.shape[:2]),
+        semantic_composite,
         guard.subject_mask,
     )
     fidelity["repair"] = dict(result.repair_report)
@@ -133,7 +165,7 @@ def save_portrait_bundle(output_dir: str, result: PortraitPipelineResult, *,
     diagnostic_paths["occlusion_graph"] = occlusion_relative
 
     error = np.abs(result.fullpage[..., :3].astype(np.int32)
-                   - composite[..., :3].astype(np.int32)).sum(axis=2)
+                   - reconstruction_composite[..., :3].astype(np.int32)).sum(axis=2)
     error_relative = "diagnostics/composite_error.png"
     Image.fromarray(np.clip(error, 0, 255).astype(np.uint8), mode="L").save(
         os.path.join(output_dir, *error_relative.split("/")))
@@ -207,6 +239,14 @@ def save_portrait_bundle(output_dir: str, result: PortraitPipelineResult, *,
                 "version": REPAIR_VERSION,
                 "order": list(REPAIR_ORDER),
                 "report": fidelity_relative,
+            },
+            "body_remainder": {
+                "path": remainder_relative,
+                "present": bool(has_remainder),
+                "semantic_role": "reconstruction_fallback",
+                "consumer": "diagnostic_only",
+                "composer_harvest": False,
+                "autorig_input": False,
             },
         },
         "diagnostics": diagnostic_paths,

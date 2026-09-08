@@ -109,14 +109,19 @@ A002.portrait/
    ├─ coverage_mask.png
    ├─ missing_mask.png
    ├─ spill_mask.png
+   ├─ body_remainder.png
    ├─ reconstruction.png
    ├─ layer_composite.png
+   ├─ semantic_composite.png
    └─ composite_error.png
 ```
 
 `layers/` is the `production_repaired` canonical stage. See
 [`docs/PORTRAIT_BUNDLE_V1.md`](../docs/PORTRAIT_BUNDLE_V1.md) for the schema and
 invariants.
+`body_remainder.png` is diagnostic-only reconstruction fallback and is never a
+Composer/AutoRig input. Use `semantic_composite.png` when reviewing the
+swap-safe semantic stack.
 
 ## Architecture boundaries
 

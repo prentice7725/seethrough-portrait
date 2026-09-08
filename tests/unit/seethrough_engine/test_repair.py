@@ -9,7 +9,9 @@ from seethrough_engine.repair import (
     RECLAIM_PAIRS,
     REPAIR_ORDER,
     REPAIR_VERSION,
+    clean_garment_contacts,
     clean_garment_orphans,
+    extract_mouth_feature,
     fit_edge_alpha,
     fit_layer_tone,
     fit_mouth_contact,
@@ -131,6 +133,61 @@ class ToneFitTests(unittest.TestCase):
             self.assertTrue(np.array_equal(out[tag][..., 3], layers[tag][..., 3]))
 
 
+class GarmentContactTests(unittest.TestCase):
+    """A connected topwear mass may incorrectly claim the neck/face."""
+
+    def scene(self, *, garment_matches_anatomy=False):
+        original = np.zeros((CANVAS, CANVAS, 4), dtype=np.uint8)
+        original[..., 3] = 255
+        original[20:72, 40:88, :3] = (224, 178, 158)  # visible skin
+        original[72:112, 30:98, :3] = (145, 125, 120)  # garment
+
+        face = np.zeros_like(original)
+        face[20:52, 48:80, :3] = (224, 178, 158)
+        face[20:52, 48:80, 3] = 255
+        neck = np.zeros_like(original)
+        neck[52:72, 54:74, :3] = (224, 178, 158)
+        neck[52:72, 54:74, 3] = 255
+
+        topwear = np.zeros_like(original)
+        topwear[20:112, 30:98, :3] = (
+            (224, 178, 158) if garment_matches_anatomy else (145, 125, 120)
+        )
+        topwear[20:112, 30:98, 3] = 255
+        # The lower garment remains a valid connected garment body.
+        topwear[72:112, 30:98, :3] = (145, 125, 120)
+        return original, {"face": face, "neck": neck, "topwear": topwear}
+
+    def test_connected_skin_contact_is_removed_only_where_anatomy_wins(self):
+        original, layers = self.scene()
+        raw_snapshot = {tag: image.copy() for tag, image in layers.items()}
+        out, report = clean_garment_contacts(layers, original, min_area=4)
+
+        self.assertEqual(int(out["topwear"][30:52, 48:80, 3].sum()), 0)
+        self.assertEqual(int(out["topwear"][80:100, 40:88, 3].min()), 255)
+        self.assertGreater(report["topwear"]["removed_px"], 0)
+        self.assertTrue(any(
+            row["status"] == "removed"
+            for row in report["topwear"]["components"]
+        ))
+        for tag, image in layers.items():
+            np.testing.assert_array_equal(image, raw_snapshot[tag])
+
+    def test_contact_is_kept_when_garment_explains_original_better(self):
+        original, layers = self.scene(garment_matches_anatomy=True)
+        out, report = clean_garment_contacts(layers, original, min_area=4)
+
+        np.testing.assert_array_equal(out["topwear"], layers["topwear"])
+        self.assertEqual(report, {})
+
+    def test_full_repair_records_contact_stage(self):
+        original, layers = self.scene()
+        result = repair_portrait_layers(layers, original)
+
+        self.assertEqual(result.report["order"], list(REPAIR_ORDER))
+        self.assertIn("clean_garment_contacts", result.report)
+
+
 class MouthContactTests(unittest.TestCase):
     """A mouth matte may surround the drawing, but the face owns the skin."""
 
@@ -183,6 +240,76 @@ class MouthContactTests(unittest.TestCase):
         out, report = fit_mouth_contact(layers, original, band=5)
         self.assertEqual(report["status"], "unchanged")
         np.testing.assert_array_equal(out["mouth"], layers["mouth"])
+
+
+class MouthFeatureTests(unittest.TestCase):
+    def scene(self):
+        face = np.full((64, 64, 4), (170, 110, 85, 255), dtype=np.uint8)
+        mouth = np.zeros_like(face)
+        mouth[8:56, 8:56] = face[8:56, 8:56]
+        # A closed outline protects even a skin-coloured mouth interior.
+        mouth[26:38, 20:44, :3] = (45, 20, 25)
+        mouth[28:36, 22:42, :3] = (170, 110, 85)
+        mouth[28:31, 24:40, :3] = (245, 240, 220)  # teeth
+        mouth[33:36, 24:40, :3] = (190, 80, 100)  # tongue
+        mouth[25, 21:43] = (110, 70, 65, 80)  # soft lip edge
+        layers = {"face": face, "mouth": mouth}
+        return composite_layers(layers, (64, 64)), layers
+
+    def test_redundant_skin_removed_and_feature_rgba_preserved(self):
+        original, layers = self.scene()
+        raw = layers["mouth"].copy()
+        out, report = extract_mouth_feature(layers, original)
+        self.assertEqual(report["status"], "applied")
+        self.assertEqual(int(out["mouth"][10, 10, 3]), 0)
+        np.testing.assert_array_equal(out["mouth"][26:38, 20:44], raw[26:38, 20:44])
+        np.testing.assert_array_equal(out["mouth"][25, 21:43], raw[25, 21:43])
+        np.testing.assert_array_equal(out["face"], layers["face"])
+        np.testing.assert_array_equal(layers["mouth"], raw)
+        np.testing.assert_array_equal(composite_layers(out, (64, 64)), original)
+        # On a differently coloured recipient the exterior is recipient skin.
+        recipient = np.full_like(layers["face"], (80, 55, 40, 255))
+        swapped = composite_layers({"face": recipient, "mouth": out["mouth"]}, (64, 64))
+        np.testing.assert_array_equal(swapped[10, 10], recipient[10, 10])
+        again, _ = extract_mouth_feature(out, original)
+        np.testing.assert_array_equal(again["mouth"], out["mouth"])
+
+    def test_faint_and_opaque_wrong_colour_fringe_removed(self):
+        original, layers = self.scene()
+        for alpha in (1, 8, 80, 255):
+            with self.subTest(alpha=alpha):
+                mouth = layers["mouth"].copy()
+                mouth[9:12, 9:12] = (50, 30, 20, alpha)
+                out, _ = extract_mouth_feature({**layers, "mouth": mouth}, original)
+                self.assertFalse(out["mouth"][9:12, 9:12].any())
+
+    def test_uncertain_face_does_not_destroy_mouth(self):
+        original, layers = self.scene()
+        for face in (None, original.copy()):
+            candidate = {"mouth": layers["mouth"]}
+            if face is not None:
+                candidate["face"] = face
+            out, report = extract_mouth_feature(candidate, original)
+            self.assertEqual(report["status"], "review")
+            np.testing.assert_array_equal(out["mouth"], layers["mouth"])
+
+    def test_transparent_face_and_occluded_pixels_are_preserved(self):
+        original, layers = self.scene()
+        layers["face"][10, 10, 3] = 0
+        overlay = np.zeros_like(original)
+        overlay[11, 11] = (30, 30, 30, 255)
+        order = (*SEMANTIC_Z_ORDER, "test_overlay")
+        layers["test_overlay"] = overlay
+        out, _ = extract_mouth_feature(layers, original, order=order)
+        np.testing.assert_array_equal(out["mouth"][10, 10], layers["mouth"][10, 10])
+        np.testing.assert_array_equal(out["mouth"][11, 11], layers["mouth"][11, 11])
+
+    def test_canonical_pipeline_applies_terminal_feature_policy(self):
+        original, layers = self.scene()
+        result = repair_portrait_layers(layers, original)
+        self.assertEqual(result.report["order"][-1], "extract_mouth_feature")
+        self.assertEqual(result.report["extract_mouth_feature"]["status"], "applied")
+        self.assertEqual(int(result.layers["mouth"][10, 10, 3]), 0)
 
 
 class SeamResidualTests(unittest.TestCase):

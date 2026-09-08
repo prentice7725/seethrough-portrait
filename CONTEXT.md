@@ -13,6 +13,14 @@ A full-canvas, straight-alpha, sRGB RGBA image after Silhouette Guard and the
 complete fidelity-repair sequence. Canonical layers are safe for another
 program to consume without running repair again.
 
+Mouth has a terminal feature-extraction policy after seam fitting. Exterior
+facial matte is removed where an opaque face already explains the source,
+including redundant source-coloured skin that reconstruction alone cannot
+detect. Lip drawing, enclosed interiors, and source-supported antialiasing
+retain their RGBA. Extraction never transfers the matte into face or changes
+raw layers. Missing or ambiguous face evidence is reported for review rather
+than forcing an unsupported trim.
+
 ## Raw layer
 
 The selected model output before Silhouette Guard and fidelity repair. Raw
@@ -21,10 +29,11 @@ layers exist only for debugging, provenance, and regression analysis.
 ## Fidelity repair
 
 The ordered static reconstruction pass: reclaim occluded pixels, remove
-well-supported orphan semantic contamination, fit material tone, fit edge
-alpha, then fit residual seams. It compares layers with the original still
-image and contains no animation policy. A proposed cleanup is accepted only
-when canonical composite fidelity does not regress.
+well-supported orphan semantic contamination and anatomy-contradicted garment
+contact ownership, fit material tone, fit edge alpha, then fit residual seams.
+It compares layers with the original still image and contains no animation
+policy. A proposed cleanup is accepted only when canonical composite fidelity
+does not regress.
 
 ## Semantic warning
 

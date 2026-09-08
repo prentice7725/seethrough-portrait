@@ -95,6 +95,30 @@ def test_bundle_can_omit_raw_layers_without_changing_the_canonical_contract(tmp_
     assert not (tmp_path / "raw_layers").exists()
 
 
+def test_body_remainder_is_diagnostic_only_and_never_published_as_canonical(tmp_path):
+    result = result_fixture()
+    remainder = np.zeros_like(result.fullpage)
+    remainder[:4, :, :3] = 255
+    remainder[:4, :, 3] = 255
+    result.guard.body_remainder = remainder
+
+    manifest = save_portrait_bundle(str(tmp_path), result)
+
+    assert "body_remainder" not in manifest["layers"]
+    assert manifest["diagnostics"]["body_remainder"] == "diagnostics/body_remainder.png"
+    assert (tmp_path / "diagnostics" / "body_remainder.png").is_file()
+    contract = manifest["layer_contract"]["body_remainder"]
+    assert contract["semantic_role"] == "reconstruction_fallback"
+    assert contract["consumer"] == "diagnostic_only"
+    assert contract["composer_harvest"] is False
+    assert contract["autorig_input"] is False
+    assert manifest["diagnostics"]["semantic_composite"] == "diagnostics/semantic_composite.png"
+    semantic = np.array(Image.open(tmp_path / "diagnostics" / "semantic_composite.png"))
+    reconstruction = np.array(Image.open(tmp_path / "diagnostics" / "layer_composite.png"))
+    assert semantic[1, 1, 3] == 0
+    assert reconstruction[1, 1, 3] == 255
+
+
 def test_deep_repair_interface_runs_the_declared_order():
     original = rgba(64, 180)
     result = repair_portrait_layers({"face": original.copy()}, original)

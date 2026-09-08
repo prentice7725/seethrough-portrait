@@ -17,15 +17,17 @@ from .image import composite_fidelity, composite_layers
 from .scale import canvas_scale, odd_kernel, scale_area, scale_length
 from .semantic import SEMANTIC_Z_ORDER
 
-REPAIR_VERSION = "1.8"
+REPAIR_VERSION = "2.0"
 REPAIR_ORDER = (
     "reclaim_occluded",
     "fit_layer_tone",
     "fit_edge_alpha",
     "clean_garment_orphans",
+    "clean_garment_contacts",
     "fit_edge_alpha_final",
     "fit_mouth_contact",
     "fit_seam_residual",
+    "extract_mouth_feature",
 )
 
 # A garment layer sometimes comes back holding the skin visible through its own
@@ -128,6 +130,20 @@ ORPHAN_REDUNDANT_MAX_ERROR = 18
 ORPHAN_REDUNDANT_RATIO = 0.70
 ORPHAN_FRINGE_PX = 2
 
+# Connected garment output can also claim a face/neck contact area as one
+# large component, so the orphan rule deliberately cannot see it.  This pass
+# handles only measured overlaps with an existing anatomy owner; it never
+# trims a garment by a global body/neck shape.  Pixels are removed only when
+# the anatomy layer explains the original better and the full static
+# reconstruction does not regress.
+CONTACT_GARMENT_TAGS: tuple[str, ...] = ("topwear", "neckwear")
+CONTACT_ANATOMY_TAGS: tuple[str, ...] = (
+    "neck", "head", "face", "ears", "earl", "earr",
+)
+CONTACT_ERROR_MARGIN = 12
+CONTACT_MIN_AREA_AT_768 = 8
+CONTACT_ALPHA_THRESHOLD = 10
+
 # Mouth is a feature layer, but model output can include a soft skin-coloured
 # matte around the drawing.  Only the narrow raster contact band is eligible;
 # the interior (lip/teeth/outline) is never globally trimmed.
@@ -140,6 +156,78 @@ MOUTH_HALO_MIN_LUMA = 110
 MOUTH_HALO_MAX_CHROMA = 100
 MOUTH_FRINGE_BASE_ERROR_MAX = 40
 MOUTH_FRINGE_BAND_RATIO = 0.45
+
+
+def extract_mouth_feature(
+    layer_dict: dict[str, np.ndarray], original_rgba: np.ndarray, *,
+    order: tuple[str, ...] = SEMANTIC_Z_ORDER,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """Remove exterior facial matte, including source-coloured opaque skin.
+
+    Source reconstruction alone cannot detect a redundant donor skin patch.
+    Use the source-vs-underlay drawing as a barrier and remove only exterior
+    pixels already explained by an opaque face, with no per-pixel regression.
+    Enclosed interiors and all source-supported feature pixels retain their
+    original RGBA, including antialiasing. No skin-colour palette is assumed.
+    Ambiguous underlays are reported rather than inventing a mouth mask.
+    """
+    out = dict(layer_dict)
+    if "mouth" not in out:
+        return out, {"status": "missing"}
+    original = np.asarray(original_rgba)
+    mouth = np.asarray(out["mouth"])
+    if original.ndim != 3 or original.shape[-1] != 4 or mouth.shape != original.shape:
+        raise ValueError("mouth layer and original must share an HxWx4 canvas")
+    support = mouth[..., 3] > 0
+    if not support.any():
+        return out, {"status": "empty"}
+    face = out.get("face")
+    if face is None:
+        return out, {"status": "review", "reason": "missing face underlay"}
+    if np.asarray(face).shape != original.shape:
+        raise ValueError("face layer and original must share an HxWx4 canvas")
+    beneath = {tag: arr for tag, arr in out.items() if tag != "mouth"}
+    base = composite_layers(beneath, original.shape[:2], order=order, alpha_threshold=0)
+    current = composite_layers(out, original.shape[:2], order=order, alpha_threshold=0)
+    base_diff = np.abs(original[..., :3].astype(np.int16) - base[..., :3])
+    current_error = np.abs(original[..., :3].astype(np.int16) - current[..., :3]).sum(axis=2)
+    # Even faint shading is protected. Below this noise tolerance the exact
+    # pixel error check still preserves correctly reconstructed soft edges.
+    drawing = support & (base_diff.max(axis=2) > 3)
+    if not drawing.any():
+        return out, {"status": "review", "reason": "no independent mouth evidence"}
+    # Flood the complement from a padded exterior; unlike an ellipse or a
+    # convex hull this follows open/closed mouths without cutting out teeth,
+    # tongue, or skin-coloured pixels enclosed by the lip drawing.
+    exterior = np.pad((~drawing).astype(np.uint8), 1, constant_values=1)
+    cv2.floodFill(exterior, None, (0, 0), 2, flags=4)
+    exterior = exterior[1:-1, 1:-1] == 2
+    visible = support.copy()
+    rank = {tag: i for i, tag in enumerate(order)}
+    for tag, arr in out.items():
+        if rank.get(tag, -1) > rank.get("mouth", -1):
+            visible &= np.asarray(arr)[..., 3] == 0
+    removable = (
+        exterior & visible & (np.asarray(face)[..., 3] == 255)
+        & (original[..., 3] == 255) & (base[..., 3] == 255)
+        & (base_diff.max(axis=2) <= 3)
+        & (base_diff.sum(axis=2) <= current_error)
+    )
+    report = {"status": "unchanged", "candidate_px": int(removable.sum()),
+              "protected_feature_px": int((support & ~exterior).sum())}
+    if not removable.any():
+        return out, report
+    cleaned = mouth.copy()
+    cleaned[removable] = 0
+    tentative = {**out, "mouth": cleaned}
+    before = _static_reconstruction_score(out, original, order)
+    after = _static_reconstruction_score(tentative, original, order)
+    if after[0] > before[0] or after[1] > before[1]:
+        report.update(status="review", reason="reconstruction gate rejected extraction")
+        return out, report
+    report.update(status="applied", removed_skin_px=int(removable.sum()),
+                  rgb_error_delta=int(after[0] - before[0]))
+    return tentative, report
 
 def reclaim_occluded(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarray, *,
                      pairs: tuple[tuple[str, str], ...] = RECLAIM_PAIRS,
@@ -582,6 +670,183 @@ def clean_garment_orphans(
     return out, report
 
 
+def clean_garment_contacts(
+    layer_dict: dict[str, np.ndarray],
+    original_rgba: np.ndarray,
+    *,
+    garment_tags: tuple[str, ...] = CONTACT_GARMENT_TAGS,
+    anatomy_tags: tuple[str, ...] = CONTACT_ANATOMY_TAGS,
+    order: tuple[str, ...] = SEMANTIC_Z_ORDER,
+    alpha_threshold: int = CONTACT_ALPHA_THRESHOLD,
+    margin: int = CONTACT_ERROR_MARGIN,
+    min_area: int | None = None,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """Remove connected garment ownership that is contradicted by anatomy.
+
+    ``clean_garment_orphans`` intentionally skips the largest connected
+    component, but a malformed topwear prediction can be one connected mass
+    spanning the garment and the visible neck/face.  Here we inspect only the
+    overlap with an emitted anatomy layer and compare both semantic colours to
+    the original still.  No geometry or rig knowledge is used, and the exact
+    static reconstruction score remains the acceptance gate.
+    """
+    original = np.asarray(original_rgba)
+    if original.ndim != 3 or original.shape[-1] != 4:
+        raise ValueError("original_rgba must be an HxWx4 canvas")
+    if min_area is None:
+        min_area = scale_area(CONTACT_MIN_AREA_AT_768, original.shape)
+
+    out = dict(layer_dict)
+    report: dict[str, Any] = {}
+    original_rgb = original[..., :3].astype(np.int32)
+    current_score = _static_reconstruction_score(out, original, order)
+
+    anatomy: list[tuple[str, np.ndarray]] = []
+    for tag in anatomy_tags:
+        layer = out.get(tag)
+        if layer is None:
+            continue
+        arr = np.asarray(layer)
+        if arr.shape != original.shape:
+            continue
+        mask = arr[..., 3] > alpha_threshold
+        if mask.any():
+            anatomy.append((tag, arr))
+    if not anatomy:
+        return out, report
+
+    for garment_tag in garment_tags:
+        garment = out.get(garment_tag)
+        if garment is None:
+            continue
+        garment = np.asarray(garment)
+        if garment.shape != original.shape:
+            continue
+        garment_mask = garment[..., 3] > alpha_threshold
+        if not garment_mask.any():
+            continue
+
+        best_error = np.full(garment_mask.shape, 1_000_000, np.int32)
+        best_tag = np.full(garment_mask.shape, "", dtype=object)
+        best_alpha = np.zeros(garment_mask.shape, np.uint8)
+        overlap = np.zeros(garment_mask.shape, bool)
+        for anatomy_tag, anatomy_layer in anatomy:
+            anatomy_mask = anatomy_layer[..., 3] > alpha_threshold
+            shared = garment_mask & anatomy_mask
+            if not shared.any():
+                continue
+            error = np.abs(
+                original_rgb - anatomy_layer[..., :3].astype(np.int32)
+            ).sum(axis=2)
+            better = shared & (error < best_error)
+            best_error[better] = error[better]
+            best_tag[better] = anatomy_tag
+            best_alpha[better] = anatomy_layer[..., 3][better]
+            overlap |= shared
+
+        garment_error = np.abs(
+            original_rgb - garment[..., :3].astype(np.int32)
+        ).sum(axis=2)
+        # A garment can sit below several semantic layers.  Removing it is
+        # ownership-safe only when the anatomy winner is also the topmost
+        # visible layer at that pixel; otherwise an intermediate handwear or
+        # hair layer could be exposed by the cleanup.
+        rank = {tag: index for index, tag in enumerate(order)}
+        front_tag = np.full(garment_mask.shape, "", dtype=object)
+        front_rank = np.full(garment_mask.shape, rank.get(garment_tag, -1), np.int16)
+        front_alpha = np.zeros(garment_mask.shape, np.uint8)
+        for tag, layer in out.items():
+            if rank.get(tag, -1) <= rank.get(garment_tag, -1):
+                continue
+            arr = np.asarray(layer)
+            visible = arr[..., 3] > alpha_threshold
+            newer = visible & (rank.get(tag, -1) > front_rank)
+            front_tag[newer] = tag
+            front_rank[newer] = rank.get(tag, -1)
+            front_alpha[newer] = arr[..., 3][newer]
+        covered_by_winner = (
+            (front_tag == best_tag) & (front_alpha >= 250)
+        )
+        # Fully covered contact pixels can be removed without exposing a
+        # partially transparent anatomy edge.  Soft-edge pixels stay in the
+        # ambiguous report for the later edge-alpha stage.
+        candidate = (
+            overlap & (best_alpha >= 250)
+            & covered_by_winner
+            & (best_error + margin < garment_error)
+        )
+        if not candidate.any():
+            continue
+
+        # Close pinholes but do not expand beyond the measured overlap. This
+        # keeps the operation local to the actual contact band.
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        candidate = cv2.morphologyEx(
+            candidate.astype(np.uint8), cv2.MORPH_CLOSE, kernel
+        ).astype(bool) & overlap & (best_alpha >= 250) & covered_by_winner \
+            & (best_error + margin < garment_error)
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(
+            candidate.astype(np.uint8), 8
+        )
+        rows: list[dict[str, Any]] = []
+        removed_px = 0
+        for index in range(1, count):
+            component = labels == index
+            area = int(stats[index, cv2.CC_STAT_AREA])
+            x = int(stats[index, cv2.CC_STAT_LEFT])
+            y = int(stats[index, cv2.CC_STAT_TOP])
+            width = int(stats[index, cv2.CC_STAT_WIDTH])
+            height = int(stats[index, cv2.CC_STAT_HEIGHT])
+            row: dict[str, Any] = {
+                "area_px": area,
+                "bbox_xywh": [x, y, width, height],
+                "anatomy_tags": sorted({
+                    str(value) for value in best_tag[component]
+                    if value
+                }),
+            }
+            if area < min_area:
+                row.update(status="ambiguous", reason="below minimum contact area")
+                rows.append(row)
+                continue
+
+            patched = np.array(garment, copy=True)
+            patched[..., 3][component] = 0
+            tentative = dict(out)
+            tentative[garment_tag] = patched
+            tentative_score = _static_reconstruction_score(
+                tentative, original, order
+            )
+            if (tentative_score[0] <= current_score[0]
+                    and tentative_score[1] <= current_score[1]):
+                previous_score = current_score
+                out = tentative
+                garment = patched
+                current_score = tentative_score
+                removed_px += area
+                row.update(
+                    status="removed",
+                    removed_px=area,
+                    rgb_error_delta=int(
+                        tentative_score[0] - previous_score[0]
+                    ),
+                )
+            else:
+                row.update(
+                    status="ambiguous",
+                    reason="virtual removal worsened reconstruction",
+                )
+            rows.append(row)
+
+        if rows:
+            report[garment_tag] = {
+                "removed_px": removed_px,
+                "components": rows,
+            }
+
+    return out, report
+
+
 def fit_mouth_contact(
     layer_dict: dict[str, np.ndarray],
     original_rgba: np.ndarray,
@@ -1015,6 +1280,7 @@ def repair_portrait_layers(layer_dict: dict[str, np.ndarray],
         outside=scale_length(EDGE_OUTSIDE_PX, shape),
     )
     working, orphan_cleanup = clean_garment_orphans(working, original_rgba)
+    working, contact_cleanup = clean_garment_contacts(working, original_rgba)
     # Cleanup can alter an ownership edge. Refit edge coverage against the
     # final owner set, then fit its colour residual. This is deliberately a
     # second narrow-band solve, not a broad re-application of tone fitting.
@@ -1032,6 +1298,8 @@ def repair_portrait_layers(layer_dict: dict[str, np.ndarray],
         band=scale_length(SEAM_BAND_PX, shape),
         iterations=SEAM_ITERATIONS,
     )
+    # Terminal mouth policy: generic fitting must not reintroduce donor skin.
+    working, mouth_feature = extract_mouth_feature(working, original_rgba)
     return RepairResult(
         layers=working,
         report={
@@ -1041,8 +1309,10 @@ def repair_portrait_layers(layer_dict: dict[str, np.ndarray],
             "fit_layer_tone": tone_fit,
             "fit_edge_alpha": edge_fit,
             "clean_garment_orphans": orphan_cleanup,
+            "clean_garment_contacts": contact_cleanup,
             "fit_edge_alpha_final": final_edge_fit,
             "fit_mouth_contact": mouth_contact,
             "fit_seam_residual": seam_fit,
+            "extract_mouth_feature": mouth_feature,
         },
     )

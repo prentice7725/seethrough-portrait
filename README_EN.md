@@ -43,8 +43,8 @@ imports.
   runs once, `QUALITY` compares three attempts, and `HARVEST` compares five.
   HARVEST is a SeeThrough producer profile, not Composer donor harvesting.
 - **Fidelity repair** runs `reclaim_occluded → fit_layer_tone → fit_edge_alpha
-  → clean_garment_orphans → fit_edge_alpha_final → fit_mouth_contact
-  → fit_seam_residual` against
+  → clean_garment_orphans → clean_garment_contacts → fit_edge_alpha_final → fit_mouth_contact
+  → fit_seam_residual → extract_mouth_feature` against
   the original still
   image and conservatively removes isolated garment semantic contamination.
 - **Static validation** measures whole-composite fidelity and thin, continuous
@@ -78,8 +78,10 @@ A001.portrait/
    ├─ coverage_mask.png
    ├─ missing_mask.png
    ├─ spill_mask.png
+   ├─ body_remainder.png
    ├─ reconstruction.png
    ├─ layer_composite.png
+   ├─ semantic_composite.png
    └─ composite_error.png
 ```
 
@@ -87,6 +89,10 @@ Downstream consumers use only `layers/`. `raw_layers/` records model output for
 forensics and is not a fallback asset source or canonical input. See
 [`docs/PORTRAIT_BUNDLE_V1.md`](docs/PORTRAIT_BUNDLE_V1.md) for the invariants
 and JSON Schema.
+`body_remainder` is a reconstruction fallback written only to
+`diagnostics/body_remainder.png`. `layer_composite.png` is the static
+reconstruction stack; `semantic_composite.png` contains only swap-safe semantic
+parts.
 
 ## Install for ComfyUI
 

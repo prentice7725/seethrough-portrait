@@ -49,6 +49,9 @@
     },
     "layers": {
       "type": "object",
+      "propertyNames": {
+        "not": {"enum": ["body_remainder", "head_remainder", "neck_remainder"]}
+      },
       "additionalProperties": {
         "type": "object",
         "required": ["path", "source_tag"],
@@ -86,9 +89,22 @@
           "properties": {
             "version": {"type": "string"},
             "order": {
-              "const": ["reclaim_occluded", "fit_layer_tone", "fit_edge_alpha", "clean_garment_orphans", "fit_edge_alpha_final", "fit_mouth_contact", "fit_seam_residual"]
+              "const": ["reclaim_occluded", "fit_layer_tone", "fit_edge_alpha", "clean_garment_orphans", "clean_garment_contacts", "fit_edge_alpha_final", "fit_mouth_contact", "fit_seam_residual", "extract_mouth_feature"]
             },
             "report": {"type": "string", "pattern": "^diagnostics/fidelity\\.json$"}
+          },
+          "additionalProperties": false
+        },
+        "body_remainder": {
+          "type": "object",
+          "required": ["path", "present", "semantic_role", "consumer", "composer_harvest", "autorig_input"],
+          "properties": {
+            "path": {"const": "diagnostics/body_remainder.png"},
+            "present": {"type": "boolean"},
+            "semantic_role": {"const": "reconstruction_fallback"},
+            "consumer": {"const": "diagnostic_only"},
+            "composer_harvest": {"const": false},
+            "autorig_input": {"const": false}
           },
           "additionalProperties": false
         }

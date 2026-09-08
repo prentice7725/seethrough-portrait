@@ -11,6 +11,7 @@ Reference canvas: 768 × 768. Geometric lengths use
 | `repair.fit_seam_residual` | seam-side band | geometric length | normalized by scale |
 | `repair.clean_garment_orphans` | minimum area, main-mass distance | area / normalized diagonal | scale² / dimensionless |
 | `repair.clean_garment_orphans` | two-pixel fringe | raster antialias footprint | intentionally constant; scaling to three pixels at 1024 overreaches valid cloth and fails the exact transfer gate |
+| `repair.clean_garment_contacts` | minimum contact component | area | normalized by scale²; overlap and full-anatomy coverage remain required |
 | `semantic.semantic_warnings` | minimum iris/sclera evidence | area | normalized by scale² |
 | `local_fidelity` | iris/sclera evidence, neckline contact band | area / geometric length | area normalized by scale²; eye padding derives from feature size and neckline band scales by length |
 | `ownership` | contact/sample morphology, minimum recovered region | length / area | normalized by scale / scale² |
