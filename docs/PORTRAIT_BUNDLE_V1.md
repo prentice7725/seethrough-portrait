@@ -15,6 +15,9 @@ downstream consumer such as `portrait-autorig`.
 │  ├─ topwear.png
 │  └─ ...                   # semantic parts only
 ├─ raw_layers/             # optional; diagnostic only
+├─ derived/                # optional producer-side stratification
+│  ├─ depth/
+│  └─ left_right/
 └─ diagnostics/
    ├─ portrait_report.json
    ├─ semantic_ownership.json
@@ -39,6 +42,15 @@ downstream consumer such as `portrait-autorig`.
 - Coordinates use a top-left origin with Y increasing downward.
 - RGB is sRGB and alpha is straight (unpremultiplied).
 - `layers/` contains `production_repaired` canonical layers.
+- `derived/` is optional producer-side stratification. It contains only depth
+  maps or left/right derivatives explicitly requested for this export; it
+  never replaces or mutates `layers/`.
+- `derived.left_right.status` and `derived.depth.status` are `not_computed`
+  unless the corresponding optional stage was requested. Derived output is
+  provenance-bearing convenience data, not a second canonical layer set.
+- Producer order is `semantic layers → optional depth stratification →
+  optional left/right stratification → Portrait Bundle`. Both optional stages
+  consume the repaired canonical set and are never required to publish it.
 - `layers/` never contains `body_remainder`; it is a reconstruction fallback,
   not a swappable semantic owner. The fallback is written to
   `diagnostics/body_remainder.png` and may be used only for producer-side

@@ -251,6 +251,7 @@ def run_portrait(
     manual_seed,
     enable_head_detail,
     disable_guard,
+    stratify_left_right=False,
     progress=gr.Progress(track_tqdm=True),
 ):
     if image is None:
@@ -327,7 +328,10 @@ def run_portrait(
         progress(0.9, desc="Saving outputs...")
         run_id = f"{time.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
         out_dir = OUTPUT_ROOT / f"{run_id}.portrait"
-        manifest = save_portrait_bundle(str(out_dir), result, source_filename="upload.png")
+        manifest = save_portrait_bundle(
+            str(out_dir), result, source_filename="upload.png",
+            stratify_left_right=bool(stratify_left_right),
+        )
         fid_path = out_dir / manifest["diagnostics"]["fidelity"]
         import json
         with open(fid_path, encoding="utf-8") as handle:
@@ -454,6 +458,14 @@ def build_app() -> gr.Blocks:
                     info="작은 눈·코·입 semantic을 위한 head canvas입니다. 최종 품질은 원본 ROI 검증으로 판정합니다.",
                 )
             steps_in = gr.Slider(label="추론 단계", minimum=1, maximum=100, step=1, value=30)
+            stratify_lr_in = gr.Checkbox(
+                label="좌우 파생물 생성",
+                value=False,
+                info=(
+                    "필요할 때만 canonical layers에서 좌우 파츠를 만들어 "
+                    "derived/left_right에 저장합니다. canonical layers는 변경하지 않습니다."
+                ),
+            )
 
         with gr.Accordion("Reproducibility", open=False):
             seed_mode_in = gr.Radio(
@@ -490,7 +502,7 @@ def build_app() -> gr.Blocks:
             inputs=[
                 image_in, model_in, profile_in, subject_mask_in, key_bg_in,
                 resolution_in, steps_in, head_res_in, seed_mode_in, manual_seed_in,
-                head_detail_in, disable_guard_in,
+                head_detail_in, disable_guard_in, stratify_lr_in,
             ],
             outputs=[
                 validation_out, coverage_out, summary_out, layer_gallery_out,

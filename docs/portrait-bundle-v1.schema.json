@@ -66,6 +66,32 @@
       "type": "object",
       "additionalProperties": {"type": "string", "pattern": "^raw_layers/.+\\.png$"}
     },
+    "derived": {
+      "type": "object",
+      "required": ["source_stage", "left_right", "depth"],
+      "properties": {
+        "source_stage": {"const": "production_repaired"},
+        "left_right": {
+          "type": "object",
+          "required": ["status", "paths"],
+          "properties": {
+            "status": {"enum": ["computed", "not_computed"]},
+            "paths": {"type": "object"}
+          },
+          "additionalProperties": false
+        },
+        "depth": {
+          "type": "object",
+          "required": ["status", "paths"],
+          "properties": {
+            "status": {"enum": ["computed", "not_computed"]},
+            "paths": {"type": "object"}
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
     "layer_contract": {
       "type": "object",
       "required": ["canonical_stage", "raw_layers_preserved", "silhouette_guard", "semantic_ownership", "fidelity_repair"],

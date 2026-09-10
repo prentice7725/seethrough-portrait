@@ -73,6 +73,8 @@ def test_bundle_publishes_repaired_layers_and_keeps_raw_forensics(tmp_path):
     assert manifest["semantics"]["warnings"] == []
     assert "rig" not in manifest
     assert "spine" not in manifest
+    assert manifest["derived"]["left_right"]["status"] == "not_computed"
+    assert manifest["derived"]["depth"]["status"] == "not_computed"
 
     canonical = np.array(Image.open(tmp_path / manifest["layers"]["face"]["path"]))
     raw = np.array(Image.open(tmp_path / manifest["raw_layers"]["face"]))
@@ -117,6 +119,34 @@ def test_body_remainder_is_diagnostic_only_and_never_published_as_canonical(tmp_
     reconstruction = np.array(Image.open(tmp_path / "diagnostics" / "layer_composite.png"))
     assert semantic[1, 1, 3] == 0
     assert reconstruction[1, 1, 3] == 255
+
+
+def test_optional_stratification_is_written_under_derived_without_mutating_layers(tmp_path):
+    result = result_fixture()
+    handwear = np.zeros_like(result.fullpage)
+    handwear[8:16, 4:10, :3] = 80
+    handwear[8:16, 4:10, 3] = 255
+    handwear[8:16, 22:28, :3] = 80
+    handwear[8:16, 22:28, 3] = 255
+    result.layer_dict["handwear"] = handwear
+    depth = np.full(result.fullpage.shape[:2], 0.25, np.float32)
+
+    manifest = save_portrait_bundle(
+        str(tmp_path), result, depth_maps={"handwear": depth},
+        stratify_left_right=True,
+    )
+
+    assert "handwear" in manifest["layers"]
+    assert manifest["derived"]["left_right"]["status"] == "computed"
+    assert manifest["derived"]["depth"]["status"] == "computed"
+    paths = manifest["derived"]["left_right"]["paths"]["handwear"]
+    assert set(paths) == {"left", "right"}
+    assert (tmp_path / paths["left"]).is_file()
+    assert (tmp_path / paths["right"]).is_file()
+    depth_path = manifest["derived"]["depth"]["paths"]["handwear"]
+    assert (tmp_path / depth_path).is_file()
+    canonical = np.array(Image.open(tmp_path / manifest["layers"]["handwear"]["path"]))
+    np.testing.assert_array_equal(canonical, handwear)
 
 
 def test_deep_repair_interface_runs_the_declared_order():

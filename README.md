@@ -71,6 +71,7 @@ A001.portrait/
 ├─ original.png
 ├─ layers/                 # canonical production-repaired assets
 ├─ raw_layers/             # optional forensic output
+├─ derived/                # optional depth / left-right stratification
 └─ diagnostics/
    ├─ portrait_report.json
    ├─ semantic_ownership.json
@@ -94,6 +95,11 @@ A001.portrait/
 `body_remainder`는 `layers/`에 넣지 않고 `diagnostics/body_remainder.png`에만
 기록하는 재구성 fallback입니다. `layer_composite.png`는 정적 재구성용이고,
 `semantic_composite.png`는 교체 가능한 semantic 파츠만 합성한 결과입니다.
+필요할 때만 `derived/` 아래에 depth map과 좌우 분할 파생물이 기록됩니다.
+프로그래밍 호출에서는 `save_portrait_bundle(..., stratify_left_right=True)`로
+좌우 파생물을 켜고, 검증된 per-tag depth map이 있을 때만
+`depth_maps={tag: float32_HxW}`를 전달합니다. 두 옵션 모두 canonical
+`layers/`를 수정하지 않습니다.
 
 ## 설치 (ComfyUI)
 

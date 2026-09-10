@@ -125,6 +125,7 @@ try:
     from .seethrough_engine import repair as st_repair
     from .seethrough_engine import semantic as st_semantic
     from .seethrough_engine import depth as st_depth
+    from .seethrough_engine import stratification as st_stratification
 except ImportError:
     from seethrough_engine import model_loading as st_model_loading
     from seethrough_engine import generation as st_generation
@@ -134,6 +135,7 @@ except ImportError:
     from seethrough_engine import local_fidelity as st_local_fidelity
     from seethrough_engine import image as st_image
     from seethrough_engine import depth as st_depth
+    from seethrough_engine import stratification as st_stratification
 
 print("[SeeThrough] All see-through imports OK", flush=True)
 
@@ -218,56 +220,19 @@ def _resolve_model_path(model_name):
 
 
 def _label_lr_split(labels, stats, id1, id2):
-    label1 = (labels == id1).astype(np.uint8) * 255
-    label2 = (labels == id2).astype(np.uint8) * 255
-    stats1, stats2 = stats[id1], stats[id2]
-    x1 = stats[id1][0] + stats[id1][2] / 2
-    x2 = stats[id2][0] + stats[id2][2] / 2
-    if x2 < x1:
-        return label2, label1, stats2, stats1
-    return label1, label2, stats1, stats2
+    return st_stratification.label_lr_split(labels, stats, id1, id2)
 
 
 def _process_cuts(img, depth, src_xyxy, tgt_bbox, mask=None):
-    tx1, ty1, tx2, ty2 = tgt_bbox[:4]
-    tx2 += tx1
-    ty2 += ty1
-    img = img[ty1:ty2, tx1:tx2].copy()
-    depth = depth[ty1:ty2, tx1:tx2]
-    depth_median = 1.0
-    if mask is not None:
-        mask = (mask[ty1:ty2, tx1:tx2].copy() > 15).astype(np.uint8)
-        ksize = 1
-        element = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * ksize + 1, 2 * ksize + 1), (ksize, ksize))
-        mask = cv2.dilate(mask, element)
-        img[..., -1] *= mask
-        depth = 1 - (1 - depth) * mask
-        if np.any(mask):
-            depth_median = float(np.median(depth[mask > 0]))
-    fxyxy = [tx1 + src_xyxy[0], ty1 + src_xyxy[1], tx2 + src_xyxy[0], ty2 + src_xyxy[1]]
-    return img, depth, fxyxy, depth_median
+    return st_stratification.process_cuts(img, depth, src_xyxy, tgt_bbox, mask=mask)
 
 
 def _part_lr_split(tag, part_info):
-    num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(
-        part_info["mask"].astype(np.uint8) * 255, connectivity=8)
-    tag2pinfo = {}
-    if len(stats) > 2:
-        stats = np.array(stats)
-        stats_order = np.argsort(stats[..., -1])[::-1][1:]
-        arml_mask, armr_mask, statsl, statsr = _label_lr_split(labels, stats, stats_order[0], stats_order[1])
-        img, depth, xyxy, dm = _process_cuts(part_info["img"], part_info["depth"], part_info["xyxy"], statsl, mask=arml_mask)
-        tag2pinfo[f"{tag}-r"] = {"img": img, "xyxy": xyxy, "depth": depth, "depth_median": dm, "tag": f"{tag}-r"}
-        img, depth, xyxy, dm = _process_cuts(part_info["img"], part_info["depth"], part_info["xyxy"], statsr, mask=armr_mask)
-        tag2pinfo[f"{tag}-l"] = {"img": img, "xyxy": xyxy, "depth": depth, "depth_median": dm, "tag": f"{tag}-l"}
-    else:
-        tag2pinfo[tag] = part_info
-    return tag2pinfo
+    return st_stratification.part_lr_split(tag, part_info)
 
 
 def _tag_lr_split(tag, tag2pinfo):
-    if tag in tag2pinfo:
-        tag2pinfo.update(_part_lr_split(tag, tag2pinfo.pop(tag)))
+    st_stratification.tag_lr_split(tag, tag2pinfo)
 
 
 def _compute_depth_median(part_dict):

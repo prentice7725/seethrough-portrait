@@ -68,6 +68,7 @@ A001.portrait/
 ├─ original.png
 ├─ layers/                 # canonical production-repaired assets
 ├─ raw_layers/             # optional forensic output
+├─ derived/                # optional depth / left-right stratification
 └─ diagnostics/
    ├─ portrait_report.json
    ├─ semantic_ownership.json
@@ -92,7 +93,12 @@ and JSON Schema.
 `body_remainder` is a reconstruction fallback written only to
 `diagnostics/body_remainder.png`. `layer_composite.png` is the static
 reconstruction stack; `semantic_composite.png` contains only swap-safe semantic
-parts.
+parts. Optional depth maps and left/right derivatives are written under
+`derived/` only when requested.
+Programmatic callers can enable left/right output with
+`save_portrait_bundle(..., stratify_left_right=True)` and can pass validated
+per-tag `float32` depth maps via `depth_maps={tag: HxW}`. Neither option
+mutates canonical `layers/`.
 
 ## Install for ComfyUI
 

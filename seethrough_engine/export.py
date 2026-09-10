@@ -17,6 +17,7 @@ from .ownership import OWNERSHIP_VERSION
 from .seams import RUN_SLACK_PX, seam_report_layers
 from .semantic import SEMANTIC_Z_ORDER, semantic_warnings
 from .scale import scale_length
+from .stratification import build_stratification
 
 BUNDLE_FORMAT = "portrait-bundle"
 BUNDLE_VERSION = "1.0"
@@ -50,7 +51,9 @@ def _static_verdict(fidelity: dict[str, Any]) -> str:
 
 def save_portrait_bundle(output_dir: str, result: PortraitPipelineResult, *,
                          source_filename: str = "",
-                         preserve_raw_layers: bool = True) -> dict[str, Any]:
+                         preserve_raw_layers: bool = True,
+                         depth_maps: dict[str, np.ndarray] | None = None,
+                         stratify_left_right: bool = False) -> dict[str, Any]:
     """Publish one Portrait Bundle v1 into ``output_dir``."""
     output_dir = os.path.abspath(output_dir)
     for subdir in ("layers", "diagnostics"):
@@ -94,6 +97,36 @@ def save_portrait_bundle(output_dir: str, result: PortraitPipelineResult, *,
             relative = f"raw_layers/{tag}.png"
             _save_rgba(os.path.join(output_dir, *relative.split("/")), arr)
             raw_entries[tag] = relative
+
+    derived = build_stratification(
+        canonical,
+        depth_maps=depth_maps,
+        left_right=stratify_left_right,
+    )
+    derived_paths: dict[str, Any] = {}
+    if derived.left_right:
+        left_right_paths: dict[str, dict[str, str]] = {}
+        for tag, sides in derived.left_right.items():
+            left_right_paths[tag] = {}
+            for side, arr in sides.items():
+                relative = f"derived/left_right/{tag}_{side}.png"
+                path = os.path.join(output_dir, *relative.split("/"))
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                _save_rgba(path, arr)
+                left_right_paths[tag][side] = relative
+        derived_paths["left_right"] = left_right_paths
+    if derived.depth:
+        depth_paths: dict[str, str] = {}
+        for tag, depth in derived.depth.items():
+            relative = f"derived/depth/{tag}.png"
+            path = os.path.join(output_dir, *relative.split("/"))
+            os.makedirs(os.path.dirname(path), exist_ok=True)
+            Image.fromarray(
+                np.rint(np.clip(depth, 0.0, 1.0) * 255.0).astype(np.uint8),
+                mode="L",
+            ).save(path)
+            depth_paths[tag] = relative
+        derived_paths["depth"] = depth_paths
 
     guard = result.guard
     diagnostic_paths: dict[str, str] = {}
@@ -226,6 +259,17 @@ def save_portrait_bundle(output_dir: str, result: PortraitPipelineResult, *,
         "generation": generation_metadata,
         "layers": layer_entries,
         "raw_layers": raw_entries,
+        "derived": {
+            "source_stage": "production_repaired",
+            "left_right": {
+                "status": derived.report["left_right"]["status"],
+                "paths": derived_paths.get("left_right", {}),
+            },
+            "depth": {
+                "status": derived.report["depth"]["status"],
+                "paths": derived_paths.get("depth", {}),
+            },
+        },
         "layer_contract": {
             "canonical_stage": "production_repaired",
             "raw_layers_preserved": bool(preserve_raw_layers),

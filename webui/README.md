@@ -68,6 +68,12 @@ are in **Advanced**. Seed controls are in **Reproducibility**:
 - `regression` uses the displayed regression seed (42 by default) for repeatable
   fixtures.
 
+The Advanced **좌우 파생물 생성** option is off by default. When enabled, the
+producer writes geometric left/right derivatives under `derived/left_right/`;
+the canonical `layers/` remain unchanged. Depth derivatives are intentionally
+API-only and are written when a caller supplies validated `depth_maps` to
+`save_portrait_bundle` (the standalone WebUI does not load Marigold implicitly).
+
 The UI does not expose an auto-fill count. Profile semantics own the number of
 candidate attempts.
 
@@ -99,6 +105,7 @@ A002.portrait/
 ├─ original.png
 ├─ layers/                 # canonical production-repaired assets
 ├─ raw_layers/             # forensic model output; downstream use prohibited
+├─ derived/                # optional depth / left-right stratification
 └─ diagnostics/
    ├─ portrait_report.json
    ├─ semantic_ownership.json
