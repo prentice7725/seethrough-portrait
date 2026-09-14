@@ -9,6 +9,7 @@ from seethrough_engine.repair import (
     RECLAIM_PAIRS,
     REPAIR_ORDER,
     REPAIR_VERSION,
+    clean_eye_ownership,
     clean_garment_contacts,
     clean_garment_orphans,
     extract_mouth_feature,
@@ -17,6 +18,7 @@ from seethrough_engine.repair import (
     fit_mouth_contact,
     fit_seam_residual,
     reclaim_occluded,
+    repair_eye_surface_contact,
     repair_portrait_layers,
 )
 from seethrough_engine.semantic import SEMANTIC_Z_ORDER
@@ -186,6 +188,70 @@ class GarmentContactTests(unittest.TestCase):
 
         self.assertEqual(result.report["order"], list(REPAIR_ORDER))
         self.assertIn("clean_garment_contacts", result.report)
+        self.assertIn("clean_eye_ownership", result.report)
+        self.assertIn("repair_eye_surface_contact", result.report)
+
+
+class EyeOwnershipTests(unittest.TestCase):
+    def scene(self):
+        original = np.zeros((CANVAS, CANVAS, 4), dtype=np.uint8)
+        original[..., :3] = (190, 150, 135)
+        original[..., 3] = 255
+
+        eyebrow = np.zeros_like(original)
+        eyebrow[30:33, 50:70, :3] = (60, 45, 40)
+        eyebrow[30:33, 50:70, 3] = 255
+
+        eyelash = np.zeros_like(original)
+        # A duplicated eyebrow component: wrong colour and fully overlapping.
+        eyelash[30:33, 50:70, :3] = (20, 18, 18)
+        eyelash[30:33, 50:70, 3] = 255
+        # A separate valid lash component must remain untouched.
+        original[38:40, 50:70, :3] = (20, 18, 18)
+        eyelash[38:40, 50:70, :3] = (20, 18, 18)
+        eyelash[38:40, 50:70, 3] = 255
+        return original, {"face": np.array(original, copy=True),
+                           "eyebrow": eyebrow, "eyelash": eyelash}
+
+    def test_detached_eyebrow_component_is_removed_but_real_lash_is_kept(self):
+        original, layers = self.scene()
+        raw_snapshot = {tag: image.copy() for tag, image in layers.items()}
+        out, report = clean_eye_ownership(layers, original, min_area=4)
+
+        self.assertEqual(report["status"], "applied")
+        self.assertEqual(int(out["eyelash"][31, 55, 3]), 0)
+        self.assertEqual(int(out["eyelash"][39, 55, 3]), 255)
+        self.assertGreater(report["removed_px"], 0)
+        np.testing.assert_array_equal(layers["eyelash"], raw_snapshot["eyelash"])
+
+    def test_ambiguous_component_is_retained(self):
+        original, layers = self.scene()
+        layers["eyelash"][30:33, 50:70, :3] = (60, 45, 40)
+        out, report = clean_eye_ownership(layers, original, min_area=4)
+
+        np.testing.assert_array_equal(out["eyelash"], layers["eyelash"])
+        self.assertNotEqual(report["status"], "applied")
+
+    def test_eye_surface_repair_reveals_head_only_around_iris(self):
+        original = np.zeros((CANVAS, CANVAS, 4), dtype=np.uint8)
+        original[..., :3] = (190, 150, 135)
+        original[..., 3] = 255
+        original[30:38, 50:70, :3] = (100, 88, 79)
+        head = np.array(original, copy=True)
+        head[30:38, 50:70, :3] = (100, 88, 79)
+        face = np.array(original, copy=True)
+        face[30:38, 50:70, :3] = (140, 100, 70)
+        iris = np.zeros_like(original)
+        iris[33:35, 58:62, :3] = (15, 12, 12)
+        iris[33:35, 58:62, 3] = 255
+        layers = {"head": head, "face": face, "irides": iris}
+
+        out, report = repair_eye_surface_contact(layers, original, min_area=2)
+
+        self.assertEqual(report["status"], "applied")
+        self.assertEqual(int(out["face"][33, 55, 3]), 0)
+        self.assertEqual(int(out["face"][20, 55, 3]), 255)
+        np.testing.assert_array_equal(layers["face"][..., 3], np.full((CANVAS, CANVAS), 255, np.uint8))
 
 
 class MouthContactTests(unittest.TestCase):

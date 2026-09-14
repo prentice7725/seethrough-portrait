@@ -99,7 +99,7 @@ input, now shared.
   diagnostic PNGs) via `seethrough_engine.export.save_portrait_run`
 - run log
 
-Runs also persist under `webui/outputs/<run_id>/` (gitignored) so a person
+Runs also persist under `C:\workspace\seethrough-output\<run_id>/` so a person
 can compare two runs on disk without re-downloading.
 
 ## Out of scope (explicitly deferred, not forgotten)

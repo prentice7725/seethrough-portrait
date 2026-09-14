@@ -17,13 +17,15 @@ from .image import composite_fidelity, composite_layers
 from .scale import canvas_scale, odd_kernel, scale_area, scale_length
 from .semantic import SEMANTIC_Z_ORDER
 
-REPAIR_VERSION = "2.0"
+REPAIR_VERSION = "2.1"
 REPAIR_ORDER = (
     "reclaim_occluded",
     "fit_layer_tone",
     "fit_edge_alpha",
     "clean_garment_orphans",
     "clean_garment_contacts",
+    "clean_eye_ownership",
+    "repair_eye_surface_contact",
     "fit_edge_alpha_final",
     "fit_mouth_contact",
     "fit_seam_residual",
@@ -156,6 +158,20 @@ MOUTH_HALO_MIN_LUMA = 110
 MOUTH_HALO_MAX_CHROMA = 100
 MOUTH_FRINGE_BASE_ERROR_MAX = 40
 MOUTH_FRINGE_BAND_RATIO = 0.45
+
+# A model can emit an eyebrow stroke in `eyelash` as a detached component.
+# This is not a global eye trim: only a component that substantially overlaps
+# the independently emitted eyebrow and wins a virtual static-composite test
+# may be removed.  The minimum area is scaled with the canvas so the rule has
+# the same meaning at 512/768/1024.
+EYE_FEATURE_ALPHA_THRESHOLD = 10
+EYE_OWNERSHIP_MIN_AREA_AT_768 = 4
+EYE_OWNERSHIP_MIN_OVERLAP_RATIO = 0.55
+EYE_OWNERSHIP_ERROR_MARGIN = 8
+EYE_SURFACE_ROI_X_RATIO = 1.0
+EYE_SURFACE_ROI_Y_RATIO = 0.9
+EYE_SURFACE_ERROR_MARGIN = 8
+EYE_SURFACE_MIN_AREA_AT_768 = 4
 
 
 def extract_mouth_feature(
@@ -847,6 +863,291 @@ def clean_garment_contacts(
     return out, report
 
 
+def clean_eye_ownership(
+    layer_dict: dict[str, np.ndarray],
+    original_rgba: np.ndarray,
+    *,
+    feature_tag: str = "eyelash",
+    owner_tag: str = "eyebrow",
+    order: tuple[str, ...] = SEMANTIC_Z_ORDER,
+    alpha_threshold: int = EYE_FEATURE_ALPHA_THRESHOLD,
+    min_area: int | None = None,
+    min_overlap_ratio: float = EYE_OWNERSHIP_MIN_OVERLAP_RATIO,
+    error_margin: int = EYE_OWNERSHIP_ERROR_MARGIN,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """Remove a detached feature component owned by a competing semantic.
+
+    LayerDiff occasionally places an eyebrow stroke in the eyelash output.
+    The cleanup is deliberately local and source-grounded: it considers only
+    connected eyelash components that overlap the emitted eyebrow, then
+    accepts removal only when the exact canonical composite does not regress.
+    Components that are ambiguous, connected to real lashes, or unsupported
+    by an eyebrow layer are retained and reported.
+    """
+    original = np.asarray(original_rgba)
+    if original.ndim != 3 or original.shape[-1] != 4:
+        raise ValueError("original_rgba must be an HxWx4 canvas")
+    if min_area is None:
+        min_area = scale_area(EYE_OWNERSHIP_MIN_AREA_AT_768, original.shape)
+
+    out = dict(layer_dict)
+    feature = out.get(feature_tag)
+    owner = out.get(owner_tag)
+    report: dict[str, Any] = {
+        "status": "missing" if feature is None or owner is None else "unchanged",
+        "feature_tag": feature_tag,
+        "owner_tag": owner_tag,
+    }
+    if feature is None or owner is None:
+        return out, report
+    feature = np.asarray(feature)
+    owner = np.asarray(owner)
+    if feature.shape != original.shape or owner.shape != original.shape:
+        return out, {**report, "status": "review", "reason": "canvas shape mismatch"}
+
+    feature_mask = feature[..., 3] > alpha_threshold
+    owner_mask = owner[..., 3] > alpha_threshold
+    if not feature_mask.any() or not owner_mask.any():
+        return out, {**report, "status": "empty"}
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        feature_mask.astype(np.uint8), connectivity=8,
+    )
+    if count <= 1:
+        return out, report
+
+    original_rgb = original[..., :3].astype(np.int32)
+    feature_error = np.abs(
+        original_rgb - feature[..., :3].astype(np.int32)
+    ).sum(axis=2)
+    owner_error = np.abs(
+        original_rgb - owner[..., :3].astype(np.int32)
+    ).sum(axis=2)
+    better_owner = owner_error + int(error_margin) < feature_error
+    current_score = _static_reconstruction_score(out, original, order)
+    rows: list[dict[str, Any]] = []
+    removed_px = 0
+    for index in range(1, count):
+        component = labels == index
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        overlap = component & owner_mask
+        overlap_ratio = float(overlap.sum()) / max(area, 1)
+        better_ratio = float((overlap & better_owner).sum()) / max(area, 1)
+        row: dict[str, Any] = {
+            "area_px": area,
+            "bbox_xywh": [
+                int(stats[index, cv2.CC_STAT_LEFT]),
+                int(stats[index, cv2.CC_STAT_TOP]),
+                int(stats[index, cv2.CC_STAT_WIDTH]),
+                int(stats[index, cv2.CC_STAT_HEIGHT]),
+            ],
+            "owner_overlap_ratio": round(overlap_ratio, 4),
+            "owner_better_ratio": round(better_ratio, 4),
+        }
+        if area < int(min_area):
+            row.update(status="ambiguous", reason="below minimum component area")
+            rows.append(row)
+            continue
+        if overlap_ratio < float(min_overlap_ratio) or better_ratio < float(min_overlap_ratio):
+            row.update(status="kept", reason="insufficient competing-owner evidence")
+            rows.append(row)
+            continue
+
+        # Prefer removing the whole duplicated component, but fall back to the
+        # measured overlap if a valid lash fragment shares its component.
+        candidates = [component]
+        if not np.array_equal(overlap, component):
+            candidates.append(overlap)
+        accepted = False
+        for remove in candidates:
+            if not remove.any():
+                continue
+            patched = np.array(feature, copy=True)
+            patched[remove] = 0
+            tentative = dict(out)
+            tentative[feature_tag] = patched
+            tentative_score = _static_reconstruction_score(tentative, original, order)
+            if (tentative_score[0] <= current_score[0]
+                    and tentative_score[1] <= current_score[1]):
+                previous_score = current_score
+                out = tentative
+                feature = patched
+                current_score = tentative_score
+                removed = int(remove.sum())
+                removed_px += removed
+                row.update(
+                    status="removed",
+                    removed_px=removed,
+                    rgb_error_delta=int(tentative_score[0] - previous_score[0]),
+                    bad_px_delta=int(tentative_score[1] - previous_score[1]),
+                )
+                accepted = True
+                break
+        if not accepted:
+            row.update(status="ambiguous", reason="virtual removal worsened reconstruction")
+        rows.append(row)
+
+    if rows:
+        report.update(
+            status="applied" if removed_px else "unchanged",
+            removed_px=removed_px,
+            components=rows,
+        )
+    return out, report
+
+
+def repair_eye_surface_contact(
+    layer_dict: dict[str, np.ndarray],
+    original_rgba: np.ndarray,
+    *,
+    surface_tag: str = "face",
+    underlay_tag: str = "head",
+    iris_tags: tuple[str, ...] = ("irides", "iridesl", "iridesr"),
+    order: tuple[str, ...] = SEMANTIC_Z_ORDER,
+    alpha_threshold: int = EYE_FEATURE_ALPHA_THRESHOLD,
+    min_area: int | None = None,
+    error_margin: int = EYE_SURFACE_ERROR_MARGIN,
+) -> tuple[dict[str, np.ndarray], dict[str, Any]]:
+    """Expose an underlay eye surface where ``face`` incorrectly covers it.
+
+    Some portraits have a dark or tinted sclera behind glasses.  The model may
+    emit that eye surface in ``head`` while emitting an opaque skin ``face``
+    over the same ROI, so no independent ``eyewhite`` tag can be produced.
+    This local ownership pass preserves the source still without inventing a
+    semantic layer: only pixels around an emitted iris where ``head`` explains
+    the original better than ``face`` are considered, and the exact full-stack
+    score remains the acceptance gate.
+    """
+    original = np.asarray(original_rgba)
+    if original.ndim != 3 or original.shape[-1] != 4:
+        raise ValueError("original_rgba must be an HxWx4 canvas")
+    if min_area is None:
+        min_area = scale_area(EYE_SURFACE_MIN_AREA_AT_768, original.shape)
+
+    out = dict(layer_dict)
+    surface = out.get(surface_tag)
+    underlay = out.get(underlay_tag)
+    report: dict[str, Any] = {
+        "status": "missing" if surface is None or underlay is None else "unchanged",
+        "surface_tag": surface_tag,
+        "underlay_tag": underlay_tag,
+    }
+    if surface is None or underlay is None:
+        return out, report
+    surface = np.asarray(surface)
+    underlay = np.asarray(underlay)
+    if surface.shape != original.shape or underlay.shape != original.shape:
+        return out, {**report, "status": "review", "reason": "canvas shape mismatch"}
+
+    iris = np.zeros(original.shape[:2], dtype=bool)
+    for tag in iris_tags:
+        image = out.get(tag)
+        if image is not None and np.asarray(image).shape == original.shape:
+            iris |= np.asarray(image)[..., 3] > alpha_threshold
+    if not iris.any():
+        return out, {**report, "status": "unchanged", "reason": "no iris anchor"}
+
+    # Build a scale-normalized eye-local ROI around each meaningful iris
+    # component.  Padding follows the observed iris extent, not canvas pixels.
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        iris.astype(np.uint8), connectivity=8,
+    )
+    roi = np.zeros_like(iris)
+    min_iris_area = scale_area(EYE_SURFACE_MIN_AREA_AT_768, original.shape)
+    for index in range(1, count):
+        if int(stats[index, cv2.CC_STAT_AREA]) < min_iris_area:
+            continue
+        x = int(stats[index, cv2.CC_STAT_LEFT])
+        y = int(stats[index, cv2.CC_STAT_TOP])
+        width = int(stats[index, cv2.CC_STAT_WIDTH])
+        height = int(stats[index, cv2.CC_STAT_HEIGHT])
+        pad_x = max(2, int(round(width * EYE_SURFACE_ROI_X_RATIO)))
+        pad_y = max(2, int(round(height * EYE_SURFACE_ROI_Y_RATIO)))
+        roi[
+            max(0, y - pad_y):min(roi.shape[0], y + height + pad_y),
+            max(0, x - pad_x):min(roi.shape[1], x + width + pad_x),
+        ] = True
+    if not roi.any():
+        return out, {**report, "status": "unchanged", "reason": "no iris component"}
+
+    surface_mask = surface[..., 3] > alpha_threshold
+    underlay_mask = underlay[..., 3] > alpha_threshold
+    original_rgb = original[..., :3].astype(np.int32)
+    surface_error = np.abs(
+        original_rgb - surface[..., :3].astype(np.int32)
+    ).sum(axis=2)
+    underlay_error = np.abs(
+        original_rgb - underlay[..., :3].astype(np.int32)
+    ).sum(axis=2)
+    candidate = (
+        roi & surface_mask & underlay_mask
+        & (underlay_error + int(error_margin) < surface_error)
+        & (original[..., 3] > 10)
+    )
+
+    # Features rendered after `face` must not be exposed or disturbed.
+    rank = {tag: index for index, tag in enumerate(order)}
+    surface_rank = rank.get(surface_tag, -1)
+    for tag, image in out.items():
+        if rank.get(tag, -1) > surface_rank:
+            candidate &= np.asarray(image)[..., 3] < 250
+    if not candidate.any():
+        return out, {**report, "status": "unchanged", "candidate_px": 0}
+
+    count, labels, stats, _ = cv2.connectedComponentsWithStats(
+        candidate.astype(np.uint8), connectivity=8,
+    )
+    current_score = _static_reconstruction_score(out, original, order)
+    rows: list[dict[str, Any]] = []
+    removed_px = 0
+    for index in range(1, count):
+        component = labels == index
+        area = int(stats[index, cv2.CC_STAT_AREA])
+        row: dict[str, Any] = {
+            "area_px": area,
+            "bbox_xywh": [
+                int(stats[index, cv2.CC_STAT_LEFT]),
+                int(stats[index, cv2.CC_STAT_TOP]),
+                int(stats[index, cv2.CC_STAT_WIDTH]),
+                int(stats[index, cv2.CC_STAT_HEIGHT]),
+            ],
+        }
+        if area < int(min_area):
+            row.update(status="ambiguous", reason="below minimum contact area")
+            rows.append(row)
+            continue
+        patched = np.array(surface, copy=True)
+        patched[component] = 0
+        tentative = dict(out)
+        tentative[surface_tag] = patched
+        tentative_score = _static_reconstruction_score(tentative, original, order)
+        if (tentative_score[0] <= current_score[0]
+                and tentative_score[1] <= current_score[1]):
+            previous_score = current_score
+            out = tentative
+            surface = patched
+            current_score = tentative_score
+            removed = int(component.sum())
+            removed_px += removed
+            row.update(
+                status="removed",
+                removed_px=removed,
+                rgb_error_delta=int(tentative_score[0] - previous_score[0]),
+                bad_px_delta=int(tentative_score[1] - previous_score[1]),
+            )
+        else:
+            row.update(status="ambiguous", reason="virtual removal worsened reconstruction")
+        rows.append(row)
+
+    report.update(
+        status="applied" if removed_px else "unchanged",
+        candidate_px=int(candidate.sum()),
+        removed_px=removed_px,
+        components=rows,
+    )
+    return out, report
+
+
 def fit_mouth_contact(
     layer_dict: dict[str, np.ndarray],
     original_rgba: np.ndarray,
@@ -1281,6 +1582,8 @@ def repair_portrait_layers(layer_dict: dict[str, np.ndarray],
     )
     working, orphan_cleanup = clean_garment_orphans(working, original_rgba)
     working, contact_cleanup = clean_garment_contacts(working, original_rgba)
+    working, eye_ownership = clean_eye_ownership(working, original_rgba)
+    working, eye_surface = repair_eye_surface_contact(working, original_rgba)
     # Cleanup can alter an ownership edge. Refit edge coverage against the
     # final owner set, then fit its colour residual. This is deliberately a
     # second narrow-band solve, not a broad re-application of tone fitting.
@@ -1310,6 +1613,8 @@ def repair_portrait_layers(layer_dict: dict[str, np.ndarray],
             "fit_edge_alpha": edge_fit,
             "clean_garment_orphans": orphan_cleanup,
             "clean_garment_contacts": contact_cleanup,
+            "clean_eye_ownership": eye_ownership,
+            "repair_eye_surface_contact": eye_surface,
             "fit_edge_alpha_final": final_edge_fit,
             "fit_mouth_contact": mouth_contact,
             "fit_seam_residual": seam_fit,

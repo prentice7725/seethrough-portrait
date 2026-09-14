@@ -33,7 +33,9 @@ if str(REPO_ROOT) not in sys.path:
 
 HEAD_RES_MATCH = "본문과 동일"
 
-OUTPUT_ROOT = Path(__file__).resolve().parent / "outputs"
+# Keep generated bundles outside the repository so large image artifacts do not
+# mix with source files or get picked up by repository tooling.
+OUTPUT_ROOT = Path(r"C:\workspace\seethrough-output")
 
 VERDICT_COLORS = {
     "PASS": "#16a34a",

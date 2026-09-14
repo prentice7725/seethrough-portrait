@@ -95,7 +95,7 @@ The default galleries show only `CANONICAL` assets and static `DIAGNOSTICS`.
 `raw_layers/` is preserved inside the downloaded archive for Forensics and must
 not be consumed as canonical input.
 
-Runs are also kept under `webui/outputs/<timestamp>_<id>.portrait/` (gitignored).
+Runs are also kept under `C:\workspace\seethrough-output\<timestamp>_<id>.portrait\`.
 
 ## Portrait Bundle v1 layout
 
