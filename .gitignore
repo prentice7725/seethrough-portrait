@@ -57,3 +57,7 @@ webui/outputs/
 # Python virtualenvs
 .venv/
 venv/
+
+# Separate downstream project (github.com/prentice7725/portrait-autorig),
+# consumed only as a Portrait/Assembly Bundle file contract, not tracked here.
+/_portrait_autorig/
