@@ -1,6 +1,7 @@
 import numpy as np
 import pytest
 
+from seethrough_engine.stratification import LR_TAGS
 from seethrough_engine.stratification import (
     build_stratification,
     stratify_left_right,
@@ -14,6 +15,20 @@ def _layer():
     image[8:16, 23:29, :3] = (80, 90, 100)
     image[8:16, 23:29, 3] = 255
     return image
+
+
+@pytest.mark.parametrize("tag", ["handwear", "legwear", "footwear"])
+def test_limb_tags_split_with_geometric_left_right_names(tag):
+    derived, _ = stratify_left_right({tag: _layer()})
+
+    assert set(derived[tag]) == {"left", "right"}
+    left_x = np.where(derived[tag]["left"][..., 3] > 10)[1].mean()
+    right_x = np.where(derived[tag]["right"][..., 3] > 10)[1].mean()
+    assert left_x < right_x
+
+
+def test_lr_tags_include_limb_derivatives_before_face_derivatives():
+    assert LR_TAGS[:3] == ("handwear", "legwear", "footwear")
 
 
 def test_left_right_stratification_is_derived_and_does_not_mutate_source():
@@ -39,6 +54,16 @@ def test_single_component_is_not_forced_into_two_sides():
     assert report["status"] == "not_computed"
 
 
+def test_left_right_split_does_not_mutate_canonical_for_all_limb_tags():
+    sources = {tag: _layer() for tag in ("handwear", "legwear", "footwear")}
+    snapshots = {tag: image.copy() for tag, image in sources.items()}
+
+    stratify_left_right(sources)
+
+    for tag, snapshot in snapshots.items():
+        np.testing.assert_array_equal(sources[tag], snapshot)
+
+
 def test_depth_is_optional_and_shape_checked():
     source = _layer()
     result = build_stratification(
@@ -57,4 +82,3 @@ def test_depth_is_optional_and_shape_checked():
             {"handwear": source},
             depth_maps={"handwear": np.zeros((16, 16), np.float32)},
         )
-

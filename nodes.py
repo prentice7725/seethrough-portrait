@@ -975,7 +975,7 @@ class SeeThrough_PostProcess:
             "required": {
                 "layers_depth": ("SEETHROUGH_LAYERS_DEPTH",),
                 "tblr_split": ("BOOLEAN", {"default": True,
-                                           "tooltip": "Split symmetric parts (eyes, ears, handwear) into left/right"}),
+                                           "tooltip": "Split left/right limbs (arms/hands, legs, footwear) into geometric canvas-side derivatives"}),
                 "use_lama": ("BOOLEAN", {"default": True,
                                          "tooltip": "Use LaMa inpainting for hair splitting (better quality). Falls back to OpenCV if disabled."}),
             },
@@ -1035,6 +1035,8 @@ class SeeThrough_PostProcess:
         # Left-right splitting
         if tblr_split:
             _tag_lr_split("handwear", tag2pinfo)
+            _tag_lr_split("legwear", tag2pinfo)
+            _tag_lr_split("footwear", tag2pinfo)
             for eye_tag in ["eyewhite", "irides", "eyelash", "eyebrow"]:
                 _tag_lr_split(eye_tag, tag2pinfo)
             _tag_lr_split("ears", tag2pinfo)

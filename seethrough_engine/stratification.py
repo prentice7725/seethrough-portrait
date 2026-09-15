@@ -16,7 +16,11 @@ import numpy as np
 
 
 LR_TAGS: tuple[str, ...] = (
-    "handwear", "eyewhite", "irides", "eyelash", "eyebrow", "ears",
+    # These are producer-side optional derivatives.  The public Bundle
+    # contract names the results by geometric canvas side (left/right); the
+    # historical node adapter below may still expose its tag-l/tag-r aliases.
+    "handwear", "legwear", "footwear",
+    "eyewhite", "irides", "eyelash", "eyebrow", "ears",
 )
 
 __all__ = [

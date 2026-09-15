@@ -2,9 +2,11 @@ import json
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 from PIL import Image
 
 from seethrough_engine.export import save_portrait_bundle
+from seethrough_engine.derived_contract import validate_derived_contract
 from seethrough_engine.repair import REPAIR_ORDER, REPAIR_VERSION, repair_portrait_layers
 
 
@@ -154,6 +156,45 @@ def test_deep_repair_interface_runs_the_declared_order():
     result = repair_portrait_layers({"face": original.copy()}, original)
     assert result.report["order"] == list(REPAIR_ORDER)
     assert set(result.layers) == {"face"}
+
+
+def test_derived_contract_accepts_not_computed_empty_paths():
+    derived = {
+        "source_stage": "production_repaired",
+        "left_right": {"status": "not_computed", "paths": {}},
+        "depth": {"status": "not_computed", "paths": {}},
+    }
+    assert validate_derived_contract(derived)["depth"]["paths"] == {}
+
+
+def test_derived_contract_rejects_computed_without_artifact():
+    with pytest.raises(ValueError, match="no artifacts"):
+        validate_derived_contract({
+            "source_stage": "production_repaired",
+            "left_right": {"status": "computed", "paths": {}},
+            "depth": {"status": "not_computed", "paths": {}},
+        })
+
+
+def test_derived_contract_rejects_invalid_path_and_canonical_alias(tmp_path):
+    canonical = tmp_path / "layers" / "handwear.png"
+    derived = tmp_path / "derived" / "left_right" / "handwear_left.png"
+    canonical.parent.mkdir(parents=True)
+    derived.parent.mkdir(parents=True)
+    canonical.write_bytes(b"canonical")
+    derived.write_bytes(b"derived")
+    base = {
+        "source_stage": "production_repaired",
+        "left_right": {"status": "computed", "paths": {
+            "handwear": {"left": "derived/left_right/handwear_left.png",
+                          "right": "derived/left_right/handwear_left.png"},
+        }},
+        "depth": {"status": "not_computed", "paths": {}},
+    }
+    assert validate_derived_contract(base, root=tmp_path, canonical_paths={"handwear": "layers/handwear.png"})["left_right"]
+    base["left_right"]["paths"]["handwear"]["right"] = "../layers/handwear.png"
+    with pytest.raises(ValueError, match="invalid traversal|aliases"):
+        validate_derived_contract(base, root=tmp_path, canonical_paths={"handwear": "layers/handwear.png"})
 
 
 def test_bundle_warns_when_canonical_eyewhite_is_missing_even_if_raw_has_it(tmp_path):

@@ -8,6 +8,12 @@ import cv2
 import numpy as np
 
 from .scale import scale_area, scale_length
+from .semantic import (
+    REL_BRIGHT_PERCENTILE,
+    REL_CHROMA_PERCENTILE,
+    REL_MAX_CANDIDATE_RATIO,
+    REL_MIN_ABS_BRIGHTNESS,
+)
 
 IRIS_TAGS = ("irides", "iridesl", "iridesr")
 MOUTH_TAGS = ("mouth",)
@@ -124,13 +130,33 @@ def _sclera_observation(original: np.ndarray, composite: np.ndarray,
     roi_mask = np.zeros(iris.shape, bool)
     roi_mask[y0:y1, x0:x1] = True
     rgb = original[..., :3].astype(np.float32)
+    brightness = rgb.mean(axis=2)
     maximum = rgb.max(axis=2)
     chroma = maximum - rgb.min(axis=2)
-    bright_neutral = (rgb.mean(axis=2) >= 190.0) & (
+    bright_neutral = (brightness >= 190.0) & (
         chroma <= 0.10 * np.maximum(maximum, 1.0))
-    observed = roi_mask & ~iris & bright_neutral
+    search = roi_mask & ~iris
+    observed = search & bright_neutral
     minimum = scale_area(MIN_SCLERA_AREA_AT_768, original.shape)
     count = int(observed.sum())
+    if count < minimum and search.any():
+        # Nothing cleared the absolute floor -- rank the same ROI against
+        # its own local contrast before concluding there is no sclera here
+        # (see semantic.py's REL_* comment: warm-toned or naturally dim
+        # sclera, common on darker or warmly-lit skin, never reaches an
+        # absolute brightly-lit-anime floor even when clearly present).
+        # `derive_missing_eyewhite`'s own ring-shaped, stricter-gated search
+        # is what actually paints a patch; this only decides whether a
+        # sclera loss is worth flagging for review at all.
+        roi_bright = brightness[search]
+        roi_chroma = chroma[search]
+        bright_cut = max(float(np.percentile(roi_bright, REL_BRIGHT_PERCENTILE)),
+                          REL_MIN_ABS_BRIGHTNESS)
+        chroma_cut = float(np.percentile(roi_chroma, REL_CHROMA_PERCENTILE))
+        relative = search & (brightness >= bright_cut) & (chroma <= chroma_cut)
+        if float(relative.sum()) / float(search.sum()) <= REL_MAX_CANDIDATE_RATIO:
+            observed = observed | relative
+        count = int(observed.sum())
     if count < minimum:
         return {
             "visible_in_original": False,

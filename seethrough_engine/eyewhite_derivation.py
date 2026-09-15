@@ -25,7 +25,14 @@ import cv2
 import numpy as np
 
 from .scale import scale_area
-from .semantic import EYE_SURFACE_TAGS, IRIS_TAGS
+from .semantic import (
+    EYE_SURFACE_TAGS,
+    IRIS_TAGS,
+    REL_BRIGHT_PERCENTILE,
+    REL_CHROMA_PERCENTILE,
+    REL_MAX_CANDIDATE_RATIO,
+    REL_MIN_ABS_BRIGHTNESS,
+)
 
 __all__ = ["EyewhiteDeriveResult", "derive_missing_eyewhite"]
 
@@ -111,9 +118,10 @@ def derive_missing_eyewhite(
         return EyewhiteDeriveResult(None, 0, 0, 0, "no_head_or_face_support")
 
     rgb = original[..., :3].astype(np.float32)
+    brightness = rgb.mean(axis=2)
     maximum = rgb.max(axis=2)
     chroma = maximum - rgb.min(axis=2)
-    bright_neutral = (rgb.mean(axis=2) >= BRIGHT_MEAN_MIN) & (
+    bright_neutral = (brightness >= BRIGHT_MEAN_MIN) & (
         chroma <= BRIGHT_CHROMA_MAX_RATIO * np.maximum(maximum, 1.0))
 
     min_iris_area = scale_area(MIN_IRIS_AREA_AT_768, shape)
@@ -139,6 +147,22 @@ def derive_missing_eyewhite(
             continue
 
         candidate = ring & bright_neutral
+        if (int(candidate.sum()) < min_derived_area
+                or float(candidate.sum()) / float(ring.sum()) < MIN_RING_COVERAGE_RATIO):
+            # The absolute floor found nothing decisive -- fall back to the
+            # same evidence ranked against this ring's own local contrast,
+            # same as semantic.semantic_warnings (REL_* imported from
+            # there so the two never drift apart). Still gated below by the
+            # same min-size and ring-coverage bars as the absolute path, so
+            # this only ever paints a patch the detector would itself flag.
+            ring_bright = brightness[ring]
+            ring_chroma = chroma[ring]
+            bright_cut = max(float(np.percentile(ring_bright, REL_BRIGHT_PERCENTILE)),
+                              REL_MIN_ABS_BRIGHTNESS)
+            chroma_cut = float(np.percentile(ring_chroma, REL_CHROMA_PERCENTILE))
+            relative = ring & (brightness >= bright_cut) & (chroma <= chroma_cut)
+            if float(relative.sum()) / float(ring.sum()) <= REL_MAX_CANDIDATE_RATIO:
+                candidate = candidate | relative
         if int(candidate.sum()) < min_derived_area:
             continue
         if float(candidate.sum()) / float(ring.sum()) < MIN_RING_COVERAGE_RATIO:

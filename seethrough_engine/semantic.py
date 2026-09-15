@@ -48,6 +48,33 @@ EYEWHITE_TAGS = ("eyewhite", "eyewhitel", "eyewhiter")
 IRIS_TAGS = ("irides", "iridesl", "iridesr")
 EYE_SURFACE_TAGS = ("head", "face", "ears", "earl", "earr")
 
+# `semantic_warnings` first looks for a ring around the iris that is bright
+# and neutral in absolute terms (mean >= 200, chroma <= 8% of max -- tuned
+# for flat-shaded, brightly-lit eyes). That floor is blind to sclera that is
+# genuinely present but never reaches it: warm-toned or naturally dim
+# sclera, common in photoreal portraits and on darker or warmly-lit skin,
+# where the whole eye region sits well below 200 in absolute brightness even
+# though the sclera is still visibly the lightest, least-colourful patch in
+# its own neighbourhood. When the absolute test finds nothing, these three
+# constants gate a second pass ranked against the ring's *own* local
+# contrast instead of a fixed number, so detection adapts to whatever the
+# local lighting and skin tone actually are rather than assuming a bright,
+# neutral baseline. `eyewhite_derivation.derive_missing_eyewhite` and
+# `local_fidelity._sclera_observation` import these too, so none of the
+# three ever disagree about what counts as sclera evidence.
+#
+# Ranking against local contrast breaks down when the ring/ROI is not
+# actually heterogeneous -- a flat, uniformly-lit patch of skin ranks its
+# own brightest quartile as "the highlight" purely by construction, with
+# nothing sclera-like about it. A real sclera band is always a small
+# minority of its ring, so REL_MAX_CANDIDATE_RATIO throws the relative
+# result out (falls back to "nothing decisive found") whenever it would
+# claim an implausibly large share of the ring instead.
+REL_BRIGHT_PERCENTILE = 75.0
+REL_CHROMA_PERCENTILE = 40.0
+REL_MIN_ABS_BRIGHTNESS = 90.0
+REL_MAX_CANDIDATE_RATIO = 0.3
+
 
 def semantic_rank(tag: str) -> int:
     """Back-to-front rank; unknown tags stay behind known facial layers."""
@@ -98,9 +125,10 @@ def semantic_warnings(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarr
         irises.astype(np.uint8), 8)
     min_iris_area = scale_area(20, irises.shape)
     rgb = original[..., :3].astype(np.float32)
+    brightness = rgb.mean(axis=2)
     maximum = rgb.max(axis=2)
     chroma = rgb.max(axis=2) - rgb.min(axis=2)
-    bright_neutral = (rgb.mean(axis=2) >= 200.0) & (
+    bright_neutral = (brightness >= 200.0) & (
         chroma <= 0.08 * np.maximum(maximum, 1.0))
 
     for index in range(1, count):
@@ -113,9 +141,25 @@ def semantic_warnings(layer_dict: dict[str, np.ndarray], original_rgba: np.ndarr
         kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (2 * radius + 1, 2 * radius + 1))
         iris = labels == index
-        ring = cv2.dilate(iris.astype(np.uint8), kernel).astype(bool) & ~iris
-        observed = ring & support & bright_neutral
+        ring = (cv2.dilate(iris.astype(np.uint8), kernel).astype(bool) & ~iris) & support
+        if not ring.any():
+            continue
         required = max(scale_area(12, irises.shape), int(round(area * 0.08)))
+
+        observed = ring & bright_neutral
+        if int(observed.sum()) < required:
+            # Nothing cleared the absolute floor -- try the same ring
+            # ranked against its own local contrast (see the REL_* comment
+            # above) before concluding there is no sclera here at all.
+            ring_bright = brightness[ring]
+            ring_chroma = chroma[ring]
+            bright_cut = max(float(np.percentile(ring_bright, REL_BRIGHT_PERCENTILE)),
+                              REL_MIN_ABS_BRIGHTNESS)
+            chroma_cut = float(np.percentile(ring_chroma, REL_CHROMA_PERCENTILE))
+            relative = ring & (brightness >= bright_cut) & (chroma <= chroma_cut)
+            if float(relative.sum()) / float(ring.sum()) <= REL_MAX_CANDIDATE_RATIO:
+                observed = observed | relative
+
         if int(observed.sum()) >= required:
             return ["missing_eyewhite"]
 

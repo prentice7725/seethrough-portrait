@@ -461,11 +461,12 @@ def build_app() -> gr.Blocks:
                 )
             steps_in = gr.Slider(label="추론 단계", minimum=1, maximum=100, step=1, value=30)
             stratify_lr_in = gr.Checkbox(
-                label="좌우 파생물 생성",
+                label="Split left/right limbs",
                 value=False,
                 info=(
-                    "필요할 때만 canonical layers에서 좌우 파츠를 만들어 "
-                    "derived/left_right에 저장합니다. canonical layers는 변경하지 않습니다."
+                    "Create optional left/right derivatives for arms/hands, legs, and "
+                    "footwear when the semantic output glues both sides together. "
+                    "Canonical layers are unchanged."
                 ),
             )
 

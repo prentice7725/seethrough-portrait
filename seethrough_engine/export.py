@@ -18,6 +18,7 @@ from .seams import RUN_SLACK_PX, seam_report_layers
 from .semantic import SEMANTIC_Z_ORDER, semantic_warnings
 from .scale import scale_length
 from .stratification import build_stratification
+from .derived_contract import validate_derived_contract
 
 BUNDLE_FORMAT = "portrait-bundle"
 BUNDLE_VERSION = "1.0"
@@ -301,6 +302,14 @@ def save_portrait_bundle(output_dir: str, result: PortraitPipelineResult, *,
         },
         "source": {"filename": source_filename},
     }
+    # Validate the exact paths just written before publishing the manifest.
+    # A producer-side split is optional, but a claimed computed derivative is
+    # never allowed to point at a missing file or a canonical layer alias.
+    manifest["derived"] = validate_derived_contract(
+        manifest["derived"],
+        root=output_dir,
+        canonical_paths={tag: entry["path"] for tag, entry in layer_entries.items()},
+    )
     _write_json(os.path.join(output_dir, "manifest.json"), manifest)
     return manifest
 
