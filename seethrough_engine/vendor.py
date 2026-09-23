@@ -1,11 +1,7 @@
 """Bootstrap access to the vendored `see-through` research package and
-re-export the pieces the engine needs, without requiring ComfyUI.
+re-export the pieces the standalone engine needs.
 
-This mirrors the sys.path / sys.modules dance at the top of `nodes.py`
-exactly, so both the ComfyUI node graph and the standalone webui import the
-same on-disk `see-through/common` code the same way. It is written to be
-safe to call more than once (idempotent) and safe to call whether or not
-ComfyUI has already done its own version of this setup for `nodes.py`.
+The bootstrap is written to be safe to call more than once (idempotent).
 
 Exports are split into two lazily-loaded groups so a caller who only needs
 `utils.cv` (torch-free: cv2/numpy/PIL/pycocotools only) doesn't pull in the
@@ -45,7 +41,7 @@ def ensure_seethrough_importable() -> None:
     if not os.path.isdir(SEETHROUGH_COMMON_DIR):
         raise RuntimeError(
             f"Vendored see-through package not found at {SEETHROUGH_COMMON_DIR!r}. "
-            "This repo expects a see-through/ checkout next to nodes.py."
+            "This repo expects a see-through/ checkout in its root directory."
         )
 
     try:
@@ -67,8 +63,8 @@ def ensure_seethrough_importable() -> None:
 
 def _with_module_namespace_guard(import_fn):
     """Run `import_fn()` with any pre-existing `utils`/`modules` sys.modules
-    entries (e.g. from another custom node -- these are common top-level
-    package names) stashed away and restored afterwards, so the vendored
+    entries from unrelated code (these are common top-level package names)
+    stashed away and restored afterwards, so the vendored
     code's bare `import utils...` / `import modules...` can't corrupt an
     unrelated package of the same name."""
     conflict_backup = {}

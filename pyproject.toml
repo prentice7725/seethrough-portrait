@@ -13,8 +13,3 @@ dependencies = [
 
 [project.urls]
 Repository = "https://github.com/prentice7725/seethrough-portrait"
-
-[tool.comfy]
-PublisherId = "tackcrypto1031"
-DisplayName = "TK ComfyUI See Through"
-Icon = ""

@@ -4,7 +4,12 @@ from pathlib import Path
 def test_upstream_python_does_not_import_autorig_modules():
     root = Path(__file__).resolve().parents[2]
     offenders = []
-    for path in [root / "nodes.py", *sorted((root / "seethrough_engine").glob("*.py"))]:
+    owned_sources = [
+        *sorted((root / "portrait_core").glob("*.py")),
+        *sorted((root / "seethrough_engine").glob("*.py")),
+        root / "webui" / "app.py",
+    ]
+    for path in owned_sources:
         text = path.read_text(encoding="utf-8")
         if "portrait_autorig" in text:
             offenders.append(path.name)

@@ -2,199 +2,125 @@
 
 [English](README_EN.md)
 
-한 장의 애니메이션풍 인물화를 **검증된 production-ready semantic portrait
-bundle**로 만드는 ComfyUI 확장 및 독립 실행 WebUI입니다.
-
-[@jtydhr88](https://github.com/jtydhr88)의
-[ComfyUI-See-through](https://github.com/jtydhr88/ComfyUI-See-through)를 기반으로
-Portrait Mode, Silhouette Guard, fidelity repair와 정적 품질 검증을 추가했습니다.
-
-## 프로젝트 책임
+한 장의 애니메이션풍 인물화를 검증 가능한 **Portrait Bundle v1**로 변환하는
+독립형 producer입니다. 지원 인터페이스는 standalone WebUI와 Python 엔진이며,
+이 저장소에는 ComfyUI 커스텀 노드가 포함되지 않습니다.
 
 ```text
-portrait.png
-    ↓
-seethrough-portrait
-    ↓
+source portrait
+      ↓
+SeeThrough Portrait
+      ↓
 Portrait Bundle v1
-    ↓
-Portrait Composer
-    ↓
-Assembly Bundle v0.2
-    ↓
-portrait-autorig
-    ↓
-Rig Bundle
+      ↓
+Portrait Composer → portrait-autorig
 ```
 
-이 저장소의 책임은 `Image → validated, production-ready semantic portrait
-bundle`에서 끝납니다. Composer는 donor·VariantSet·ExpressionPreset·최종 draw
-order와 `RigIntent`를 조립하고, 자동 리깅은 별도
-[`portrait-autorig`](https://github.com/prentice7725/portrait-autorig) 저장소에
-있습니다. AutoRig는 mesh·weight·deformation과 runtime binding만 담당합니다.
-두 프로젝트 사이에는 Python import 의존성이 없으며 Portrait Bundle 파일
-계약만 공유합니다.
+이 저장소는 이미지 분해, canonical semantic layer 복구, 정적 품질 검증과
+Bundle 발행까지 담당합니다. Composer와 AutoRig는 별도 프로젝트이며,
+프로젝트 간 경계는 Python import가 아닌 Portrait Bundle 파일 계약입니다.
 
-P0 producer contract freeze는 [`docs/P0_CLOSEOUT_V0.2.md`](docs/P0_CLOSEOUT_V0.2.md)에
-기록되어 있습니다.
+## 주요 기능
 
-## Portrait Mode
+- **Portrait Mode 및 Silhouette Guard** — 누락된 피사체 영역을 검사하고,
+  설명되지 않는 잔여 픽셀은 진단용 `body_remainder`로 보존합니다.
+- **생성 프로파일** — `NORMAL`은 1회, `QUALITY`는 3회, `HARVEST`는 5회
+  deterministic 후보를 비교합니다. HARVEST는 SeeThrough 내부 후보 생성 모드입니다.
+- **Fidelity repair와 품질 진단** — canonical layer를 원본과 맞춘 뒤
+  Static Reconstruction, Seams, Local Fidelity를 각각 보고합니다.
+- **선택적 좌우 파생물** — 손/팔(`handwear`), 다리(`legwear`), 신발(`footwear`)을
+  포함한 지원 semantic을 좌우로 분할해 `derived/left_right/`에 저장할 수 있습니다.
+  분할은 best-effort이며 alpha 기준을 넘는 연결 component가 두 개 미만이면
+  해당 파생물을 생략합니다. `layers/`의 canonical PNG는 바뀌지 않습니다.
+- **선택적 depth 파생물** — 검증된 depth map을 Python API로 전달할 때만 저장합니다.
+  WebUI는 Marigold depth를 자동 실행하지 않습니다.
 
-- **Silhouette Guard** — 피사체 밖의 spill을 자르고 누락된 원본 픽셀을
-  `body_remainder`로 복구합니다.
-- **Production profiles** — WebUI의 `NORMAL`은 1회, `QUALITY`는 3회,
-  `HARVEST`는 5회 deterministic 후보를 비교합니다. HARVEST는 Composer의
-  donor harvest가 아니라 SeeThrough 후보 생성 프로파일입니다.
-- **Fidelity repair** — `reclaim_occluded → fit_layer_tone → fit_edge_alpha →
-  clean_garment_orphans → clean_garment_contacts → fit_edge_alpha_final → fit_mouth_contact →
-  fit_seam_residual → extract_mouth_feature` 순서로
-  정지화면을 원본과 맞추고, garment의 고립 semantic contamination을
-  보수적으로 제거합니다. `fit_mouth_contact`는 입 주변의 국소 skin matte를
-  face 쪽으로 정리하거나 원본 기준 alpha를 다시 풀어 halo를 줄입니다.
-- **Static validation** — 전체 composite fidelity와 가늘고 긴 seam을 별도로
-  측정합니다.
-- **Semantic ownership recovery** — 누락 픽셀을 곧바로
-  `body_remainder`로 보내지 않고, 연결성·원본 색·경쟁 semantic 근거가
-  충분한 부분을 기존 canonical layer로 되돌립니다.
-- **로컬 fidelity** — 좌/우 눈·입·목선 접촉 ROI를 따로 검사하여 전체 MAE가
-  놓치는 눈흰자 소실과 가로 neck/topwear seam을 verdict와 diagnostic에 반영합니다.
-- **검증 축 3개** — Static Reconstruction, Seams, Local Fidelity를 독립적으로
-  보고하며 기존 PASS/REWORK/FAIL 값은 Diagnostic Summary로만 표시합니다.
+## 설치 및 실행
+
+Python 3.10 이상이 필요합니다. CUDA를 사용할 경우 환경에 맞는 PyTorch와
+torchvision을 먼저 설치하세요.
+
+```bash
+python -m pip install -r webui/requirements.txt
+python webui/app.py
+```
+
+브라우저에서 [http://127.0.0.1:7860](http://127.0.0.1:7860)을 열고 이미지를
+업로드하세요. 모델은 첫 실행 시 Hugging Face에서 `models/SeeThrough/`로
+다운로드됩니다. 자세한 설치, 옵션, 문제 해결은
+[`webui/README.md`](webui/README.md)를 참고하세요.
+
+지원 모델:
+
+| 모델 | Hugging Face 저장소 | 용도 |
+| --- | --- | --- |
+| LayerDiff 3D | `layerdifforg/seethroughv0.0.2_layerdiff3d` | semantic layer 생성 |
+| Marigold Depth | `layerdifforg/seethroughv0.0.1_marigold` | 선택적 depth 추정 |
+
+8GB급 GPU는 UNet block streaming 경로를 사용할 수 있습니다. VAE tiling은
+확산 단계의 해상도와 여유 VRAM에 따라 선택하며, untiled CUDA OOM이면 tiled로
+한 번 재시도합니다. 측정 방법과 결과는
+[`docs/VAE_RUNTIME_POLICY.md`](docs/VAE_RUNTIME_POLICY.md)에 있습니다.
 
 ## Portrait Bundle v1
 
-독립 WebUI의 정본 출력입니다.
+Bundle의 `layers/`가 downstream에서 사용할 canonical production-repaired
+레이어입니다. `raw_layers/`는 forensic 자료이므로 authoring이나 downstream
+레이어 입력으로 사용하지 마세요. `body_remainder`도
+`diagnostics/body_remainder.png`에만 기록되는 재구성 진단물입니다.
 
 ```text
 A001.portrait/
 ├─ manifest.json
 ├─ original.png
-├─ layers/                 # canonical production-repaired assets
-├─ raw_layers/             # optional forensic output
-├─ derived/                # optional depth / left-right stratification
-└─ diagnostics/
-   ├─ portrait_report.json
-   ├─ semantic_ownership.json
-   ├─ local_fidelity.json
-   ├─ fidelity.json
-   ├─ seams.json
-   ├─ occlusion_graph.json
-   ├─ coverage_mask.png
-   ├─ missing_mask.png
-   ├─ spill_mask.png
-   ├─ body_remainder.png
-   ├─ reconstruction.png
-   ├─ layer_composite.png
-   ├─ semantic_composite.png
-   └─ composite_error.png
+├─ layers/                 # canonical semantic layers
+├─ raw_layers/             # optional forensic output; consumer input 금지
+├─ derived/                # optional 좌우 / depth 파생물
+└─ diagnostics/            # report, fidelity, seams, masks, composites
 ```
 
-`layers/`만 downstream consumer가 사용합니다. `raw_layers/`는 모델 출력을 추적하기
-위한 진단 자료이며 소비 금지입니다. 전체 불변식과 JSON Schema는
+좌우 파생물은 manifest에서 `left`와 `right`로 표기하며, 이는 인물의 해부학적
+좌우가 아니라 **이미지 캔버스 기준 geometric left/right**입니다.
+
+```json
+{
+  "derived": {
+    "source_stage": "production_repaired",
+    "left_right": {
+      "status": "computed",
+      "paths": {
+        "handwear": {
+          "left": "derived/left_right/handwear_left.png",
+          "right": "derived/left_right/handwear_right.png"
+        }
+      }
+    },
+    "depth": { "status": "not_computed", "paths": {} }
+  }
+}
+```
+
+파생물은 명시적으로 요청한 경우에만 생성되며 canonical `layers/`를 교체하지
+않습니다. 좌우 분할 API는 `handwear`, `legwear`, `footwear`와 눈·귀 semantic을
+지원합니다. 전체 파일 불변식, manifest 검증 규칙과 JSON Schema는
 [`docs/PORTRAIT_BUNDLE_V1.md`](docs/PORTRAIT_BUNDLE_V1.md)를 참고하세요.
-`body_remainder`는 `layers/`에 넣지 않고 `diagnostics/body_remainder.png`에만
-기록하는 재구성 fallback입니다. `layer_composite.png`는 정적 재구성용이고,
-`semantic_composite.png`는 교체 가능한 semantic 파츠만 합성한 결과입니다.
-필요할 때만 `derived/` 아래에 depth map과 좌우 분할 파생물이 기록됩니다.
-프로그래밍 호출에서는 `save_portrait_bundle(..., stratify_left_right=True)`로
-좌우 파생물을 켜고, 검증된 per-tag depth map이 있을 때만
-`depth_maps={tag: float32_HxW}`를 전달합니다. 두 옵션 모두 canonical
-`layers/`를 수정하지 않습니다.
 
-## 설치 (ComfyUI)
+Python 호출에서는 `save_portrait_bundle(..., stratify_left_right=True)`로
+좌우 분할을 요청하고, 선택적으로 `depth_maps={tag: float32_HxW}`를 전달할 수
+있습니다. 파생물은 downstream에서 별도로 검토할 수 있는 producer output이며,
+canonical layer를 자동으로 대체하지 않습니다.
 
-```bash
-cd ComfyUI/custom_nodes
-git clone https://github.com/prentice7725/seethrough-portrait.git
-cd seethrough-portrait
-pip install -r requirements.txt
-```
+## 다음 단계와 개발 문서
 
-모델은 처음 사용할 때 Hugging Face에서 `models/SeeThrough/`로 자동 다운로드됩니다.
+- [Portrait Bundle v1 계약](docs/PORTRAIT_BUNDLE_V1.md) — 소비자 간 파일 계약과 schema
+- [WebUI 사용법](webui/README.md) — 설치, 생성 옵션, 결과 확인, 문제 해결
+- [Portrait Mode 사양](docs/M1_IMPLEMENTATION_SPEC.md)
+- [회귀 검증 절차](docs/TEST_PROTOCOL_A001.md)
+- [VAE runtime policy](docs/VAE_RUNTIME_POLICY.md)
+- [P0 closeout](docs/P0_CLOSEOUT_V0.2.md)
 
-| 모델 | 저장소 | 용도 |
-| --- | --- | --- |
-| LayerDiff 3D | `layerdifforg/seethroughv0.0.2_layerdiff3d` | semantic layer 생성 |
-| Marigold Depth | `layerdifforg/seethroughv0.0.1_marigold` | depth 추정 및 PostProcess |
-
-## 8GB GPU 및 처리 시간
-
-독립 WebUI는 UNet의 남은 VRAM을 측정해 통째로 올릴 수 없을 때 **leaf-level
-block streaming**으로 전환합니다. 따라서 8GB급 GPU에서도 실행할 수 있습니다.
-이는 단순히 `resolution`이나 `steps`를 낮추는 방식이 아닙니다. 이 모델의 UNet은
-bf16에서도 약 7.58 GiB이므로, 가중치가 통째로 들어가지 않는 카드에서는 연산 전에
-OOM이 날 수 있기 때문입니다. VAE 타일링은 모델 로드 시 고정하지 않습니다. body/head
-각 diffusion 직전에 해상도와 실제 여유 VRAM으로 untiled를 우선 선택하고, CUDA OOM이면
-tiled로 정확히 한 번 재시도합니다. 512px VAE tile 기준으로 768은 2×2, 1024는 3×3
-serial decode가 되므로 여유가 있을 때 untiled가 기본입니다.
-
-측정 방식과 A002 768/1024 tiled-vs-untiled 결과는
-[VAE runtime policy](docs/VAE_RUNTIME_POLICY.md)에 기록합니다.
-
-다음은 RTX 5060 Laptop 8GB (A-001, seed 42, 30 steps)에서 기록한 단일 생성
-패스의 참고 측정치입니다. 실제 시간은 GPU, 여유 VRAM, 입력과 Portrait Mode의
-auto-fill 횟수에 따라 달라집니다.
-
-| 설정 | 처리 시간 | 피크 VRAM | 레이어 |
-| --- | ---: | ---: | ---: |
-| res 512, head off | 60.7초 | 2.03 GiB | 13 |
-| res 512, head on | 109.6초 | 2.03 GiB | 24 |
-| res 1280, head off | 333.9초 | 3.66 GiB | 13 |
-| res 1280, head on | 609.9초 | 3.66 GiB | 24 |
-
-head 단계는 같은 해상도에서 추가 프레임만 생성하므로 위 측정에서는 VRAM보다
-시간에 영향을 줍니다.
-
-반복 실행에서는 body/head의 고정 semantic prompt 임베딩을 pipeline 인스턴스의
-CPU 캐시에 보관해 text encoder 재실행과 GPU 왕복을 건너뜁니다. 엔진 경로는
-사용하지 않는 체크무늬 preview도 만들지 않습니다. 각 diffusion 호출의
-`input_encode_seconds`, `unet_denoise_seconds`, `transparent_decode_seconds`와
-전체 시간은 Bundle manifest의 `run.pipeline_timing`에 기록됩니다.
-
-UNet streaming의 비동기 전송 A/B는 `run_portrait_pipeline`의
-`offload_non_blocking` 및 `offload_record_stream` 옵션으로 켤 수 있습니다.
-두 옵션은 기본적으로 꺼져 있어 기존 8GB 경로의 안정성을 유지하며, 같은
-pipeline을 새로 로드한 뒤 wall time·피크 VRAM·fidelity를 비교해 선택하세요.
-8GB 프로파일에서는 두 옵션을 동시에 요청하면 안전상 둘 다 자동으로 꺼집니다.
-
-### ComfyUI 노드
-
-| 노드 | 설명 |
-| --- | --- |
-| SeeThrough Load Source | 이미지, alpha mask, 원본 이름 로드 |
-| SeeThrough Load LayerDiff Model | LayerDiff 모델 로드 |
-| SeeThrough Load Depth Model | Marigold 모델 로드 |
-| SeeThrough Generate Layers | 기본 semantic layer 생성 |
-| SeeThrough Generate Layers (Custom) | Portrait Mode, head detail, auto-fill |
-| SeeThrough Generate Depth | 레이어별 depth map 생성 |
-| SeeThrough Post Process | crop, hair/part 분할, 색 복원 |
-| SeeThrough Save PSD | PNG·메타데이터·PSD 다운로드 자료 저장 |
-
-Portrait Mode에서는 투명 PNG를 **Load Source**로 읽고 `subject_mask`를 Custom
-노드에 연결하세요. 불투명 배경이라면 foreground-positive mask가 필요합니다.
-
-## 독립 실행 WebUI
-
-```bash
-python -m pip install -r webui/requirements.txt
-python webui/app.py
-# http://127.0.0.1:7860
-```
-
-명령을 실행하는 Python과 같은 환경에 의존성을 설치하세요. Windows에서
-다른 프로젝트의 가상환경으로 실행한다면 그 환경에서
-`python -m pip install -r C:\workspace\seethrough-portrait\webui\requirements.txt`
-를 먼저 실행해야 합니다 (`cv2` import는 `opencv-python` 패키지에서 옵니다).
-
-이미지 한 장을 업로드해 Portrait Mode를 실행하고 verdict, canonical layers와
-diagnostics가 담긴 Portrait Bundle zip을 받습니다. 자세한 내용은
-[`webui/README.md`](webui/README.md)를 참고하세요.
-
-투명 PNG라도 RGB 채널에 원래의 밝은 배경이 남아 있는 경우가 있습니다. 업로드
-단계에서 머리카락, 팔 안쪽처럼 얇은 경계의 soft-alpha 픽셀만 주변 불투명
-foreground와 비교해 국소 보정하며, alpha mask 자체나 raw layer는 건드리지
-않습니다. 기존 Bundle에는 이 보정이 소급되지 않으므로 해당 입력은 한 번
-다시 생성해야 합니다.
+자동 리깅은 별도 [`portrait-autorig`](https://github.com/prentice7725/portrait-autorig)
+저장소에서 관리합니다.
 
 ## 테스트
 
@@ -202,22 +128,8 @@ foreground와 비교해 국소 보정하며, alpha mask 자체나 raw layer는 �
 python -m pytest tests -q
 ```
 
-vendored `see-through/ui`는 별도 선택 의존성을 가진 연구 UI이므로 이 프로젝트의
-migration gate는 루트 `tests/`를 대상으로 합니다.
-
-## 문서
-
-- [`docs/PORTRAIT_BUNDLE_V1.md`](docs/PORTRAIT_BUNDLE_V1.md) — 두 저장소 사이 파일 계약
-- [`docs/M1_IMPLEMENTATION_SPEC.md`](docs/M1_IMPLEMENTATION_SPEC.md) — Portrait Mode 계약
-- [`webui/README.md`](webui/README.md) — standalone producer WebUI 사용법
-- [`docs/TEST_PROTOCOL_A001.md`](docs/TEST_PROTOCOL_A001.md) — 회귀 검증 절차
-- 자동 리깅 설계와 실험 기록은
-  [`portrait-autorig`](https://github.com/prentice7725/portrait-autorig)에 있습니다.
-
-## 감사의 말
-
-원본 ComfyUI 통합을 만든 [@jtydhr88](https://github.com/jtydhr88)와 See-Through
-연구 프로젝트 기여자들에게 감사드립니다.
+vendored `see-through/ui`는 별도의 선택 의존성을 가진 연구 UI입니다. 이
+저장소의 테스트는 루트 `tests/`에 있습니다.
 
 ## 라이선스
 

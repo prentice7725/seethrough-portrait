@@ -1,7 +1,7 @@
 """Pure portrait-mode analysis and recovery primitives.
 
-This package intentionally has no ComfyUI, torch, diffusers, or OpenCV import so
-its contracts can be tested without a GPU environment.
+This package intentionally avoids inference-runtime imports (torch, diffusers,
+or OpenCV) so its contracts can be tested without a GPU environment.
 """
 
 from .body_remainder import build_body_remainder, composite_alpha

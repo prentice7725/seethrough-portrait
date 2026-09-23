@@ -1,17 +1,7 @@
-"""Layer-generation primitives shared by the ComfyUI nodes and the standalone
-webui: the raw diffusion call and the Portrait Mode orchestration loop.
-
-`nodes.py`'s `_run_diffusion` / `_layer_similarity` static methods on
-`SeeThrough_GenerateLayers_Custom` delegate to `run_diffusion_stage` /
-`layers.layer_similarity` so there is one implementation of the GPU-facing
-call. The node keeps its own (unchanged) control flow for the full
-auto-fill/portrait orchestration, since that loop is interleaved with
-ComfyUI-specific VRAM offload bookkeeping; `run_portrait_pipeline` below is
-the equivalent orchestration for callers with no ComfyUI underneath (i.e.
-the standalone webui), built from the same shared primitives. Tag lists,
-head-region cropping, similarity scoring, and preview compositing live in
-`.layers` (no torch import, so they stay unit-testable without the heavy
-inference stack).
+"""Layer-generation primitives and Portrait Mode orchestration for the
+standalone producer. Tag lists, head-region cropping, similarity scoring,
+and preview compositing live in `.layers` (no torch import, so they stay
+unit-testable without the heavy inference stack).
 """
 
 from __future__ import annotations
@@ -24,28 +14,14 @@ import cv2
 import numpy as np
 import torch
 
-try:
-    # ComfyUI loads this package's parent as a relative package, where
-    # portrait_core is a sibling -- same reason nodes.py imports it this way.
-    from ..portrait_core import (
-        PortraitConfig,
-        apply_silhouette_guard,
-        evaluate_portrait_layers,
-        resolve_subject_mask,
-        select_best_layer_set,
-    )
-    from ..portrait_core.report import build_portrait_report
-except ImportError:
-    # Standalone (webui): portrait_core is a plain top-level package on
-    # sys.path, not a relative sibling.
-    from portrait_core import (
-        PortraitConfig,
-        apply_silhouette_guard,
-        evaluate_portrait_layers,
-        resolve_subject_mask,
-        select_best_layer_set,
-    )
-    from portrait_core.report import build_portrait_report
+from portrait_core import (
+    PortraitConfig,
+    apply_silhouette_guard,
+    evaluate_portrait_layers,
+    resolve_subject_mask,
+    select_best_layer_set,
+)
+from portrait_core.report import build_portrait_report
 
 from . import vendor
 from .device import (
@@ -556,18 +532,15 @@ def run_portrait_pipeline(
     seed_everything: Callable[[int], None] = lambda seed: None,
     log: Callable[[str], None] = _NOOP_LOG,
 ) -> PortraitPipelineResult:
-    """Portrait Mode, end to end, for a caller with no ComfyUI graph
-    underneath: load an image, run the diffusion stage(s), apply the
-    Silhouette Guard, and (optionally) auto-fill low-coverage runs. Mirrors
-    the `portrait_mode=True` branch of `SeeThrough_GenerateLayers_Custom.generate`
-    in nodes.py, built from the same `run_diffusion_stage` primitive.
+    """Run Portrait Mode end to end: load an image, run the diffusion
+    stage(s), apply the Silhouette Guard, and (optionally) auto-fill
+    low-coverage runs.
 
     `input_img_rgba` may carry a real alpha channel (e.g. a transparent-PNG
-    portrait cutout); unlike nodes.py's ComfyUI branch it is not discarded,
-    so `resolve_subject_mask`'s own informative-alpha detection can pick it
-    up directly. `provided_subject_mask`, if given, must be the same H,W as
-    `input_img_rgba` (before padding) -- it is aligned to the model's square
-    canvas the same way the source image is.
+    portrait cutout); `resolve_subject_mask`'s informative-alpha detection
+    can use it directly. `provided_subject_mask`, if given, must be the same
+    H,W as `input_img_rgba` (before padding) -- it is aligned to the model's
+    square canvas the same way the source image is.
     """
     vendor.ensure_seethrough_importable()
     device = device or resolve_device()
@@ -716,12 +689,8 @@ def run_portrait_pipeline(
         if all_runs_layers:
             all_runs_layers[0]["layer_dict"] = dict(layer_dict)
 
-    # Unlike nodes.py's portrait branch, `fullpage` here can carry a real
-    # source alpha channel: ComfyUI's IMAGE type is RGB-only (which is why
-    # that branch synthesizes opaque alpha and instead leans on a separately
-    # supplied MASK input), but a caller with no ComfyUI graph underneath can
-    # hand us a true RGBA image directly. Passing it through as-is lets
-    # `resolve_subject_mask` do its own informative-alpha detection, which is
+    # `fullpage` can carry a real source alpha channel. Passing it through as-is
+    # lets `resolve_subject_mask` do its informative-alpha detection, which is
     # what the A-001 protocol's "subject-mask source: source alpha, HIGH
     # confidence" baseline expects for a transparent-background portrait.
     portrait_mask = resolve_subject_mask(

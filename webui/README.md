@@ -139,9 +139,9 @@ swap-safe semantic stack.
 - **Portrait AutoRig**: derived rig parts, mesh/weights, deformation, and
   runtime binding.
 
-The standalone producer exports full-canvas PNG layers by contract. PSD export
-and the original ComfyUI compatibility nodes remain separate optional paths;
-they are not prerequisites for this WebUI.
+The standalone producer exports full-canvas PNG layers by contract. The
+supported interface in this repository is the WebUI and the Portrait Bundle
+API; it does not include a ComfyUI custom-node adapter or PSD node extension.
 
 ## Troubleshooting
 

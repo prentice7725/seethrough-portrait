@@ -1,6 +1,6 @@
 """Standalone SeeThrough Portrait producer WebUI.
 
-No ComfyUI required. Launches a Gradio app that runs Portrait Mode end to
+Launches a Gradio app that runs Portrait Mode end to
 end on one uploaded image -- diffusion decomposition, canonical repair,
 static validation, and diagnostics -- and lets you download a Portrait Bundle.
 
@@ -9,10 +9,7 @@ Usage:
     python webui/app.py
     # then open http://127.0.0.1:7860
 
-Model loading, diffusion, and export all go through `seethrough_engine`, the
-same ComfyUI-independent core `nodes.py` delegates to -- so a result from
-this webui and a result from the ComfyUI node graph come from one producer
-implementation, not two.
+Model loading, diffusion, and export all go through `seethrough_engine`.
 """
 
 from __future__ import annotations

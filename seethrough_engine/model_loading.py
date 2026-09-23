@@ -1,12 +1,4 @@
-"""Model resolution and loading, shared by the ComfyUI nodes and the
-standalone webui.
-
-Extracted verbatim (modulo parametrizing the model-cache directory and
-dropping ComfyUI-only assumptions) from `SeeThrough_LoadLayerDiffModel` and
-`SeeThrough_LoadDepthModel` in nodes.py, which now delegate here. Keeping one
-copy means a fix (e.g. to the issue #6 text-encoder placeholder guard) only
-has to happen once.
-"""
+"""Model resolution and loading for the standalone Portrait producer."""
 
 from __future__ import annotations
 
@@ -48,7 +40,7 @@ def assert_text_encoder_loaded(text_encoder, name: str, pretrained: str) -> None
             f"Likely causes:\n"
             f"  1. Model checkpoint missing text_encoder/text_encoder_2 subfolder or model_index.json entries.\n"
             f"  2. Incompatible diffusers version silently substituted nn.Identity placeholder.\n"
-            f"Fix: re-download the model, or downgrade diffusers to a version compatible with your ComfyUI build.\n"
+            f"Fix: re-download the model, or install a diffusers version compatible with this checkpoint.\n"
             f"See: https://github.com/tackcrypto1031/tk_seethrough/issues/6"
         )
 
@@ -63,8 +55,7 @@ def load_layerdiff_model(pretrained: str, vae_ckpt: str = "", unet_ckpt: str = "
     checkpoint on the way in, so loading this UNet -- 4.07B parameters, already
     stored as bf16 -- materialized ~16.3 GB of fp32 in system RAM only to be
     cast straight back down. (`torch_dtype` is deprecated in favour of `dtype`
-    as of diffusers 1.0.0, but it is the spelling every version this node has
-    to run under accepts -- ComfyUI ships its own diffusers, see issue #6.)
+    as of diffusers 1.0.0; see issue #6 for checkpoint compatibility context.)
     Loading at the target dtype makes the blanket `.to(dtype=...)` calls this
     used to end with redundant, so only the custom-`vae_ckpt` path still
     normalizes.

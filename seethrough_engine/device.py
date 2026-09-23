@@ -1,9 +1,4 @@
-"""Device selection shared between the ComfyUI nodes and the standalone webui.
-
-`nodes.py` normally asks ComfyUI's `comfy.model_management` for the active
-device so it cooperates with ComfyUI's own VRAM scheduling. Outside ComfyUI
-there is no such scheduler, so we fall back to plain torch device selection.
-"""
+"""Device selection and memory helpers for the standalone inference engine."""
 
 from __future__ import annotations
 

@@ -16,9 +16,8 @@ import numpy as np
 
 
 LR_TAGS: tuple[str, ...] = (
-    # These are producer-side optional derivatives.  The public Bundle
-    # contract names the results by geometric canvas side (left/right); the
-    # historical node adapter below may still expose its tag-l/tag-r aliases.
+    # These optional derivatives use geometric canvas sides in the public
+    # Bundle contract; left/right does not imply anatomical side.
     "handwear", "legwear", "footwear",
     "eyewhite", "irides", "eyelash", "eyebrow", "ears",
 )
@@ -27,11 +26,7 @@ __all__ = [
     "LR_TAGS",
     "StratificationResult",
     "build_stratification",
-    "label_lr_split",
-    "part_lr_split",
-    "process_cuts",
     "stratify_left_right",
-    "tag_lr_split",
 ]
 
 
@@ -42,77 +37,6 @@ class StratificationResult:
     left_right: dict[str, dict[str, np.ndarray]]
     depth: dict[str, np.ndarray]
     report: dict[str, Any]
-
-
-def label_lr_split(labels: np.ndarray, stats: np.ndarray, id1: int, id2: int):
-    """Return masks ordered by canvas x (left, right) for node adapters."""
-    label1 = (labels == id1).astype(np.uint8) * 255
-    label2 = (labels == id2).astype(np.uint8) * 255
-    stats1, stats2 = stats[id1], stats[id2]
-    x1 = stats[id1][0] + stats[id1][2] / 2
-    x2 = stats[id2][0] + stats[id2][2] / 2
-    if x2 < x1:
-        return label2, label1, stats2, stats1
-    return label1, label2, stats1, stats2
-
-
-def process_cuts(img: np.ndarray, depth: np.ndarray, src_xyxy, tgt_bbox, mask=None):
-    """Crop one stratified part while preserving its depth map and alpha."""
-    tx1, ty1, tx2, ty2 = (int(value) for value in tgt_bbox[:4])
-    tx2 += tx1
-    ty2 += ty1
-    cropped = np.asarray(img)[ty1:ty2, tx1:tx2].copy()
-    cropped_depth = np.asarray(depth)[ty1:ty2, tx1:tx2]
-    depth_median = 1.0
-    if mask is not None:
-        local_mask = (np.asarray(mask)[ty1:ty2, tx1:tx2].copy() > 15).astype(np.uint8)
-        element = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3), (1, 1))
-        local_mask = cv2.dilate(local_mask, element)
-        cropped[..., -1] *= local_mask
-        cropped_depth = 1 - (1 - cropped_depth) * local_mask
-        if np.any(local_mask):
-            depth_median = float(np.median(cropped_depth[local_mask > 0]))
-    fxyxy = [tx1 + src_xyxy[0], ty1 + src_xyxy[1], tx2 + src_xyxy[0], ty2 + src_xyxy[1]]
-    return cropped, cropped_depth, fxyxy, depth_median
-
-
-def part_lr_split(tag: str, part_info: dict) -> dict[str, dict]:
-    """Split a node-style part record into its two largest components."""
-    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(
-        np.asarray(part_info["mask"]).astype(np.uint8) * 255, connectivity=8
-    )
-    result: dict[str, dict] = {}
-    if len(stats) <= 2:
-        result[tag] = part_info
-        return result
-    stats = np.asarray(stats)
-    stats_order = np.argsort(stats[..., -1])[::-1][1:]
-    left_mask, right_mask, stats_left, stats_right = label_lr_split(
-        labels, stats, int(stats_order[0]), int(stats_order[1])
-    )
-    img, depth, xyxy, dm = process_cuts(
-        part_info["img"], part_info["depth"], part_info["xyxy"], stats_left,
-        mask=left_mask,
-    )
-    result[f"{tag}-r"] = {
-        "img": img, "xyxy": xyxy, "depth": depth,
-        "depth_median": dm, "tag": f"{tag}-r",
-    }
-    img, depth, xyxy, dm = process_cuts(
-        part_info["img"], part_info["depth"], part_info["xyxy"], stats_right,
-        mask=right_mask,
-    )
-    result[f"{tag}-l"] = {
-        "img": img, "xyxy": xyxy, "depth": depth,
-        "depth_median": dm, "tag": f"{tag}-l",
-    }
-    return result
-
-
-def tag_lr_split(tag: str, tag2pinfo: dict[str, dict]) -> None:
-    """Mutate a node part mapping through the shared split implementation."""
-    if tag in tag2pinfo:
-        tag2pinfo.update(part_lr_split(tag, tag2pinfo.pop(tag)))
 
 
 def _split_two_sides(image: np.ndarray, *, alpha_threshold: int) -> tuple[np.ndarray, np.ndarray] | None:

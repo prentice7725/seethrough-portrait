@@ -19,8 +19,7 @@ LAYERDIFF_MARKER_SUBFOLDER = "trans_vae"
 
 
 def default_models_dir() -> str:
-    """Model cache directory used when the caller (e.g. the standalone webui)
-    has no ComfyUI `models/SeeThrough` directory to defer to."""
+    """Default model cache directory used by the standalone producer."""
     return os.path.join(str(vendor.REPO_ROOT_DIR), "models", "SeeThrough")
 
 

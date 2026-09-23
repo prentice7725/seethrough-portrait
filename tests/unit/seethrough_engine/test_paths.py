@@ -13,13 +13,9 @@ from seethrough_engine.paths import (
 class ResolveModelPathTests(unittest.TestCase):
     def test_repo_id_calls_snapshot_download_even_when_local_dir_exists(self):
         # A folder existing is not proof the download finished (see the
-        # ComfyUI Desktop bug this guards against: an interrupted first
-        # download left a folder with only partial files, and the old
-        # "if os.path.isdir(local): return local" check meant every later
-        # load attempt silently reused that broken folder forever instead
-        # of retrying). snapshot_download must always be asked, since it's
-        # what actually resumes/completes an interrupted download and is a
-        # cheap no-op when everything is already present.
+        # The old folder-exists shortcut could leave an interrupted first
+        # download incomplete forever. snapshot_download must always be asked
+        # because it resumes the download and is a cheap no-op when complete.
         with tempfile.TemporaryDirectory() as models_dir:
             local = os.path.join(models_dir, "seethroughv0.0.2_layerdiff3d")
             os.makedirs(local)

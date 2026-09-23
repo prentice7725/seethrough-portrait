@@ -1,6 +1,5 @@
-"""ComfyUI-independent core: model loading, layer generation, and Portrait
-Mode orchestration shared by `nodes.py` (the ComfyUI node graph) and
-`webui/app.py` (the standalone single-image webui, M2).
+"""Core model loading, layer generation, and Portrait Mode orchestration
+used by `webui/app.py` (the standalone single-image WebUI).
 
 Importing this package's *submodules* directly (`seethrough_engine.paths`,
 `seethrough_engine.layers`) does not require torch/diffusers/etc. Actually

@@ -1,5 +1,10 @@
 # M2 Implementation Specification
 
+> Historical implementation record. This document describes the period when
+> the repository shipped both a ComfyUI adapter and the standalone WebUI. The
+> ComfyUI adapter has since been removed; the supported producer interface is
+> `webui/app.py` and the `seethrough_engine` API.
+
 ## Goal
 
 Give Portrait Mode a single-image webui that runs without ComfyUI, so A-001
