@@ -128,7 +128,9 @@ def _prepare_subject_image(image_rgba: np.ndarray, has_provided_mask: bool,
         return repaired
 
     if has_provided_mask:
-        return image_rgba  # the mask supplies what the alpha does not
+        # The pipeline applies the mask to source alpha before diffusion. Do
+        # not run the colour key on a source with explicit matte evidence.
+        return image_rgba
 
     if not key_background:
         raise gr.Error(
@@ -288,6 +290,8 @@ def run_portrait(
             if mask_arr.ndim == 3:
                 mask_arr = mask_arr[..., 0]
             provided_mask = mask_arr.astype(np.float32) / (255.0 if mask_arr.max() > 1.0 else 1.0)
+            if provided_mask.shape != image_rgba.shape[:2] or not np.any(provided_mask > 0):
+                raise gr.Error("Subject Mask must match the source image size and contain a subject.")
         # Before the model load, not after the diffusion pass.
         image_rgba = _prepare_subject_image(
             image_rgba, provided_mask is not None, bool(key_background), _log)
