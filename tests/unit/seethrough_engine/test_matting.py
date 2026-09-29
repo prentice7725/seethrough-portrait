@@ -4,6 +4,7 @@ import numpy as np
 
 from seethrough_engine.matting import (
     DEFAULT_TOLERANCE,
+    apply_subject_mask,
     detect_flat_background,
     key_flat_background,
     repair_existing_alpha_edge,
@@ -58,6 +59,49 @@ class DetectTests(unittest.TestCase):
 
 
 class KeyTests(unittest.TestCase):
+    def test_supplied_mask_removes_opaque_background_and_unmixes_flat_edge(self):
+        bg = np.array([240, 240, 240], np.float32)
+        fg = np.array([30, 40, 50], np.float32)
+        matte = np.zeros((SIZE, SIZE), np.float32)
+        matte[20:76, 20:76] = 1.0
+        matte[20:76, 19] = 0.5
+        matte[20:76, 76] = 0.5
+        rgb = np.rint(fg * matte[..., None] + bg * (1 - matte[..., None])).astype(np.uint8)
+        source = np.dstack([rgb, np.full((SIZE, SIZE), 255, np.uint8)])
+        out, info = apply_subject_mask(source, matte)
+        self.assertTrue(info["edge_unmixed"])
+        self.assertEqual(out[0, 0, 3], 0)
+        self.assertAlmostEqual(int(out[30, 19, 3]), 128, delta=1)
+        self.assertLess(np.abs(out[30, 19, :3].astype(np.float32) - fg).mean(), 2)
+
+    def test_supplied_mask_handles_complex_background_without_guessing_edge_rgb(self):
+        yy, xx = np.mgrid[:SIZE, :SIZE]
+        source = np.dstack([xx * 2, yy * 2, xx + yy,
+                            np.full((SIZE, SIZE), 255)]).astype(np.uint8)
+        matte = np.zeros((SIZE, SIZE), np.uint8)
+        matte[16:80, 16:80] = 255
+        matte[15, 16:80] = 128
+        out, info = apply_subject_mask(source, matte)
+        self.assertFalse(info["edge_unmixed"])
+        self.assertTrue(info["warning"])
+        self.assertEqual(out[0, 0, 3], 0)
+        np.testing.assert_array_equal(out[..., :3], source[..., :3])
+
+    def test_supplied_mask_preserves_existing_transparent_padding(self):
+        source = np.full((SIZE, SIZE, 4), 180, np.uint8)
+        source[..., 3] = 0
+        source[16:80, 16:80, 3] = 255
+        matte = np.ones((SIZE, SIZE), np.float32)
+        matte[20:76, 20:76] = 0.5
+        out, _ = apply_subject_mask(source, matte)
+        self.assertEqual(out[0, 0, 3], 0)
+        self.assertAlmostEqual(int(out[30, 30, 3]), 128, delta=1)
+
+    def test_supplied_mask_rejects_wrong_size_before_inference(self):
+        opaque, _, _ = scene()
+        with self.assertRaisesRegex(ValueError, "matching image"):
+            apply_subject_mask(opaque, np.ones((SIZE - 1, SIZE), np.uint8))
+
     def test_existing_alpha_edge_unmixes_premultiplied_background(self):
         bg = np.array([220, 217, 215], np.float32)
         fg = np.array([30, 32, 38], np.float32)
