@@ -50,7 +50,7 @@ from .image import composite_layers
 from .local_fidelity import local_fidelity_report
 from .ownership import recover_missing_ownership
 from .vae_runtime import run_with_vae_runtime
-from .matting import repair_existing_alpha_edge
+from .matting import apply_subject_mask, repair_existing_alpha_edge
 
 __all__ = [
     "ALL_TAGS",
@@ -550,9 +550,19 @@ def run_portrait_pipeline(
     input_img = np.asarray(input_img_rgba)
     if input_img.ndim != 3 or input_img.shape[-1] != 4:
         raise ValueError(f"input_img_rgba must be HxWx4, got {input_img.shape}")
-    # Keep this upstream of diffusion so every caller (not only the WebUI's
-    # upload path) receives a decontaminated subject edge.
-    input_img, input_edge_repair = repair_existing_alpha_edge(input_img)
+    supplied_matte = None
+    if provided_subject_mask is not None:
+        input_img, supplied_matte = apply_subject_mask(input_img, provided_subject_mask)
+        log("Applied supplied subject mask to source alpha before diffusion.")
+        if supplied_matte["warning"]:
+            log(supplied_matte["warning"])
+        # The explicit matte has already been applied. A second, global
+        # background-colour guess can damage soft edges on complex backgrounds.
+        input_edge_repair = {"changed_px": 0, "reason": "provided matte; fringe repair skipped"}
+    else:
+        # Keep this upstream of diffusion so every caller (not only the WebUI's
+        # upload path) receives a decontaminated subject edge.
+        input_img, input_edge_repair = repair_existing_alpha_edge(input_img)
     seed_mode = str(seed_mode)
     if seed_mode not in SEED_MODES:
         raise ValueError(f"Unknown seed_mode {seed_mode!r}; expected one of {SEED_MODES}")
@@ -577,7 +587,9 @@ def run_portrait_pipeline(
         # `provided_subject_mask` is expected at the same H,W as
         # `input_img_rgba` (before padding) -- align it through the same
         # center-square transform so it lines up with `fullpage`.
-        aligned_subject_mask = align_subject_mask_to_canvas(provided_subject_mask, resolution)
+        # Align the effective matte (mask intersected with any source alpha),
+        # so transparent padding cannot reappear as a subject after scaling.
+        aligned_subject_mask = align_subject_mask_to_canvas(input_img[..., 3], resolution)
 
     tag_version = pipeline.unet.get_tag_version()
     prompt_cache = getattr(pipeline, "_seethrough_prompt_cache", None) or {}
@@ -832,6 +844,7 @@ def run_portrait_pipeline(
         "device": "cpu",
     }
     report["run"]["input_alpha_repair"] = input_edge_repair
+    report["run"]["provided_subject_matte"] = supplied_matte
     report["run"]["head_rescue"] = (
         head_rescue_outcome.report if head_rescue_outcome is not None else {"enabled": False}
     )
