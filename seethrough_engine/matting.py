@@ -31,6 +31,7 @@ __all__ = [
     "DEFAULT_TOLERANCE",
     "detect_flat_background",
     "key_flat_background",
+    "apply_subject_mask",
     "repair_existing_alpha_edge",
 ]
 
@@ -42,6 +43,59 @@ DEFAULT_TOLERANCE = 18.0
 # A background this uneven is a gradient, a texture, or a drop shadow -- not a
 # flat colour, and keying it will leave a fringe wherever it varies.
 DEFAULT_MAX_BORDER_STD = 6.0
+
+
+def apply_subject_mask(image: np.ndarray, mask: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
+    """Use an explicit matte to remove an opaque background before inference.
+
+    A supplied mask is evidence about the subject, not just a score for the
+    silhouette guard. Preserve an existing alpha (including transparent padding)
+    by intersecting it with the mask. On a verified flat background, undo the
+    background blend at soft edges; otherwise leave RGB untouched and report
+    that edge colours still need review.
+    """
+    arr = np.asarray(image)
+    if arr.ndim != 3 or arr.shape[-1] != 4 or arr.dtype != np.uint8:
+        raise ValueError("image must be uint8 HxWx4 RGBA")
+    supplied = np.asarray(mask)
+    if supplied.ndim == 3 and supplied.shape[-1] == 1:
+        supplied = supplied[..., 0]
+    if supplied.shape != arr.shape[:2] or not np.issubdtype(supplied.dtype, np.number):
+        raise ValueError(f"subject mask must be HxW matching image {arr.shape[:2]}")
+    value = supplied.astype(np.float32)
+    if not np.all(np.isfinite(value)) or np.any(value < 0):
+        raise ValueError("subject mask must contain finite non-negative values")
+    if value.size and float(value.max()) > 1.0:
+        if float(value.max()) > 255.0:
+            raise ValueError("subject mask values must be in [0, 1] or [0, 255]")
+        value /= 255.0
+    if not np.any(value > 0):
+        raise ValueError("subject mask is empty")
+    value = np.clip(value, 0.0, 1.0)
+    source_alpha = arr[..., 3].astype(np.float32) / 255.0
+    alpha = source_alpha * value
+    if not np.any(alpha > 0):
+        raise ValueError("subject mask has no overlap with source image")
+    out = np.array(arr, copy=True)
+    out[..., 3] = np.rint(alpha * 255.0).astype(np.uint8)
+
+    # An already-transparent source has its own edge colours. Only unmix an
+    # opaque source for which the background colour can actually be measured.
+    opaque_source = bool(np.all(source_alpha[source_alpha > 0] >= 0.99))
+    detected = detect_flat_background(arr) if opaque_source else {"flat": False}
+    unmix = opaque_source and bool(detected["flat"])
+    if unmix:
+        bg = np.asarray(detected["color"], dtype=np.float32)
+        soft = (alpha >= 16.0 / 255.0) & (alpha < 0.99)
+        rgb = arr[..., :3].astype(np.float32)
+        corrected = (rgb - (1.0 - alpha[..., None]) * bg) / np.maximum(alpha[..., None], 1e-3)
+        out[..., :3] = np.where(soft[..., None], np.rint(np.clip(corrected, 0, 255)), rgb).astype(np.uint8)
+    return out, {
+        "source": "provided_mask",
+        "foreground_ratio": round(float(np.mean(out[..., 3] > 16)), 4),
+        "edge_unmixed": bool(unmix),
+        "warning": "Edge RGB may contain background colour; review soft edges." if not unmix else "",
+    }
 
 # Width of the ring sampled to identify the background colour, and of the band
 # inside the silhouette whose alpha is estimated rather than assumed.
